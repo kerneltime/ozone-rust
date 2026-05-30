@@ -8,3 +8,13 @@ authors.workspace = true
 description = "bindgen-generated FFI to Intel ISA-L"
 
 [dependencies]
+
+[build-dependencies]
+bindgen.workspace = true
+pkg-config = "0.3"
+
+[features]
+default = []
+# When set, fail the build if pkg-config cannot find libisal. Default behavior
+# falls back to env-var-driven paths.
+strict-pkg-config = []

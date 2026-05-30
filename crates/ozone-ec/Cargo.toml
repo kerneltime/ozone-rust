@@ -8,3 +8,5 @@ authors.workspace = true
 description = "Ozone-specific Reed-Solomon Cauchy EC layer"
 
 [dependencies]
+isa-l-safe = { path = "../isa-l-safe" }
+thiserror.workspace = true

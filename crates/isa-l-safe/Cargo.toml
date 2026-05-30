@@ -8,3 +8,5 @@ authors.workspace = true
 description = "Lifetime-safe wrappers over isa-l-sys"
 
 [dependencies]
+isa-l-sys = { path = "../isa-l-sys" }
+thiserror.workspace = true
