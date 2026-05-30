@@ -1,0 +1,9 @@
+target/
+Cargo.lock
+*.rs.bk
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+/golden-vectors/*.bin

@@ -1,0 +1,280 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Ozone Manager <-> Rust S3 Gateway gRPC service. DRAFT v0.1.
+// Phase 2 OM gRPC spec.
+
+syntax = "proto3";
+
+package org.apache.ozone.om.gw.v1;
+
+import "datanode_gateway_v1.proto";
+
+// =============================================================
+// Common
+// =============================================================
+
+message VolumeBucketKey {
+  string volume_name = 1;
+  string bucket_name = 2;
+  string key_name = 3;
+}
+
+message OmKeyInfoLite {
+  VolumeBucketKey vbk = 1;
+  uint64 data_size = 2;
+  uint64 creation_time_ms = 3;
+  uint64 modification_time_ms = 4;
+  repeated KeyLocation locations = 5;
+  map<string, string> metadata = 6;  // includes ETag
+  org.apache.ozone.dn.v1.ECReplicationConfig ec_config = 7;
+}
+
+message KeyLocation {
+  org.apache.ozone.dn.v1.BlockID block_id = 1;
+  uint64 offset = 2;
+  uint64 length = 3;
+  Pipeline pipeline = 4;
+  // Opaque token issued by SCM; gateway forwards verbatim to the DN.
+  bytes block_token = 5;
+}
+
+message Pipeline {
+  string id = 1;
+  repeated DatanodeDetails members = 2;
+  // Per-member replica index for EC pipelines (slot 1..D+P).
+  map<string, uint32> member_replica_indexes = 3;
+}
+
+message DatanodeDetails {
+  string uuid = 1;
+  string ip_address = 2;
+  string host_name = 3;
+  uint32 gateway_port = 4;  // gRPC port on the Rust DN
+  string cert_serial = 5;
+}
+
+message AuthContext {
+  string principal = 1;        // upstream-proxy-attested S3 access key id
+  bool proxy_attested = 2;     // must be true; gateway sets this
+  string request_id = 3;
+}
+
+// =============================================================
+// Bucket / key reads
+// =============================================================
+
+message HeadBucketRequest {
+  string volume_name = 1;
+  string bucket_name = 2;
+  AuthContext auth = 3;
+}
+
+message HeadBucketResponse {
+  bool exists = 1;
+  org.apache.ozone.dn.v1.ECReplicationConfig default_ec_config = 2;
+  string bucket_layout = 3;  // expected "OBJECT_STORE" for OBS
+}
+
+message LookupKeyRequest {
+  VolumeBucketKey vbk = 1;
+  AuthContext auth = 2;
+}
+
+message LookupKeyResponse {
+  OmKeyInfoLite key_info = 1;
+}
+
+message HeadKeyRequest {
+  VolumeBucketKey vbk = 1;
+  AuthContext auth = 2;
+}
+
+message HeadKeyResponse {
+  OmKeyInfoLite key_info = 1;
+}
+
+// =============================================================
+// Listing (streaming)
+// =============================================================
+
+message ListKeysRequest {
+  string volume_name = 1;
+  string bucket_name = 2;
+  string prefix = 3;
+  string delimiter = 4;  // S3-style; server folds CommonPrefixes
+  string continuation_token = 5;
+  uint32 max_keys = 6;
+  AuthContext auth = 7;
+}
+
+message ListKeysResponse {
+  repeated OmKeyInfoLite keys = 1;
+  repeated string common_prefixes = 2;
+  string next_continuation_token = 3;
+  bool is_truncated = 4;
+}
+
+// =============================================================
+// Key write path
+// =============================================================
+
+message CreateKeyRequest {
+  VolumeBucketKey vbk = 1;
+  uint64 expected_size = 2;  // optional hint for block allocation
+  org.apache.ozone.dn.v1.ECReplicationConfig ec_config = 3;
+  map<string, string> metadata = 4;  // user x-amz-meta-* metadata
+  AuthContext auth = 5;
+}
+
+message CreateKeyResponse {
+  uint64 client_id = 1;
+  uint64 open_version = 2;
+  repeated KeyLocation pre_allocated_blocks = 3;
+}
+
+message AllocateBlockRequest {
+  uint64 client_id = 1;
+  uint64 open_version = 2;
+  VolumeBucketKey vbk = 3;
+  // Optional: exclude list of DN UUIDs that failed in earlier blocks
+  repeated string exclude_dn_uuids = 4;
+  AuthContext auth = 5;
+}
+
+message AllocateBlockResponse {
+  KeyLocation new_block = 1;
+}
+
+message CommitKeyRequest {
+  uint64 client_id = 1;
+  uint64 open_version = 2;
+  VolumeBucketKey vbk = 3;
+  uint64 final_size = 4;
+  repeated KeyLocation final_locations = 5;
+  bytes etag = 6;  // gateway-computed; OM stores in metadata[ETAG]
+  AuthContext auth = 7;
+}
+
+message CommitKeyResponse {
+  uint64 commit_time_ms = 1;
+}
+
+message DeleteKeyRequest {
+  VolumeBucketKey vbk = 1;
+  AuthContext auth = 2;
+}
+
+message DeleteKeyResponse {}
+
+message CopyKeyRequest {
+  VolumeBucketKey source = 1;
+  VolumeBucketKey dest = 2;
+  AuthContext auth = 3;
+}
+
+message CopyKeyResponse {
+  uint64 size = 1;
+  bytes etag = 2;
+}
+
+// =============================================================
+// Multipart upload
+// =============================================================
+
+message InitiateMultipartUploadRequest {
+  VolumeBucketKey vbk = 1;
+  org.apache.ozone.dn.v1.ECReplicationConfig ec_config = 2;
+  map<string, string> metadata = 3;
+  AuthContext auth = 4;
+}
+
+message InitiateMultipartUploadResponse {
+  string upload_id = 1;
+}
+
+message AbortMultipartUploadRequest {
+  VolumeBucketKey vbk = 1;
+  string upload_id = 2;
+  AuthContext auth = 3;
+}
+
+message AbortMultipartUploadResponse {}
+
+message Part {
+  uint32 part_number = 1;
+  bytes etag = 2;
+  uint64 size = 3;
+  repeated KeyLocation locations = 4;
+}
+
+message CompleteMultipartUploadRequest {
+  VolumeBucketKey vbk = 1;
+  string upload_id = 2;
+  repeated Part parts = 3;
+  AuthContext auth = 4;
+}
+
+message CompleteMultipartUploadResponse {
+  bytes etag = 1;  // AWS-compliant: md5(concat(binary digests)) + "-N"
+  uint64 final_size = 2;
+}
+
+message ListPartsRequest {
+  VolumeBucketKey vbk = 1;
+  string upload_id = 2;
+  uint32 part_number_marker = 3;
+  uint32 max_parts = 4;
+  AuthContext auth = 5;
+}
+
+message ListPartsResponse {
+  repeated Part parts = 1;
+  uint32 next_part_number_marker = 2;
+  bool is_truncated = 3;
+}
+
+message ListMultipartUploadsRequest {
+  string volume_name = 1;
+  string bucket_name = 2;
+  string prefix = 3;
+  string key_marker = 4;
+  string upload_id_marker = 5;
+  uint32 max_uploads = 6;
+  AuthContext auth = 7;
+}
+
+message ListMultipartUploadsResponse {
+  message Upload {
+    VolumeBucketKey vbk = 1;
+    string upload_id = 2;
+    uint64 initiated_ms = 3;
+  }
+  repeated Upload uploads = 1;
+  string next_key_marker = 2;
+  string next_upload_id_marker = 3;
+  bool is_truncated = 4;
+}
+
+// =============================================================
+// Service
+// =============================================================
+
+service OmRustGatewayService {
+  rpc HeadBucket(HeadBucketRequest) returns (HeadBucketResponse);
+
+  rpc LookupKey(LookupKeyRequest) returns (LookupKeyResponse);
+  rpc HeadKey(HeadKeyRequest) returns (HeadKeyResponse);
+  rpc ListKeys(ListKeysRequest) returns (stream ListKeysResponse);
+
+  rpc CreateKey(CreateKeyRequest) returns (CreateKeyResponse);
+  rpc AllocateBlock(AllocateBlockRequest) returns (AllocateBlockResponse);
+  rpc CommitKey(CommitKeyRequest) returns (CommitKeyResponse);
+  rpc DeleteKey(DeleteKeyRequest) returns (DeleteKeyResponse);
+  rpc CopyKey(CopyKeyRequest) returns (CopyKeyResponse);
+
+  rpc InitiateMultipartUpload(InitiateMultipartUploadRequest) returns (InitiateMultipartUploadResponse);
+  rpc AbortMultipartUpload(AbortMultipartUploadRequest) returns (AbortMultipartUploadResponse);
+  rpc CompleteMultipartUpload(CompleteMultipartUploadRequest) returns (CompleteMultipartUploadResponse);
+  rpc ListParts(ListPartsRequest) returns (ListPartsResponse);
+  rpc ListMultipartUploads(ListMultipartUploadsRequest) returns (ListMultipartUploadsResponse);
+}

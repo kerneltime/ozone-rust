@@ -1,0 +1,113 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ozone-types",
+    "crates/ozone-config",
+    "crates/ozone-observability",
+    "crates/isa-l-sys",
+    "crates/isa-l-safe",
+    "crates/ozone-ec",
+    "crates/ozone-grpc-types",
+    "crates/ozone-om-client",
+    "crates/ozone-dn-client",
+    "crates/ozone-dn-server",
+    "crates/ozone-scm-client",
+    "crates/ozone-storage",
+    "crates/ozone-fjall-store",
+    "crates/ozone-s3-gw",
+    "crates/ozone-dn",
+    "crates/test-fixtures",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+authors = ["Ozone Rust contributors"]
+repository = "https://github.com/kerneltime/ozone-rust"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.41", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec", "io"] }
+tokio-stream = "0.1"
+futures = "0.3"
+async-trait = "0.1"
+
+# HTTP / gRPC
+hyper = { version = "1.5", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+h2 = "0.4"
+tonic = { version = "0.12", features = ["tls", "tls-roots", "gzip"] }
+tonic-build = { version = "0.12", features = ["prost"] }
+prost = "0.13"
+prost-types = "0.13"
+
+# TLS
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
+rustls-pemfile = "2"
+tokio-rustls = { version = "0.26", default-features = false }
+
+# Storage
+fjall = "2.4"
+
+# Serialization / config
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Bytes / buffers
+bytes = "1.8"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-opentelemetry = "0.27"
+opentelemetry = "0.26"
+opentelemetry_sdk = { version = "0.26", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.26", features = ["grpc-tonic"] }
+prometheus = "0.13"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Build deps
+bindgen = "0.71"
+cc = "1"
+
+# Test deps
+proptest = "1.5"
+mockall = "0.13"
+insta = { version = "1", features = ["yaml"] }
+criterion = { version = "0.5", features = ["html_reports"] }
+testcontainers = "0.23"
+
+# Pure-Rust EC fallback (gated by feature)
+reed-solomon-simd = "3"
+
+# Cryptography (for checksums)
+crc32c = "0.6"
+
+# Misc
+once_cell = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+parking_lot = "0.12"
+dashmap = "6"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+debug = "line-tables-only"
+
+[profile.bench]
+inherits = "release"
+debug = true
+
+[profile.dev]
+opt-level = 1  # faster sqlx / tokio in dev
