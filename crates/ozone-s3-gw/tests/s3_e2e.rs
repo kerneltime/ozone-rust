@@ -738,3 +738,86 @@ async fn s3_sdk_content_type_and_user_metadata() {
         tokio::fs::remove_dir_all(&d.dir).await.ok();
     }
 }
+
+/// Conditional requests via the real SDK: If-Match / If-None-Match on GET, and
+/// If-None-Match: * create-only on PUT.
+#[tokio::test]
+async fn s3_sdk_conditional_requests() {
+    use aws_sdk_s3::primitives::ByteStream;
+
+    let (base, dns) = spawn_stack().await;
+    let s3 = s3_client(&base);
+
+    let put = s3
+        .put_object()
+        .bucket("bucket1")
+        .key("c.bin")
+        .body(ByteStream::from(vec![1u8; 10]))
+        .send()
+        .await
+        .expect("put");
+    let etag = put.e_tag().unwrap().to_string();
+
+    // If-None-Match with the current ETag -> 304 (surfaced as an error, not 200).
+    assert!(
+        s3.get_object()
+            .bucket("bucket1")
+            .key("c.bin")
+            .if_none_match(&etag)
+            .send()
+            .await
+            .is_err(),
+        "If-None-Match with current ETag must not return the object"
+    );
+
+    // If-Match with the current ETag -> 200.
+    let ok = s3
+        .get_object()
+        .bucket("bucket1")
+        .key("c.bin")
+        .if_match(&etag)
+        .send()
+        .await
+        .expect("If-Match with current ETag should pass");
+    let _ = ok.body.collect().await;
+
+    // If-Match with a wrong ETag -> 412.
+    assert!(
+        s3.get_object()
+            .bucket("bucket1")
+            .key("c.bin")
+            .if_match("\"deadbeef\"")
+            .send()
+            .await
+            .is_err(),
+        "If-Match with a wrong ETag must fail"
+    );
+
+    // PUT If-None-Match: * on an existing key -> 412 (create-only).
+    assert!(
+        s3.put_object()
+            .bucket("bucket1")
+            .key("c.bin")
+            .if_none_match("*")
+            .body(ByteStream::from(vec![9u8; 5]))
+            .send()
+            .await
+            .is_err(),
+        "create-only on an existing key must fail"
+    );
+
+    // PUT If-None-Match: * on a new key -> succeeds.
+    s3.put_object()
+        .bucket("bucket1")
+        .key("new.bin")
+        .if_none_match("*")
+        .body(ByteStream::from(vec![7u8; 5]))
+        .send()
+        .await
+        .expect("create-only on a new key should succeed");
+
+    for d in &dns {
+        d.handle.abort();
+        tokio::fs::remove_dir_all(&d.dir).await.ok();
+    }
+}

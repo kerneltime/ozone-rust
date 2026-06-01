@@ -89,6 +89,16 @@ async fn route(
         .and_then(|v| v.to_str().ok())
         .map(String::from);
     let user_metadata = collect_user_metadata(req.headers());
+    let if_match = req
+        .headers()
+        .get(hyper::header::IF_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+    let if_none_match = req
+        .headers()
+        .get(hyper::header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
 
     let (bucket, key) = split_path(&path);
     if bucket.is_empty() {
@@ -212,6 +222,12 @@ async fn route(
                 .expect("valid response"))
         }
         (&Method::PUT, false) => {
+            // If-None-Match: * -> create-only: fail if the object already exists.
+            if if_none_match.as_deref() == Some("*")
+                && gw.head_object(&bucket, &key, &principal).await.is_ok()
+            {
+                return Ok(precondition_failed_response());
+            }
             // PutObject with x-amz-copy-source is a server-side CopyObject.
             if let Some(source) = &copy_source {
                 let (src_bucket, src_key) = parse_copy_source(source)?;
@@ -236,6 +252,20 @@ async fn route(
                 .expect("valid response"))
         }
         (&Method::GET, false) => {
+            // Conditional GET: evaluate preconditions against the ETag without
+            // reading data (an extra metadata lookup, only when conditions exist).
+            if if_match.is_some() || if_none_match.is_some() {
+                let (_, etag, _) = gw.head_object(&bucket, &key, &principal).await?;
+                if let Some(status) =
+                    precondition_status(if_match.as_deref(), if_none_match.as_deref(), &etag)
+                {
+                    return Ok(if status == StatusCode::NOT_MODIFIED {
+                        status_only(status)
+                    } else {
+                        precondition_failed_response()
+                    });
+                }
+            }
             let (data, etag, metadata) = gw.get_object(&bucket, &key, &principal).await?;
             // Range request -> 206 Partial Content with Content-Range. The
             // object is decoded in full and sliced (range-aware EC reads are a
@@ -271,6 +301,15 @@ async fn route(
         }
         (&Method::HEAD, false) => {
             let (size, etag, metadata) = gw.head_object(&bucket, &key, &principal).await?;
+            if let Some(status) =
+                precondition_status(if_match.as_deref(), if_none_match.as_deref(), &etag)
+            {
+                return Ok(if status == StatusCode::NOT_MODIFIED {
+                    status_only(status)
+                } else {
+                    precondition_failed_response()
+                });
+            }
             Ok(apply_object_metadata(
                 Response::builder()
                     .status(StatusCode::OK)
@@ -391,6 +430,53 @@ fn apply_object_metadata(
         }
     }
     builder
+}
+
+/// Evaluate If-Match / If-None-Match against an object's (unquoted) ETag for a
+/// read. Returns `Some(412)` if If-Match fails, `Some(304)` if If-None-Match
+/// matches, else `None` (proceed).
+fn precondition_status(
+    if_match: Option<&str>,
+    if_none_match: Option<&str>,
+    etag: &str,
+) -> Option<StatusCode> {
+    let quoted = format!("\"{etag}\"");
+    if let Some(im) = if_match {
+        if !etag_list_matches(im, &quoted) {
+            return Some(StatusCode::PRECONDITION_FAILED);
+        }
+    }
+    if let Some(inm) = if_none_match {
+        if etag_list_matches(inm, &quoted) {
+            return Some(StatusCode::NOT_MODIFIED);
+        }
+    }
+    None
+}
+
+/// True if a `If-(None-)Match` header value matches `quoted_etag`: either `*`,
+/// or a comma-separated list containing the (optionally weak `W/`-prefixed) tag.
+fn etag_list_matches(header: &str, quoted_etag: &str) -> bool {
+    let header = header.trim();
+    if header == "*" {
+        return true;
+    }
+    header
+        .split(',')
+        .map(str::trim)
+        .any(|t| t == quoted_etag || t.strip_prefix("W/").map(str::trim) == Some(quoted_etag))
+}
+
+/// A 412 Precondition Failed response with an S3 error body.
+fn precondition_failed_response() -> Response<Full<Bytes>> {
+    let xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+<Error><Code>PreconditionFailed</Code>\
+<Message>At least one of the preconditions you specified did not hold.</Message></Error>";
+    Response::builder()
+        .status(StatusCode::PRECONDITION_FAILED)
+        .header(hyper::header::CONTENT_TYPE, "application/xml")
+        .body(Full::new(Bytes::from(xml)))
+        .expect("valid response")
 }
 
 /// Determine the request principal. Production traffic carries the proxy-
@@ -980,6 +1066,32 @@ mod tests {
         let mut enc = hyper::HeaderMap::new();
         enc.insert(hyper::header::CONTENT_ENCODING, "aws-chunked".parse().unwrap());
         assert!(is_aws_chunked(&enc));
+    }
+
+    #[test]
+    fn precondition_logic() {
+        let etag = "abc123";
+        let q = "\"abc123\"";
+        // If-None-Match matching (or *) -> 304 Not Modified.
+        assert_eq!(
+            precondition_status(None, Some(q), etag),
+            Some(StatusCode::NOT_MODIFIED)
+        );
+        assert_eq!(
+            precondition_status(None, Some("*"), etag),
+            Some(StatusCode::NOT_MODIFIED)
+        );
+        // If-None-Match not matching -> proceed.
+        assert_eq!(precondition_status(None, Some("\"other\""), etag), None);
+        // If-Match matching (or *) -> proceed; otherwise 412.
+        assert_eq!(precondition_status(Some(q), None, etag), None);
+        assert_eq!(precondition_status(Some("*"), None, etag), None);
+        assert_eq!(
+            precondition_status(Some("\"other\""), None, etag),
+            Some(StatusCode::PRECONDITION_FAILED)
+        );
+        // Comma-separated list form.
+        assert_eq!(precondition_status(Some("\"x\", \"abc123\""), None, etag), None);
     }
 }
 
