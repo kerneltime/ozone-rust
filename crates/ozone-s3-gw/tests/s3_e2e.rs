@@ -500,3 +500,57 @@ async fn s3_sdk_multipart_upload() {
         tokio::fs::remove_dir_all(&d.dir).await.ok();
     }
 }
+
+/// CopyObject and ranged GET through the real AWS SDK.
+#[tokio::test]
+async fn s3_sdk_copy_object_and_range_get() {
+    use aws_sdk_s3::primitives::ByteStream;
+
+    let (base, dns) = spawn_stack().await;
+    let s3 = s3_client(&base);
+
+    let body: Vec<u8> = (0..1000u32).map(|i| (i % 256) as u8).collect();
+    s3.put_object()
+        .bucket("bucket1")
+        .key("src.bin")
+        .body(ByteStream::from(body.clone()))
+        .send()
+        .await
+        .expect("put source");
+
+    // Server-side copy, then GET the destination -> same bytes.
+    s3.copy_object()
+        .bucket("bucket1")
+        .key("dest.bin")
+        .copy_source("bucket1/src.bin")
+        .send()
+        .await
+        .expect("copy_object");
+    let dest = s3
+        .get_object()
+        .bucket("bucket1")
+        .key("dest.bin")
+        .send()
+        .await
+        .expect("get dest");
+    let dest_bytes = dest.body.collect().await.unwrap().into_bytes();
+    assert_eq!(dest_bytes.as_ref(), &body[..], "copied object matches source");
+
+    // Ranged GET: bytes 100-199 inclusive -> 100 bytes, 206 semantics.
+    let ranged = s3
+        .get_object()
+        .bucket("bucket1")
+        .key("src.bin")
+        .range("bytes=100-199")
+        .send()
+        .await
+        .expect("ranged get");
+    assert_eq!(ranged.content_length(), Some(100));
+    let ranged_bytes = ranged.body.collect().await.unwrap().into_bytes();
+    assert_eq!(ranged_bytes.as_ref(), &body[100..200], "range bytes match");
+
+    for d in &dns {
+        d.handle.abort();
+        tokio::fs::remove_dir_all(&d.dir).await.ok();
+    }
+}

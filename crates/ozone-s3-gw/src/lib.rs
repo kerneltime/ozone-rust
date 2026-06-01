@@ -77,6 +77,16 @@ async fn route(
     let query = req.uri().query().map(|q| q.to_string());
     let principal = extract_principal(req.headers());
     let aws_chunked = is_aws_chunked(req.headers());
+    let copy_source = req
+        .headers()
+        .get("x-amz-copy-source")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+    let range_header = req
+        .headers()
+        .get(hyper::header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
 
     let (bucket, key) = split_path(&path);
     if bucket.is_empty() {
@@ -159,6 +169,14 @@ async fn route(
                 .expect("valid response"))
         }
         (&Method::PUT, false) => {
+            // PutObject with x-amz-copy-source is a server-side CopyObject.
+            if let Some(source) = &copy_source {
+                let (src_bucket, src_key) = parse_copy_source(source)?;
+                let (etag, _size) = gw
+                    .copy_object(&bucket, &key, &src_bucket, &src_key, &principal)
+                    .await?;
+                return Ok(xml_ok(copy_object_xml(&etag)));
+            }
             let raw = collect_body(req).await?;
             let body = if aws_chunked {
                 decode_aws_chunked(&raw)?
@@ -174,6 +192,26 @@ async fn route(
         }
         (&Method::GET, false) => {
             let (data, etag) = gw.get_object(&bucket, &key, &principal).await?;
+            // Range request -> 206 Partial Content with Content-Range. The
+            // object is decoded in full and sliced (range-aware EC reads are a
+            // later optimization).
+            if let Some(range) = &range_header {
+                if let Some((start, end)) = parse_range(range, data.len()) {
+                    let total = data.len();
+                    let slice = data.slice(start..end + 1);
+                    return Ok(Response::builder()
+                        .status(StatusCode::PARTIAL_CONTENT)
+                        .header(hyper::header::ETAG, quote(&etag))
+                        .header(
+                            hyper::header::CONTENT_RANGE,
+                            format!("bytes {start}-{end}/{total}"),
+                        )
+                        .header(hyper::header::CONTENT_LENGTH, slice.len())
+                        .header(hyper::header::CONTENT_TYPE, "application/octet-stream")
+                        .body(Full::new(slice))
+                        .expect("valid response"));
+                }
+            }
             Ok(Response::builder()
                 .status(StatusCode::OK)
                 .header(hyper::header::ETAG, quote(&etag))
@@ -477,6 +515,65 @@ fn parse_complete_parts(body: &[u8]) -> Result<Vec<u32>, GatewayError> {
     Ok(parts)
 }
 
+/// Parse an `x-amz-copy-source` header (`/bucket/key` or `bucket/key`, possibly
+/// percent-encoded, with an optional `?versionId=...` suffix) into
+/// `(bucket, key)`.
+fn parse_copy_source(header: &str) -> Result<(String, String), GatewayError> {
+    let trimmed = header.trim_start_matches('/');
+    let without_query = trimmed.split('?').next().unwrap_or(trimmed);
+    let (bucket, key) = without_query
+        .split_once('/')
+        .ok_or_else(|| GatewayError::BadRequest("malformed x-amz-copy-source".into()))?;
+    if bucket.is_empty() || key.is_empty() {
+        return Err(GatewayError::BadRequest("empty copy-source bucket or key".into()));
+    }
+    Ok((pct_decode(bucket), pct_decode(key)))
+}
+
+/// `CopyObjectResult` XML.
+fn copy_object_xml(etag: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+<CopyObjectResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+<LastModified>{}</LastModified><ETag>&quot;{}&quot;</ETag>\
+</CopyObjectResult>",
+        iso8601_millis(0),
+        xml_escape(etag)
+    )
+}
+
+/// Parse an HTTP `Range: bytes=...` header against a known object length,
+/// returning an inclusive `(start, end)`. Returns `None` for unsupported or
+/// unsatisfiable ranges (the caller then serves the full object).
+fn parse_range(header: &str, total: usize) -> Option<(usize, usize)> {
+    if total == 0 {
+        return None;
+    }
+    let spec = header.trim().strip_prefix("bytes=")?;
+    let (s, e) = spec.split_once('-')?; // a single range only
+    let last = total - 1;
+    let (start, end) = if s.is_empty() {
+        // Suffix range: the final N bytes.
+        let n: usize = e.trim().parse().ok()?;
+        if n == 0 {
+            return None;
+        }
+        (total.saturating_sub(n), last)
+    } else {
+        let start: usize = s.trim().parse().ok()?;
+        let end = if e.trim().is_empty() {
+            last
+        } else {
+            e.trim().parse::<usize>().ok()?.min(last)
+        };
+        (start, end)
+    };
+    if start > end || start > last {
+        return None;
+    }
+    Some((start, end))
+}
+
 /// Render a [`Listing`](backend::Listing) as an S3 `ListBucketResult` document.
 fn listing_xml(l: &backend::Listing) -> String {
     let mut s = String::new();
@@ -612,6 +709,39 @@ mod tests {
         let body = b"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part><Part><PartNumber>2</PartNumber><ETag>\"b\"</ETag></Part></CompleteMultipartUpload>";
         assert_eq!(parse_complete_parts(body).unwrap(), vec![1, 2]);
         assert!(parse_complete_parts(b"<x/>").is_err());
+    }
+
+    #[test]
+    fn parse_copy_source_forms() {
+        assert_eq!(
+            parse_copy_source("/bucket1/dir/obj").unwrap(),
+            ("bucket1".to_string(), "dir/obj".to_string())
+        );
+        assert_eq!(
+            parse_copy_source("bucket1/a%2Fb").unwrap(),
+            ("bucket1".to_string(), "a/b".to_string())
+        );
+        assert_eq!(
+            parse_copy_source("/bucket1/obj?versionId=9").unwrap(),
+            ("bucket1".to_string(), "obj".to_string())
+        );
+        assert!(parse_copy_source("nobucket").is_err());
+    }
+
+    #[test]
+    fn parse_range_forms() {
+        // bytes 0-9 of 100 -> inclusive (0, 9).
+        assert_eq!(parse_range("bytes=0-9", 100), Some((0, 9)));
+        // open-ended -> to last byte.
+        assert_eq!(parse_range("bytes=50-", 100), Some((50, 99)));
+        // suffix -> last 10 bytes.
+        assert_eq!(parse_range("bytes=-10", 100), Some((90, 99)));
+        // end clamped to last byte.
+        assert_eq!(parse_range("bytes=90-999", 100), Some((90, 99)));
+        // unsatisfiable / malformed -> None (caller serves full object).
+        assert_eq!(parse_range("bytes=200-300", 100), None);
+        assert_eq!(parse_range("items=0-9", 100), None);
+        assert_eq!(parse_range("bytes=0-9", 0), None);
     }
 }
 

@@ -405,6 +405,34 @@ impl Gateway {
         Ok(etag)
     }
 
+    /// Server-side copy: clone the source key's metadata under the destination
+    /// (an OBS-style reference copy — the destination shares the source's block
+    /// groups). Returns `(etag, size)`. A missing source maps to `NoSuchKey`.
+    pub async fn copy_object(
+        &self,
+        dest_bucket: &str,
+        dest_key: &str,
+        src_bucket: &str,
+        src_key: &str,
+        principal: &str,
+    ) -> Result<(String, u64), GatewayError> {
+        match self
+            .om()
+            .copy_key(om::CopyKeyRequest {
+                source: Some(vbk(src_bucket, src_key)),
+                dest: Some(vbk(dest_bucket, dest_key)),
+                auth: Some(auth(principal)),
+            })
+            .await
+        {
+            Ok(resp) => Ok((String::from_utf8_lossy(&resp.etag).into_owned(), resp.size)),
+            Err(OmClientError::Rpc(s)) if s.code() == tonic::Code::NotFound => {
+                Err(GatewayError::NoSuchKey)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// HEAD object: `(size, etag)` from OM metadata, no data read.
     pub async fn head_object(
         &self,
