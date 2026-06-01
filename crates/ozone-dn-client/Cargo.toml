@@ -5,6 +5,20 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "gRPC client for DatanodeGatewayService"
+description = "Domain-typed gateway-side client for DatanodeGatewayService"
 
 [dependencies]
+ozone-types = { path = "../ozone-types" }
+ozone-grpc-types = { path = "../ozone-grpc-types" }
+tonic = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+futures = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+ozone-dn-server = { path = "../ozone-dn-server" }
+ozone-fjall-store = { path = "../ozone-fjall-store" }
+ozone-storage = { path = "../ozone-storage" }

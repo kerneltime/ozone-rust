@@ -5,6 +5,19 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "gRPC server impl for DatanodeGatewayService"
+description = "DatanodeGatewayService server: container/block/chunk handlers over the storage traits"
 
 [dependencies]
+ozone-types = { path = "../ozone-types" }
+ozone-storage = { path = "../ozone-storage" }
+ozone-grpc-types = { path = "../ozone-grpc-types" }
+tonic = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+futures = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+ozone-fjall-store = { path = "../ozone-fjall-store" }
