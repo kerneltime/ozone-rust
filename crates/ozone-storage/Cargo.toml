@@ -5,6 +5,13 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Volume + container abstractions, BlockIndexStore trait"
+description = "Datanode storage contracts: chunk file store, CRC32C checksums, MetaStore trait"
 
 [dependencies]
+ozone-types = { path = "../ozone-types" }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+crc32c = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

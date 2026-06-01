@@ -8,3 +8,7 @@ authors.workspace = true
 description = "Prometheus + tracing-subscriber setup helpers"
 
 [dependencies]
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+prometheus = { workspace = true }
+thiserror = { workspace = true }

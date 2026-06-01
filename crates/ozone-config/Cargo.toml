@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Config loading from TOML + env"
+description = "Typed configuration for the datanode and S3 gateway binaries, loadable from TOML"
 
 [dependencies]
+serde = { workspace = true }
+toml = { workspace = true }
+thiserror = { workspace = true }
+ozone-types = { path = "../ozone-types" }
