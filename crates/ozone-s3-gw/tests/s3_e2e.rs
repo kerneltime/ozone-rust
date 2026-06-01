@@ -416,3 +416,87 @@ async fn s3_sdk_compliance_suite() {
         tokio::fs::remove_dir_all(&d.dir).await.ok();
     }
 }
+
+/// Multipart upload through the real AWS SDK: create, two upload-parts,
+/// complete, then GET the reassembled object. Each part is its own EC block
+/// group; the completed object is their concatenation, and the multipart ETag
+/// carries the `-N` part-count suffix.
+#[tokio::test]
+async fn s3_sdk_multipart_upload() {
+    use aws_sdk_s3::primitives::ByteStream;
+    use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+
+    let (base, dns) = spawn_stack().await;
+    let s3 = s3_client(&base);
+
+    let create = s3
+        .create_multipart_upload()
+        .bucket("bucket1")
+        .key("big.bin")
+        .send()
+        .await
+        .expect("create_multipart_upload");
+    let upload_id = create.upload_id().expect("upload id").to_string();
+
+    // Two parts, each spanning multiple EC stripes.
+    let part1: Vec<u8> = (0..3000u32).map(|i| (i % 256) as u8).collect();
+    let part2: Vec<u8> = (0..2000u32).map(|i| ((i + 99) % 256) as u8).collect();
+
+    let mut completed_parts = Vec::new();
+    for (n, body) in [(1i32, &part1), (2i32, &part2)] {
+        let up = s3
+            .upload_part()
+            .bucket("bucket1")
+            .key("big.bin")
+            .upload_id(&upload_id)
+            .part_number(n)
+            .body(ByteStream::from(body.clone()))
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("upload_part {n}: {e:?}"));
+        completed_parts.push(
+            CompletedPart::builder()
+                .part_number(n)
+                .e_tag(up.e_tag().unwrap_or_default())
+                .build(),
+        );
+    }
+
+    let completed = CompletedMultipartUpload::builder()
+        .set_parts(Some(completed_parts))
+        .build();
+    let comp = s3
+        .complete_multipart_upload()
+        .bucket("bucket1")
+        .key("big.bin")
+        .upload_id(&upload_id)
+        .multipart_upload(completed)
+        .send()
+        .await
+        .expect("complete_multipart_upload");
+    let etag = comp.e_tag().unwrap_or_default().to_string();
+    assert!(etag.contains("-2"), "multipart ETag must carry -N suffix: {etag}");
+
+    // GET returns part1 ++ part2 exactly, with the multipart ETag.
+    let got = s3
+        .get_object()
+        .bucket("bucket1")
+        .key("big.bin")
+        .send()
+        .await
+        .expect("get multipart object");
+    assert_eq!(got.e_tag().unwrap_or_default(), etag);
+    let got_bytes = got.body.collect().await.expect("collect").into_bytes();
+    let mut expected = part1.clone();
+    expected.extend_from_slice(&part2);
+    assert_eq!(
+        got_bytes.as_ref(),
+        &expected[..],
+        "multipart object must reassemble part1 ++ part2"
+    );
+
+    for d in &dns {
+        d.handle.abort();
+        tokio::fs::remove_dir_all(&d.dir).await.ok();
+    }
+}

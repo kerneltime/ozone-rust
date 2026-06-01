@@ -14,7 +14,7 @@
 //!   caller (the secure proxy), and `proxy_attested` is set true. The gateway
 //!   does NOT verify SigV4.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use bytes::Bytes;
 use md5::{Digest, Md5};
@@ -47,6 +47,9 @@ pub enum GatewayError {
     /// The requested bucket does not exist.
     #[error("no such bucket")]
     NoSuchBucket,
+    /// The referenced multipart upload id is unknown.
+    #[error("no such upload")]
+    NoSuchUpload,
     /// The request was malformed (bad path, missing field).
     #[error("bad request: {0}")]
     BadRequest(String),
@@ -112,11 +115,33 @@ pub struct Listing {
     pub common_prefixes: Vec<String>,
 }
 
-/// The gateway backend. Holds the OM channel and a per-datanode channel cache;
-/// per-call clients are built from these cloneable channels.
+/// One uploaded part of an in-flight multipart upload.
+struct MpuPart {
+    /// AWS part ETag (MD5 hex, unquoted).
+    etag_hex: String,
+    /// Raw 16-byte MD5 digest, fed to the final multipart-ETag computation.
+    etag_binary: Vec<u8>,
+    /// Part size in bytes.
+    size: u64,
+    /// The part's stored block group.
+    location: om::KeyLocation,
+}
+
+/// A part summary for `ListParts`: `(part_number, etag_hex, size)`.
+pub type PartSummary = (u32, String, u64);
+
+/// The gateway backend. Holds the OM channel, a per-datanode channel cache, and
+/// the in-flight multipart registry; per-call clients are built from the
+/// cloneable channels.
+///
+/// The multipart registry tracks parts in-process (the OM only finalizes at
+/// completion), so the gateway is stateful across the UploadPart/Complete
+/// requests of a single upload — acceptable for a single instance; a production
+/// deployment would persist part records in OM so any replica can complete.
 pub struct Gateway {
     om_channel: Channel,
     dn_channels: Mutex<HashMap<String, Channel>>,
+    mpu: Mutex<HashMap<String, BTreeMap<u32, MpuPart>>>,
     /// S3 region reported in responses (informational for OBS).
     pub region: String,
 }
@@ -135,6 +160,7 @@ impl Gateway {
         Ok(Self {
             om_channel,
             dn_channels: Mutex::new(HashMap::new()),
+            mpu: Mutex::new(HashMap::new()),
             region: region.into(),
         })
     }
@@ -242,19 +268,14 @@ impl Gateway {
         })
     }
 
-    /// PUT object: encode, fan shards to datanodes, commit metadata. Returns the
-    /// object's ETag (MD5 hex, unquoted).
-    pub async fn put_object(
+    /// Resolve a bucket's EC config (and confirm the bucket exists).
+    async fn bucket_ec(
         &self,
         bucket: &str,
-        key: &str,
         principal: &str,
-        body: Bytes,
-    ) -> Result<String, GatewayError> {
-        let mut om = self.om();
-
-        // Bucket existence + EC config.
-        let hb = om
+    ) -> Result<(EcReplicationConfig, dn::EcReplicationConfig), GatewayError> {
+        let hb = self
+            .om()
             .head_bucket(om::HeadBucketRequest {
                 volume_name: S3_VOLUME.to_string(),
                 bucket_name: bucket.to_string(),
@@ -268,26 +289,36 @@ impl Gateway {
             .default_ec_config
             .ok_or_else(|| GatewayError::Internal("bucket has no EC config".into()))?;
         let ec = to_domain_ec(&ec_wire)?;
+        Ok((ec, ec_wire))
+    }
+
+    /// Allocate a block from OM, EC-encode `body`, and write the k+p shards to
+    /// the pipeline datanodes (one shard per replica slot). Returns the
+    /// committed-shape [`om::KeyLocation`] plus the OM `client_id`/`open_version`
+    /// (the simple PUT path needs them for `CommitKey`; multipart discards them).
+    async fn allocate_and_write(
+        &self,
+        bucket: &str,
+        key: &str,
+        principal: &str,
+        ec: EcReplicationConfig,
+        ec_wire: &dn::EcReplicationConfig,
+        body: &[u8],
+    ) -> Result<(om::KeyLocation, u64, u64), GatewayError> {
         let profile = ec_profile(ec);
+        let shards = ozone_ec::stripe::encode_object(profile, body)?;
 
-        // Encode into k+p shards.
-        let shards = ozone_ec::stripe::encode_object(profile, &body)?;
-
-        // Allocate a block + pipeline.
-        let vbk = om::VolumeBucketKey {
-            volume_name: S3_VOLUME.to_string(),
-            bucket_name: bucket.to_string(),
-            key_name: key.to_string(),
-        };
-        let ck = om
+        let ck = self
+            .om()
             .create_key(om::CreateKeyRequest {
-                vbk: Some(vbk.clone()),
+                vbk: Some(vbk(bucket, key)),
                 expected_size: body.len() as u64,
                 ec_config: Some(ec_wire.clone()),
                 metadata: HashMap::new(),
                 auth: Some(auth(principal)),
             })
             .await?;
+        let (client_id, open_version) = (ck.client_id, ck.open_version);
         let block = ck
             .pre_allocated_blocks
             .into_iter()
@@ -304,8 +335,6 @@ impl Gateway {
 
         let k = ec.data as usize;
         let p = ec.parity as usize;
-
-        // Write each shard to the datanode holding its slot.
         for slot in 1..=(k + p) {
             let shard: &[u8] = if slot <= k {
                 &shards.data[slot - 1]
@@ -314,14 +343,12 @@ impl Gateway {
             };
             let endpoint = endpoint_for_slot(&pipeline, slot as u32)?;
             let mut dnc = self.dn(&endpoint).await?;
-
             // Ensure the container exists on this datanode (idempotent).
             match dnc.create_container(container, ec).await {
                 Ok(_) => {}
                 Err(DnClientError::Rpc(s)) if s.code() == tonic::Code::AlreadyExists => {}
                 Err(e) => return Err(e.into()),
             }
-
             let cd = checksum::compute(shard, ec.ec_chunk_size, ChecksumType::Crc32c)
                 .map_err(|e| GatewayError::Internal(format!("checksum: {e}")))?;
             let chunk = ChunkInfo {
@@ -334,33 +361,47 @@ impl Gateway {
             let block_slot = BlockId::ec(container, local, ReplicaIndex::new(slot as u8));
             dnc.write_chunk(&block_slot, &chunk, Bytes::copy_from_slice(shard))
                 .await?;
-
             let mut bd = BlockData::new(block_slot);
             bd.chunks.push(chunk);
             bd.set_block_group_len(body.len() as u64);
             dnc.put_block(&bd, true).await?;
         }
 
-        // ETag + commit.
-        let etag = md5_hex(&body);
-        let final_loc = om::KeyLocation {
+        let loc = om::KeyLocation {
             block_id: Some(group),
             offset: 0,
             length: body.len() as u64,
             pipeline: Some(pipeline),
             block_token: Vec::new(),
         };
-        om.commit_key(om::CommitKeyRequest {
-            client_id: ck.client_id,
-            open_version: ck.open_version,
-            vbk: Some(vbk),
-            final_size: body.len() as u64,
-            final_locations: vec![final_loc],
-            etag: etag.clone().into_bytes(),
-            auth: Some(auth(principal)),
-        })
-        .await?;
+        Ok((loc, client_id, open_version))
+    }
 
+    /// PUT object: encode + store one block group, then commit the key. Returns
+    /// the object's ETag (MD5 hex, unquoted).
+    pub async fn put_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        principal: &str,
+        body: Bytes,
+    ) -> Result<String, GatewayError> {
+        let (ec, ec_wire) = self.bucket_ec(bucket, principal).await?;
+        let (loc, client_id, open_version) = self
+            .allocate_and_write(bucket, key, principal, ec, &ec_wire, &body)
+            .await?;
+        let etag = md5_hex(&body);
+        self.om()
+            .commit_key(om::CommitKeyRequest {
+                client_id,
+                open_version,
+                vbk: Some(vbk(bucket, key)),
+                final_size: body.len() as u64,
+                final_locations: vec![loc],
+                etag: etag.clone().into_bytes(),
+                auth: Some(auth(principal)),
+            })
+            .await?;
         Ok(etag)
     }
 
@@ -511,6 +552,141 @@ impl Gateway {
         Ok(())
     }
 
+    /// Initiate a multipart upload: validate the bucket, get an upload id from
+    /// OM, and register in-flight state. Returns the upload id.
+    pub async fn initiate_multipart(
+        &self,
+        bucket: &str,
+        key: &str,
+        principal: &str,
+    ) -> Result<String, GatewayError> {
+        let (_, ec_wire) = self.bucket_ec(bucket, principal).await?;
+        let resp = self
+            .om()
+            .initiate_multipart_upload(om::InitiateMultipartUploadRequest {
+                vbk: Some(vbk(bucket, key)),
+                ec_config: Some(ec_wire),
+                metadata: HashMap::new(),
+                auth: Some(auth(principal)),
+            })
+            .await?;
+        let upload_id = resp.upload_id;
+        self.mpu
+            .lock()
+            .await
+            .insert(upload_id.clone(), BTreeMap::new());
+        Ok(upload_id)
+    }
+
+    /// Upload one part: EC-encode + store its block group, record it under the
+    /// upload, and return the part ETag (MD5 hex, unquoted).
+    pub async fn upload_part(
+        &self,
+        bucket: &str,
+        key: &str,
+        principal: &str,
+        upload_id: &str,
+        part_number: u32,
+        body: Bytes,
+    ) -> Result<String, GatewayError> {
+        if !self.mpu.lock().await.contains_key(upload_id) {
+            return Err(GatewayError::NoSuchUpload);
+        }
+        let (ec, ec_wire) = self.bucket_ec(bucket, principal).await?;
+        let (location, _, _) = self
+            .allocate_and_write(bucket, key, principal, ec, &ec_wire, &body)
+            .await?;
+        let etag_binary = md5_binary(&body);
+        let etag_hex = hex(&etag_binary);
+        let mut reg = self.mpu.lock().await;
+        let parts = reg.get_mut(upload_id).ok_or(GatewayError::NoSuchUpload)?;
+        parts.insert(
+            part_number,
+            MpuPart {
+                etag_hex: etag_hex.clone(),
+                etag_binary,
+                size: body.len() as u64,
+                location,
+            },
+        );
+        Ok(etag_hex)
+    }
+
+    /// Complete a multipart upload: assemble the named parts in order, hand them
+    /// to OM (which finalizes the key and computes the multipart ETag), and
+    /// return the final ETag (`<hash>-N`, unquoted).
+    pub async fn complete_multipart(
+        &self,
+        bucket: &str,
+        key: &str,
+        principal: &str,
+        upload_id: &str,
+        ordered_part_numbers: &[u32],
+    ) -> Result<String, GatewayError> {
+        if ordered_part_numbers.is_empty() {
+            return Err(GatewayError::BadRequest("complete with no parts".into()));
+        }
+        let parts: Vec<om::Part> = {
+            let reg = self.mpu.lock().await;
+            let stored = reg.get(upload_id).ok_or(GatewayError::NoSuchUpload)?;
+            let mut v = Vec::with_capacity(ordered_part_numbers.len());
+            for &pn in ordered_part_numbers {
+                let part = stored.get(&pn).ok_or_else(|| {
+                    GatewayError::BadRequest(format!("part {pn} was not uploaded"))
+                })?;
+                v.push(om::Part {
+                    part_number: pn,
+                    etag: part.etag_binary.clone(),
+                    size: part.size,
+                    locations: vec![part.location.clone()],
+                });
+            }
+            v
+        };
+        let resp = self
+            .om()
+            .complete_multipart_upload(om::CompleteMultipartUploadRequest {
+                vbk: Some(vbk(bucket, key)),
+                upload_id: upload_id.to_string(),
+                parts,
+                auth: Some(auth(principal)),
+            })
+            .await?;
+        self.mpu.lock().await.remove(upload_id);
+        Ok(String::from_utf8_lossy(&resp.etag).into_owned())
+    }
+
+    /// Abort a multipart upload: drop in-flight state and tell OM. Already-
+    /// written part blocks become garbage reclaimed by container GC (a
+    /// background reclaimer is out of scope for this slice).
+    pub async fn abort_multipart(
+        &self,
+        bucket: &str,
+        key: &str,
+        principal: &str,
+        upload_id: &str,
+    ) -> Result<(), GatewayError> {
+        self.mpu.lock().await.remove(upload_id);
+        self.om()
+            .abort_multipart_upload(om::AbortMultipartUploadRequest {
+                vbk: Some(vbk(bucket, key)),
+                upload_id: upload_id.to_string(),
+                auth: Some(auth(principal)),
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// List the parts uploaded so far for an in-flight upload.
+    pub async fn list_parts(&self, upload_id: &str) -> Result<Vec<PartSummary>, GatewayError> {
+        let reg = self.mpu.lock().await;
+        let parts = reg.get(upload_id).ok_or(GatewayError::NoSuchUpload)?;
+        Ok(parts
+            .iter()
+            .map(|(pn, p)| (*pn, p.etag_hex.clone(), p.size))
+            .collect())
+    }
+
     /// Shared OM lookup that maps `NotFound` -> [`GatewayError::NoSuchKey`].
     async fn lookup(
         &self,
@@ -550,6 +726,14 @@ fn auth(principal: &str) -> om::AuthContext {
     }
 }
 
+fn vbk(bucket: &str, key: &str) -> om::VolumeBucketKey {
+    om::VolumeBucketKey {
+        volume_name: S3_VOLUME.to_string(),
+        bucket_name: bucket.to_string(),
+        key_name: key.to_string(),
+    }
+}
+
 fn ec_profile(ec: EcReplicationConfig) -> ozone_ec::Profile {
     ozone_ec::Profile {
         data: ec.data as usize,
@@ -585,8 +769,16 @@ fn etag_of(info: &om::OmKeyInfoLite) -> String {
     info.metadata.get(ETAG_META_KEY).cloned().unwrap_or_default()
 }
 
-fn md5_hex(data: &[u8]) -> String {
+fn md5_binary(data: &[u8]) -> Vec<u8> {
     let mut h = Md5::new();
     h.update(data);
-    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    h.finalize().to_vec()
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn md5_hex(data: &[u8]) -> String {
+    hex(&md5_binary(data))
 }

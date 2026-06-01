@@ -83,6 +83,59 @@ async fn route(
         return Err(GatewayError::BadRequest("missing bucket in path".into()));
     }
 
+    // Multipart-upload subresources are selected by query string and take
+    // precedence over the plain object verbs for the same path.
+    if !key.is_empty() {
+        let q = query.as_deref();
+        if method == Method::POST && query_param(q, "uploads").is_some() {
+            let upload_id = gw.initiate_multipart(&bucket, &key, &principal).await?;
+            return Ok(xml_ok(initiate_mpu_xml(&bucket, &key, &upload_id)));
+        }
+        if let Some(upload_id) = query_param(q, "uploadId") {
+            if method == Method::PUT {
+                let part_number = query_param(q, "partNumber")
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .ok_or_else(|| {
+                        GatewayError::BadRequest("missing or invalid partNumber".into())
+                    })?;
+                let raw = collect_body(req).await?;
+                let body = if aws_chunked {
+                    decode_aws_chunked(&raw)?
+                } else {
+                    raw
+                };
+                let etag = gw
+                    .upload_part(&bucket, &key, &principal, &upload_id, part_number, body)
+                    .await?;
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header(hyper::header::ETAG, quote(&etag))
+                    .body(Full::new(Bytes::new()))
+                    .expect("valid response"));
+            } else if method == Method::POST {
+                let raw = collect_body(req).await?;
+                let body = if aws_chunked {
+                    decode_aws_chunked(&raw)?
+                } else {
+                    raw
+                };
+                let part_numbers = parse_complete_parts(&body)?;
+                let etag = gw
+                    .complete_multipart(&bucket, &key, &principal, &upload_id, &part_numbers)
+                    .await?;
+                return Ok(xml_ok(complete_mpu_xml(&bucket, &key, &etag)));
+            } else if method == Method::DELETE {
+                gw.abort_multipart(&bucket, &key, &principal, &upload_id)
+                    .await?;
+                return Ok(status_only(StatusCode::NO_CONTENT));
+            } else if method == Method::GET {
+                let parts = gw.list_parts(&upload_id).await?;
+                return Ok(xml_ok(list_parts_xml(&bucket, &key, &upload_id, &parts)));
+            }
+            return Err(GatewayError::BadRequest("unsupported multipart operation".into()));
+        }
+    }
+
     match (&method, key.is_empty()) {
         (&Method::HEAD, true) => {
             gw.head_bucket(&bucket, &principal).await?;
@@ -185,6 +238,7 @@ fn error_response(e: GatewayError) -> Response<Full<Bytes>> {
     let (status, code) = match e {
         GatewayError::NoSuchKey => (StatusCode::NOT_FOUND, "NoSuchKey"),
         GatewayError::NoSuchBucket => (StatusCode::NOT_FOUND, "NoSuchBucket"),
+        GatewayError::NoSuchUpload => (StatusCode::NOT_FOUND, "NoSuchUpload"),
         GatewayError::BadRequest(_) => (StatusCode::BAD_REQUEST, "InvalidRequest"),
         _ => (StatusCode::INTERNAL_SERVER_ERROR, "InternalError"),
     };
@@ -336,6 +390,93 @@ fn find_crlf(raw: &[u8], from: usize) -> Option<usize> {
         .map(|p| from + p)
 }
 
+/// 200 response with an XML body.
+fn xml_ok(xml: String) -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(hyper::header::CONTENT_TYPE, "application/xml")
+        .body(Full::new(Bytes::from(xml)))
+        .expect("valid response")
+}
+
+/// `InitiateMultipartUploadResult` XML.
+fn initiate_mpu_xml(bucket: &str, key: &str, upload_id: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+<InitiateMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+<Bucket>{}</Bucket><Key>{}</Key><UploadId>{}</UploadId>\
+</InitiateMultipartUploadResult>",
+        xml_escape(bucket),
+        xml_escape(key),
+        xml_escape(upload_id)
+    )
+}
+
+/// `CompleteMultipartUploadResult` XML.
+fn complete_mpu_xml(bucket: &str, key: &str, etag: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+<CompleteMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+<Location>/{}/{}</Location><Bucket>{}</Bucket><Key>{}</Key><ETag>&quot;{}&quot;</ETag>\
+</CompleteMultipartUploadResult>",
+        xml_escape(bucket),
+        xml_escape(key),
+        xml_escape(bucket),
+        xml_escape(key),
+        xml_escape(etag)
+    )
+}
+
+/// `ListPartsResult` XML.
+fn list_parts_xml(
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    parts: &[backend::PartSummary],
+) -> String {
+    let mut s = String::new();
+    s.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
+    s.push_str("<ListPartsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">");
+    s.push_str(&format!("<Bucket>{}</Bucket>", xml_escape(bucket)));
+    s.push_str(&format!("<Key>{}</Key>", xml_escape(key)));
+    s.push_str(&format!("<UploadId>{}</UploadId>", xml_escape(upload_id)));
+    s.push_str("<IsTruncated>false</IsTruncated>");
+    for (pn, etag, size) in parts {
+        s.push_str("<Part>");
+        s.push_str(&format!("<PartNumber>{pn}</PartNumber>"));
+        s.push_str(&format!("<ETag>&quot;{}&quot;</ETag>", xml_escape(etag)));
+        s.push_str(&format!("<Size>{size}</Size>"));
+        s.push_str("</Part>");
+    }
+    s.push_str("</ListPartsResult>");
+    s
+}
+
+/// Extract the ordered `<PartNumber>` values from a `CompleteMultipartUpload`
+/// request body. The ETags in the body are not required — the gateway holds the
+/// authoritative part records — so only the ordering is read here.
+fn parse_complete_parts(body: &[u8]) -> Result<Vec<u32>, GatewayError> {
+    let s = String::from_utf8_lossy(body);
+    let mut parts = Vec::new();
+    let mut rest: &str = s.as_ref();
+    while let Some(start) = rest.find("<PartNumber>") {
+        let after = &rest[start + "<PartNumber>".len()..];
+        let end = after.find("</PartNumber>").ok_or_else(|| {
+            GatewayError::BadRequest("malformed Part in complete request".into())
+        })?;
+        let n: u32 = after[..end]
+            .trim()
+            .parse()
+            .map_err(|_| GatewayError::BadRequest("invalid PartNumber".into()))?;
+        parts.push(n);
+        rest = &after[end..];
+    }
+    if parts.is_empty() {
+        return Err(GatewayError::BadRequest("no parts in complete request".into()));
+    }
+    Ok(parts)
+}
+
 /// Render a [`Listing`](backend::Listing) as an S3 `ListBucketResult` document.
 fn listing_xml(l: &backend::Listing) -> String {
     let mut s = String::new();
@@ -464,6 +605,13 @@ mod tests {
     fn aws_chunked_truncation_is_rejected() {
         let body = b"9;chunk-signature=a\r\nshort\r\n";
         assert!(decode_aws_chunked(body).is_err());
+    }
+
+    #[test]
+    fn parse_complete_parts_in_order() {
+        let body = b"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part><Part><PartNumber>2</PartNumber><ETag>\"b\"</ETag></Part></CompleteMultipartUpload>";
+        assert_eq!(parse_complete_parts(body).unwrap(), vec![1, 2]);
+        assert!(parse_complete_parts(b"<x/>").is_err());
     }
 }
 
