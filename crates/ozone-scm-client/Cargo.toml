@@ -8,3 +8,10 @@ authors.workspace = true
 description = "gRPC client for ScmRustDatanodeService"
 
 [dependencies]
+tonic = { workspace = true }
+futures = { workspace = true }
+thiserror = { workspace = true }
+ozone-grpc-types = { path = "../ozone-grpc-types" }
+
+[dev-dependencies]
+tokio = { workspace = true }

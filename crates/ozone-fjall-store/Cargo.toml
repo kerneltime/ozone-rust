@@ -5,6 +5,15 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "fjall-backed BlockIndexStore implementation"
+description = "fjall-backed MetaStore: container + block metadata persistence"
 
 [dependencies]
+ozone-types = { path = "../ozone-types" }
+ozone-storage = { path = "../ozone-storage" }
+fjall = { workspace = true }
+postcard = { workspace = true }
+serde = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

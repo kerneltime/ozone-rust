@@ -8,3 +8,9 @@ authors.workspace = true
 description = "gRPC client for OmRustGatewayService"
 
 [dependencies]
+tonic = { workspace = true }
+ozone-grpc-types = { path = "../ozone-grpc-types" }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

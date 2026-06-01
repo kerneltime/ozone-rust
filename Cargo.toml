@@ -56,6 +56,7 @@ fjall = "2.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
+postcard = { version = "1", features = ["use-std"] }
 
 # Bytes / buffers
 bytes = "1.8"

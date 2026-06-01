@@ -11,6 +11,8 @@ description = "tonic-build generated gRPC types for our three protos"
 tonic.workspace = true
 prost.workspace = true
 prost-types.workspace = true
+ozone-types = { path = "../ozone-types" }
+thiserror = { workspace = true }
 
 [build-dependencies]
 tonic-build.workspace = true
