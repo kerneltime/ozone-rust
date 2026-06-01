@@ -554,3 +554,88 @@ async fn s3_sdk_copy_object_and_range_get() {
         tokio::fs::remove_dir_all(&d.dir).await.ok();
     }
 }
+
+/// Batch delete, GetBucketLocation, and ListMultipartUploads via the real SDK.
+#[tokio::test]
+async fn s3_sdk_batch_delete_location_list_uploads() {
+    use aws_sdk_s3::primitives::ByteStream;
+    use aws_sdk_s3::types::{Delete, ObjectIdentifier};
+
+    let (base, dns) = spawn_stack().await;
+    let s3 = s3_client(&base);
+
+    // GetBucketLocation succeeds.
+    s3.get_bucket_location()
+        .bucket("bucket1")
+        .send()
+        .await
+        .expect("get_bucket_location");
+
+    // Two objects, then a batch delete of both.
+    for k in ["d1.txt", "d2.txt"] {
+        s3.put_object()
+            .bucket("bucket1")
+            .key(k)
+            .body(ByteStream::from(vec![1u8, 2, 3]))
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("put {k}: {e:?}"));
+    }
+    let del = Delete::builder()
+        .objects(ObjectIdentifier::builder().key("d1.txt").build().unwrap())
+        .objects(ObjectIdentifier::builder().key("d2.txt").build().unwrap())
+        .build()
+        .unwrap();
+    let res = s3
+        .delete_objects()
+        .bucket("bucket1")
+        .delete(del)
+        .send()
+        .await
+        .expect("delete_objects");
+    assert_eq!(res.deleted().len(), 2, "both keys reported deleted");
+    assert!(
+        s3.get_object()
+            .bucket("bucket1")
+            .key("d1.txt")
+            .send()
+            .await
+            .is_err(),
+        "deleted object is gone"
+    );
+
+    // ListMultipartUploads shows an in-flight upload.
+    let cmu = s3
+        .create_multipart_upload()
+        .bucket("bucket1")
+        .key("mpu.bin")
+        .send()
+        .await
+        .expect("create_multipart_upload");
+    let upload_id = cmu.upload_id().unwrap().to_string();
+    let listed = s3
+        .list_multipart_uploads()
+        .bucket("bucket1")
+        .send()
+        .await
+        .expect("list_multipart_uploads");
+    assert!(
+        listed
+            .uploads()
+            .iter()
+            .any(|u| u.upload_id() == Some(upload_id.as_str()) && u.key() == Some("mpu.bin")),
+        "in-flight upload should be listed"
+    );
+    s3.abort_multipart_upload()
+        .bucket("bucket1")
+        .key("mpu.bin")
+        .upload_id(&upload_id)
+        .send()
+        .await
+        .expect("abort_multipart_upload");
+
+    for d in &dns {
+        d.handle.abort();
+        tokio::fs::remove_dir_all(&d.dir).await.ok();
+    }
+}

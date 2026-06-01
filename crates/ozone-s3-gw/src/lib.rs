@@ -146,6 +146,30 @@ async fn route(
         }
     }
 
+    // Bucket-level subresources (query-string dispatched), taking precedence
+    // over plain bucket verbs.
+    if key.is_empty() {
+        let q = query.as_deref();
+        if method == Method::POST && query_param(q, "delete").is_some() {
+            let raw = collect_body(req).await?;
+            let body = if aws_chunked {
+                decode_aws_chunked(&raw)?
+            } else {
+                raw
+            };
+            let keys = parse_delete_request(&body)?;
+            let results = gw.delete_objects(&bucket, &keys, &principal).await;
+            return Ok(xml_ok(delete_result_xml(&results)));
+        }
+        if method == Method::GET && query_param(q, "location").is_some() {
+            return Ok(xml_ok(bucket_location_xml(&gw.region)));
+        }
+        if method == Method::GET && query_param(q, "uploads").is_some() {
+            let uploads = gw.list_multipart_uploads(&bucket).await;
+            return Ok(xml_ok(list_mpu_xml(&bucket, &uploads)));
+        }
+    }
+
     match (&method, key.is_empty()) {
         (&Method::HEAD, true) => {
             gw.head_bucket(&bucket, &principal).await?;
@@ -574,6 +598,79 @@ fn parse_range(header: &str, total: usize) -> Option<(usize, usize)> {
     Some((start, end))
 }
 
+/// Extract the `<Key>` values from a `DeleteObjects` request body.
+fn parse_delete_request(body: &[u8]) -> Result<Vec<String>, GatewayError> {
+    let s = String::from_utf8_lossy(body);
+    let mut keys = Vec::new();
+    let mut rest: &str = s.as_ref();
+    while let Some(start) = rest.find("<Key>") {
+        let after = &rest[start + "<Key>".len()..];
+        let end = after
+            .find("</Key>")
+            .ok_or_else(|| GatewayError::BadRequest("malformed Delete request".into()))?;
+        keys.push(xml_unescape(&after[..end]));
+        rest = &after[end..];
+    }
+    if keys.is_empty() {
+        return Err(GatewayError::BadRequest("no keys in delete request".into()));
+    }
+    Ok(keys)
+}
+
+/// Reverse of [`xml_escape`] for text taken from request XML.
+fn xml_unescape(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&") // must be last
+}
+
+/// `DeleteResult` XML for a batch delete.
+fn delete_result_xml(results: &[(String, Option<String>)]) -> String {
+    let mut s = String::new();
+    s.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
+    s.push_str("<DeleteResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">");
+    for (key, err) in results {
+        match err {
+            None => s.push_str(&format!("<Deleted><Key>{}</Key></Deleted>", xml_escape(key))),
+            Some(msg) => s.push_str(&format!(
+                "<Error><Key>{}</Key><Code>InternalError</Code><Message>{}</Message></Error>",
+                xml_escape(key),
+                xml_escape(msg)
+            )),
+        }
+    }
+    s.push_str("</DeleteResult>");
+    s
+}
+
+/// `LocationConstraint` XML for GetBucketLocation.
+fn bucket_location_xml(region: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+<LocationConstraint xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">{}</LocationConstraint>",
+        xml_escape(region)
+    )
+}
+
+/// `ListMultipartUploadsResult` XML.
+fn list_mpu_xml(bucket: &str, uploads: &[backend::UploadSummary]) -> String {
+    let mut s = String::new();
+    s.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
+    s.push_str("<ListMultipartUploadsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">");
+    s.push_str(&format!("<Bucket>{}</Bucket>", xml_escape(bucket)));
+    s.push_str("<IsTruncated>false</IsTruncated>");
+    for (upload_id, key) in uploads {
+        s.push_str("<Upload>");
+        s.push_str(&format!("<Key>{}</Key>", xml_escape(key)));
+        s.push_str(&format!("<UploadId>{}</UploadId>", xml_escape(upload_id)));
+        s.push_str("</Upload>");
+    }
+    s.push_str("</ListMultipartUploadsResult>");
+    s
+}
+
 /// Render a [`Listing`](backend::Listing) as an S3 `ListBucketResult` document.
 fn listing_xml(l: &backend::Listing) -> String {
     let mut s = String::new();
@@ -742,6 +839,21 @@ mod tests {
         assert_eq!(parse_range("bytes=200-300", 100), None);
         assert_eq!(parse_range("items=0-9", 100), None);
         assert_eq!(parse_range("bytes=0-9", 0), None);
+    }
+
+    #[test]
+    fn parse_delete_request_extracts_keys() {
+        let body = b"<Delete><Object><Key>a/b</Key></Object><Object><Key>c&amp;d</Key></Object></Delete>";
+        assert_eq!(
+            parse_delete_request(body).unwrap(),
+            vec!["a/b".to_string(), "c&d".to_string()]
+        );
+        assert!(parse_delete_request(b"<Delete></Delete>").is_err());
+    }
+
+    #[test]
+    fn xml_unescape_reverses_escape() {
+        assert_eq!(xml_unescape("a &amp;&lt;b&gt; &quot;c&quot;"), "a &<b> \"c\"");
     }
 }
 

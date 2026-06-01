@@ -127,8 +127,18 @@ struct MpuPart {
     location: om::KeyLocation,
 }
 
+/// In-flight multipart upload: its target key plus the parts uploaded so far.
+struct MpuUpload {
+    bucket: String,
+    key: String,
+    parts: BTreeMap<u32, MpuPart>,
+}
+
 /// A part summary for `ListParts`: `(part_number, etag_hex, size)`.
 pub type PartSummary = (u32, String, u64);
+
+/// An upload summary for `ListMultipartUploads`: `(upload_id, key)`.
+pub type UploadSummary = (String, String);
 
 /// The gateway backend. Holds the OM channel, a per-datanode channel cache, and
 /// the in-flight multipart registry; per-call clients are built from the
@@ -141,7 +151,7 @@ pub type PartSummary = (u32, String, u64);
 pub struct Gateway {
     om_channel: Channel,
     dn_channels: Mutex<HashMap<String, Channel>>,
-    mpu: Mutex<HashMap<String, BTreeMap<u32, MpuPart>>>,
+    mpu: Mutex<HashMap<String, MpuUpload>>,
     /// S3 region reported in responses (informational for OBS).
     pub region: String,
 }
@@ -580,6 +590,25 @@ impl Gateway {
         Ok(())
     }
 
+    /// Batch delete (S3 `DeleteObjects`). Deletes each key independently and
+    /// returns per-key outcomes: `(key, None)` on success, `(key, Some(msg))` on
+    /// error. Since object DELETE is idempotent, deleting an absent key succeeds.
+    pub async fn delete_objects(
+        &self,
+        bucket: &str,
+        keys: &[String],
+        principal: &str,
+    ) -> Vec<(String, Option<String>)> {
+        let mut results = Vec::with_capacity(keys.len());
+        for key in keys {
+            match self.delete_object(bucket, key, principal).await {
+                Ok(()) => results.push((key.clone(), None)),
+                Err(e) => results.push((key.clone(), Some(e.to_string()))),
+            }
+        }
+        results
+    }
+
     /// Initiate a multipart upload: validate the bucket, get an upload id from
     /// OM, and register in-flight state. Returns the upload id.
     pub async fn initiate_multipart(
@@ -599,10 +628,14 @@ impl Gateway {
             })
             .await?;
         let upload_id = resp.upload_id;
-        self.mpu
-            .lock()
-            .await
-            .insert(upload_id.clone(), BTreeMap::new());
+        self.mpu.lock().await.insert(
+            upload_id.clone(),
+            MpuUpload {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                parts: BTreeMap::new(),
+            },
+        );
         Ok(upload_id)
     }
 
@@ -627,8 +660,8 @@ impl Gateway {
         let etag_binary = md5_binary(&body);
         let etag_hex = hex(&etag_binary);
         let mut reg = self.mpu.lock().await;
-        let parts = reg.get_mut(upload_id).ok_or(GatewayError::NoSuchUpload)?;
-        parts.insert(
+        let up = reg.get_mut(upload_id).ok_or(GatewayError::NoSuchUpload)?;
+        up.parts.insert(
             part_number,
             MpuPart {
                 etag_hex: etag_hex.clone(),
@@ -659,7 +692,7 @@ impl Gateway {
             let stored = reg.get(upload_id).ok_or(GatewayError::NoSuchUpload)?;
             let mut v = Vec::with_capacity(ordered_part_numbers.len());
             for &pn in ordered_part_numbers {
-                let part = stored.get(&pn).ok_or_else(|| {
+                let part = stored.parts.get(&pn).ok_or_else(|| {
                     GatewayError::BadRequest(format!("part {pn} was not uploaded"))
                 })?;
                 v.push(om::Part {
@@ -708,11 +741,25 @@ impl Gateway {
     /// List the parts uploaded so far for an in-flight upload.
     pub async fn list_parts(&self, upload_id: &str) -> Result<Vec<PartSummary>, GatewayError> {
         let reg = self.mpu.lock().await;
-        let parts = reg.get(upload_id).ok_or(GatewayError::NoSuchUpload)?;
-        Ok(parts
+        let up = reg.get(upload_id).ok_or(GatewayError::NoSuchUpload)?;
+        Ok(up
+            .parts
             .iter()
             .map(|(pn, p)| (*pn, p.etag_hex.clone(), p.size))
             .collect())
+    }
+
+    /// List in-flight multipart uploads for a bucket as `(upload_id, key)`,
+    /// sorted by key then upload id for stable output.
+    pub async fn list_multipart_uploads(&self, bucket: &str) -> Vec<UploadSummary> {
+        let reg = self.mpu.lock().await;
+        let mut out: Vec<UploadSummary> = reg
+            .iter()
+            .filter(|(_, up)| up.bucket == bucket)
+            .map(|(id, up)| (id.clone(), up.key.clone()))
+            .collect();
+        out.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+        out
     }
 
     /// Shared OM lookup that maps `NotFound` -> [`GatewayError::NoSuchKey`].
