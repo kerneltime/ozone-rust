@@ -12,7 +12,9 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
-use isa_l_safe::{EcConfig as InnerCfg, EcError as InnerError, Encoder as InnerEncoder};
+use isa_l_safe::{
+    Decoder as InnerDecoder, EcConfig as InnerCfg, EcError as InnerError, Encoder as InnerEncoder,
+};
 use thiserror::Error;
 
 /// Ozone EC profile: the `(data, parity, ec_chunk_size)` triple.
@@ -152,6 +154,60 @@ impl Encoder {
     }
 }
 
+/// Reconstructs erased shards of a stripe under a fixed [`Profile`].
+///
+/// Wraps [`isa_l_safe::Decoder`] with profile awareness. Serves both the
+/// degraded-read path (recover erased *data* shards to satisfy a read) and the
+/// reconstruction path (rebuild any erased shards to restore redundancy). Shard
+/// indices are `0..profile.total()`, data shards first.
+///
+/// This is the layer the datanode/gateway use; they do not reach into
+/// `isa-l-safe` directly.
+pub struct Reconstructor {
+    profile: Profile,
+    inner: InnerDecoder,
+}
+
+impl Reconstructor {
+    /// Build a reconstructor for `profile`.
+    pub fn new(profile: Profile) -> Result<Self, EcError> {
+        let inner = InnerDecoder::new(InnerCfg {
+            data: profile.data,
+            parity: profile.parity,
+        })?;
+        Ok(Self { profile, inner })
+    }
+
+    /// Profile this reconstructor was built for.
+    #[inline]
+    pub fn profile(&self) -> Profile {
+        self.profile
+    }
+
+    /// Reconstruct `erased` shards from `k` surviving shards.
+    ///
+    /// `len` is the per-shard byte width: `chunk_size` for a full stripe, or the
+    /// (equal) trailing shard width for a partial last stripe. Any originally
+    /// short trailing shard must be re-padded to `len` by the caller before
+    /// reconstruction — the GF math runs on fixed-width shards.
+    ///
+    /// See [`isa_l_safe::Decoder::reconstruct`] for the full index/buffer
+    /// contract: `source_indices`/`sources` carry exactly `k` distinct surviving
+    /// shards, `erased`/`outputs` are parallel, and indices are `0..total()`.
+    pub fn reconstruct(
+        &self,
+        len: usize,
+        source_indices: &[usize],
+        sources: &[&[u8]],
+        erased: &[usize],
+        outputs: &mut [&mut [u8]],
+    ) -> Result<(), EcError> {
+        self.inner
+            .reconstruct(len, source_indices, sources, erased, outputs)?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,5 +282,59 @@ mod tests {
             err,
             EcError::Inner(InnerError::BufferLen { .. })
         ));
+    }
+
+    #[test]
+    fn encode_then_reconstruct_round_trip_rs_6_3() {
+        // End-to-end through the ozone-ec layer: encode a stripe with the
+        // Encoder, drop one data shard and one parity shard, rebuild both with
+        // the Reconstructor, and assert byte-equality with the originals.
+        let profile = Profile {
+            data: 6,
+            parity: 3,
+            chunk_size: 4096,
+        };
+        let len = profile.chunk_size;
+
+        let enc = Encoder::new(profile).unwrap();
+        let data_storage: Vec<Vec<u8>> = (0..profile.data)
+            .map(|i| (0..len).map(|j| ((i * 13 + j * 5 + 3) & 0xff) as u8).collect())
+            .collect();
+        let data: Vec<&[u8]> = data_storage.iter().map(|v| v.as_slice()).collect();
+        let mut parity_storage = vec![vec![0u8; len]; profile.parity];
+        {
+            let mut parity: Vec<&mut [u8]> = parity_storage
+                .iter_mut()
+                .map(|v| v.as_mut_slice())
+                .collect();
+            enc.encode_stripe(&data, &mut parity).unwrap();
+        }
+
+        // Full stripe: indices 0..6 data, 6..9 parity.
+        let mut stripe: Vec<Vec<u8>> = data_storage.clone();
+        stripe.extend(parity_storage.clone());
+
+        // Erase data shard 4 and parity shard 7; rebuild from the first 6 survivors.
+        let erased = [4usize, 7];
+        let survivors: Vec<usize> = (0..profile.total())
+            .filter(|i| !erased.contains(i))
+            .take(profile.data)
+            .collect();
+        let sources: Vec<&[u8]> = survivors.iter().map(|&i| stripe[i].as_slice()).collect();
+
+        let recon = Reconstructor::new(profile).unwrap();
+        assert_eq!(recon.profile(), profile);
+        let mut out_storage = vec![vec![0u8; len]; erased.len()];
+        {
+            let mut outputs: Vec<&mut [u8]> = out_storage
+                .iter_mut()
+                .map(|v| v.as_mut_slice())
+                .collect();
+            recon
+                .reconstruct(len, &survivors, &sources, &erased, &mut outputs)
+                .unwrap();
+        }
+        assert_eq!(out_storage[0], stripe[4], "data shard 4 not recovered");
+        assert_eq!(out_storage[1], stripe[7], "parity shard 7 not recovered");
     }
 }
