@@ -10,3 +10,6 @@ description = "Ozone-specific Reed-Solomon Cauchy EC layer"
 [dependencies]
 isa-l-safe = { path = "../isa-l-safe" }
 thiserror.workspace = true
+
+[dev-dependencies]
+proptest = { workspace = true }

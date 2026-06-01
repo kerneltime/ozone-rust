@@ -341,4 +341,61 @@ mod tests {
         let out = decode_object(profile, len, &views).unwrap();
         assert_eq!(out, data);
     }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(150))]
+
+        /// For any data length, any production-shaped profile, and any erasure
+        /// of up to `p` shards, the object decodes back byte-for-byte. Small
+        /// chunk sizes keep each case cheap while still exercising multi-stripe
+        /// and partial-stripe layouts.
+        #[test]
+        fn encode_then_decode_survives_any_p_erasures(
+            data in proptest::collection::vec(proptest::prelude::any::<u8>(), 0usize..1500),
+            profile_idx in 0usize..3,
+            drop_seed in proptest::prelude::any::<u64>(),
+        ) {
+            use std::collections::HashSet;
+            let profiles = [
+                Profile { data: 3, parity: 2, chunk_size: 16 },
+                Profile { data: 6, parity: 3, chunk_size: 16 },
+                Profile { data: 10, parity: 4, chunk_size: 16 },
+            ];
+            let profile = profiles[profile_idx];
+            let total = profile.total();
+            let p = profile.parity;
+
+            let shards = encode_object(profile, &data).unwrap();
+
+            // Deterministically drop up to p distinct shards (always recoverable
+            // since at least k survive).
+            let mut seed = drop_seed;
+            let mut next = || {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                seed
+            };
+            let n_drop = (next() % (p as u64 + 1)) as usize;
+            let mut dropped = HashSet::new();
+            while dropped.len() < n_drop {
+                dropped.insert((next() % total as u64) as usize);
+            }
+
+            let views: Vec<Option<&[u8]>> = (0..total)
+                .map(|i| {
+                    if dropped.contains(&i) {
+                        None
+                    } else if i < profile.data {
+                        Some(shards.data[i].as_slice())
+                    } else {
+                        Some(shards.parity[i - profile.data].as_slice())
+                    }
+                })
+                .collect();
+
+            let recovered = decode_object(profile, data.len(), &views).unwrap();
+            proptest::prop_assert_eq!(recovered, data);
+        }
+    }
 }
