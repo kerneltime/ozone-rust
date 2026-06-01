@@ -383,7 +383,6 @@ impl Gateway {
         principal: &str,
     ) -> Result<(Bytes, String), GatewayError> {
         let info = self.lookup(bucket, key, principal).await?;
-        let size = info.data_size as usize;
         let etag = etag_of(&info);
         let ec = to_domain_ec(
             info.ec_config
@@ -391,26 +390,48 @@ impl Gateway {
                 .ok_or_else(|| GatewayError::Internal("key has no EC config".into()))?,
         )?;
         let profile = ec_profile(ec);
-        let loc = info
-            .locations
-            .into_iter()
-            .next()
-            .ok_or_else(|| GatewayError::Internal("key has no locations".into()))?;
-        let pipeline = loc
-            .pipeline
-            .ok_or_else(|| GatewayError::Internal("location has no pipeline".into()))?;
-        let group = loc
-            .block_id
-            .ok_or_else(|| GatewayError::Internal("location has no block id".into()))?;
-        let container = ContainerId(group.container_id);
-        let local = LocalId(group.local_id);
-        let total = (ec.data + ec.parity) as usize;
 
-        // Gather every shard we can; missing/failed reads stay None and EC
-        // reconstructs as long as >= k survive.
+        // The object is the concatenation of its locations' block groups (one
+        // group for a simple PUT; one per part for a completed multipart upload).
+        let mut out = Vec::with_capacity(info.data_size as usize);
+        for loc in &info.locations {
+            let pipeline = loc
+                .pipeline
+                .as_ref()
+                .ok_or_else(|| GatewayError::Internal("location has no pipeline".into()))?;
+            let group = loc
+                .block_id
+                .as_ref()
+                .ok_or_else(|| GatewayError::Internal("location has no block id".into()))?;
+            let part = self
+                .read_block_group(
+                    profile,
+                    ContainerId(group.container_id),
+                    LocalId(group.local_id),
+                    pipeline,
+                    loc.length as usize,
+                )
+                .await?;
+            out.extend_from_slice(&part);
+        }
+        Ok((Bytes::from(out), etag))
+    }
+
+    /// Read and EC-decode a single block group of `length` user bytes. Gathers
+    /// every shard it can; missing/failed reads stay absent and the decoder
+    /// reconstructs as long as `>= k` shards survive.
+    async fn read_block_group(
+        &self,
+        profile: ozone_ec::Profile,
+        container: ContainerId,
+        local: LocalId,
+        pipeline: &om::Pipeline,
+        length: usize,
+    ) -> Result<Vec<u8>, GatewayError> {
+        let total = profile.data + profile.parity;
         let mut shard_bufs: Vec<Option<Vec<u8>>> = vec![None; total];
         for slot in 1..=total {
-            let endpoint = match endpoint_for_slot(&pipeline, slot as u32) {
+            let endpoint = match endpoint_for_slot(pipeline, slot as u32) {
                 Ok(e) => e,
                 Err(_) => continue,
             };
@@ -430,10 +451,8 @@ impl Gateway {
                 shard_bufs[slot - 1] = Some(b.to_vec());
             }
         }
-
         let views: Vec<Option<&[u8]>> = shard_bufs.iter().map(|o| o.as_deref()).collect();
-        let data = ozone_ec::stripe::decode_object(profile, size, &views)?;
-        Ok((Bytes::from(data), etag))
+        Ok(ozone_ec::stripe::decode_object(profile, length, &views)?)
     }
 
     /// DELETE object: remove OM metadata and best-effort delete shards. S3
