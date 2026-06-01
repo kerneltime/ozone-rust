@@ -23,6 +23,7 @@ pub mod backend;
 
 pub use backend::{Gateway, GatewayError};
 
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 
@@ -87,6 +88,7 @@ async fn route(
         .get(hyper::header::RANGE)
         .and_then(|v| v.to_str().ok())
         .map(String::from);
+    let user_metadata = collect_user_metadata(req.headers());
 
     let (bucket, key) = split_path(&path);
     if bucket.is_empty() {
@@ -224,7 +226,9 @@ async fn route(
             } else {
                 raw
             };
-            let etag = gw.put_object(&bucket, &key, &principal, body).await?;
+            let etag = gw
+                .put_object(&bucket, &key, &principal, body, user_metadata)
+                .await?;
             Ok(Response::builder()
                 .status(StatusCode::OK)
                 .header(hyper::header::ETAG, quote(&etag))
@@ -232,7 +236,7 @@ async fn route(
                 .expect("valid response"))
         }
         (&Method::GET, false) => {
-            let (data, etag) = gw.get_object(&bucket, &key, &principal).await?;
+            let (data, etag, metadata) = gw.get_object(&bucket, &key, &principal).await?;
             // Range request -> 206 Partial Content with Content-Range. The
             // object is decoded in full and sliced (range-aware EC reads are a
             // later optimization).
@@ -240,36 +244,42 @@ async fn route(
                 if let Some((start, end)) = parse_range(range, data.len()) {
                     let total = data.len();
                     let slice = data.slice(start..end + 1);
-                    return Ok(Response::builder()
-                        .status(StatusCode::PARTIAL_CONTENT)
-                        .header(hyper::header::ETAG, quote(&etag))
-                        .header(
-                            hyper::header::CONTENT_RANGE,
-                            format!("bytes {start}-{end}/{total}"),
-                        )
-                        .header(hyper::header::CONTENT_LENGTH, slice.len())
-                        .header(hyper::header::CONTENT_TYPE, "application/octet-stream")
-                        .body(Full::new(slice))
-                        .expect("valid response"));
+                    return Ok(apply_object_metadata(
+                        Response::builder()
+                            .status(StatusCode::PARTIAL_CONTENT)
+                            .header(hyper::header::ETAG, quote(&etag))
+                            .header(
+                                hyper::header::CONTENT_RANGE,
+                                format!("bytes {start}-{end}/{total}"),
+                            )
+                            .header(hyper::header::CONTENT_LENGTH, slice.len()),
+                        &metadata,
+                    )
+                    .body(Full::new(slice))
+                    .expect("valid response"));
                 }
             }
-            Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header(hyper::header::ETAG, quote(&etag))
-                .header(hyper::header::CONTENT_LENGTH, data.len())
-                .header(hyper::header::CONTENT_TYPE, "application/octet-stream")
-                .body(Full::new(data))
-                .expect("valid response"))
+            Ok(apply_object_metadata(
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(hyper::header::ETAG, quote(&etag))
+                    .header(hyper::header::CONTENT_LENGTH, data.len()),
+                &metadata,
+            )
+            .body(Full::new(data))
+            .expect("valid response"))
         }
         (&Method::HEAD, false) => {
-            let (size, etag) = gw.head_object(&bucket, &key, &principal).await?;
-            Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header(hyper::header::ETAG, quote(&etag))
-                .header(hyper::header::CONTENT_LENGTH, size)
-                .header(hyper::header::CONTENT_TYPE, "application/octet-stream")
-                .body(Full::new(Bytes::new()))
-                .expect("valid response"))
+            let (size, etag, metadata) = gw.head_object(&bucket, &key, &principal).await?;
+            Ok(apply_object_metadata(
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(hyper::header::ETAG, quote(&etag))
+                    .header(hyper::header::CONTENT_LENGTH, size),
+                &metadata,
+            )
+            .body(Full::new(Bytes::new()))
+            .expect("valid response"))
         }
         (&Method::DELETE, false) => {
             gw.delete_object(&bucket, &key, &principal).await?;
@@ -337,6 +347,50 @@ fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+/// Metadata key under which the gateway stores an object's Content-Type.
+const CONTENT_TYPE_META_KEY: &str = "content-type";
+
+/// Collect the object metadata to persist on a PUT: Content-Type and any
+/// `x-amz-meta-*` user metadata headers (lowercased header names).
+fn collect_user_metadata(headers: &hyper::HeaderMap) -> HashMap<String, String> {
+    let mut m = HashMap::new();
+    if let Some(ct) = headers
+        .get(hyper::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+    {
+        m.insert(CONTENT_TYPE_META_KEY.to_string(), ct.to_string());
+    }
+    for (name, value) in headers.iter() {
+        let n = name.as_str();
+        if n.starts_with("x-amz-meta-") {
+            if let Ok(v) = value.to_str() {
+                m.insert(n.to_string(), v.to_string());
+            }
+        }
+    }
+    m
+}
+
+/// Apply an object's stored metadata to a response: set Content-Type (defaulting
+/// to `application/octet-stream`) and re-emit `x-amz-meta-*` headers. The `ETAG`
+/// metadata entry is handled separately, so it is skipped here.
+fn apply_object_metadata(
+    mut builder: hyper::http::response::Builder,
+    metadata: &HashMap<String, String>,
+) -> hyper::http::response::Builder {
+    let content_type = metadata
+        .get(CONTENT_TYPE_META_KEY)
+        .map(String::as_str)
+        .unwrap_or("application/octet-stream");
+    builder = builder.header(hyper::header::CONTENT_TYPE, content_type);
+    for (k, v) in metadata {
+        if k.starts_with("x-amz-meta-") {
+            builder = builder.header(k.as_str(), v.as_str());
+        }
+    }
+    builder
 }
 
 /// Determine the request principal. Production traffic carries the proxy-
@@ -889,6 +943,43 @@ mod tests {
     #[test]
     fn xml_unescape_reverses_escape() {
         assert_eq!(xml_unescape("a &amp;&lt;b&gt; &quot;c&quot;"), "a &<b> \"c\"");
+    }
+
+    #[test]
+    fn aws_chunked_unsigned_payload_trailer_variant() {
+        // STREAMING-UNSIGNED-PAYLOAD-TRAILER: chunks carry no signature, and a
+        // checksum trailer follows the terminating zero chunk.
+        let body = b"5\r\nhello\r\n6\r\nworld!\r\n0\r\nx-amz-checksum-crc32:AAAAAA==\r\n\r\n";
+        assert_eq!(&decode_aws_chunked(body).unwrap()[..], b"helloworld!");
+    }
+
+    #[test]
+    fn aws_chunked_signed_with_trailer() {
+        // STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER: signed chunks plus a
+        // trailing checksum after the zero chunk.
+        let body =
+            b"3;chunk-signature=abc\r\nabc\r\n0;chunk-signature=def\r\nx-amz-checksum-crc32:AAAAAA==\r\n\r\n";
+        assert_eq!(&decode_aws_chunked(body).unwrap()[..], b"abc");
+    }
+
+    #[test]
+    fn is_aws_chunked_detects_all_streaming_variants() {
+        let none = hyper::HeaderMap::new();
+        assert!(!is_aws_chunked(&none));
+
+        for sha in [
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
+            "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+        ] {
+            let mut h = hyper::HeaderMap::new();
+            h.insert("x-amz-content-sha256", sha.parse().unwrap());
+            assert!(is_aws_chunked(&h), "should detect {sha}");
+        }
+
+        let mut enc = hyper::HeaderMap::new();
+        enc.insert(hyper::header::CONTENT_ENCODING, "aws-chunked".parse().unwrap());
+        assert!(is_aws_chunked(&enc));
     }
 }
 

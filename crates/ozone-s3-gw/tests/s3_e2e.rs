@@ -684,3 +684,57 @@ async fn s3_sdk_bucket_lifecycle() {
         tokio::fs::remove_dir_all(&d.dir).await.ok();
     }
 }
+
+/// Content-Type and x-amz-meta-* round-trip via the real SDK. The PUT is also
+/// SigV4-chunked-signed by the SDK, so this additionally covers chunked signing.
+#[tokio::test]
+async fn s3_sdk_content_type_and_user_metadata() {
+    use aws_sdk_s3::primitives::ByteStream;
+
+    let (base, dns) = spawn_stack().await;
+    let s3 = s3_client(&base);
+
+    let body = b"some text content".to_vec();
+    s3.put_object()
+        .bucket("bucket1")
+        .key("doc.txt")
+        .body(ByteStream::from(body.clone()))
+        .content_type("text/plain; charset=utf-8")
+        .metadata("author", "ritesh")
+        .metadata("project", "ozone-rust")
+        .send()
+        .await
+        .expect("put with metadata");
+
+    let got = s3
+        .get_object()
+        .bucket("bucket1")
+        .key("doc.txt")
+        .send()
+        .await
+        .expect("get");
+    assert_eq!(got.content_type(), Some("text/plain; charset=utf-8"));
+    let meta = got.metadata().expect("metadata present");
+    assert_eq!(meta.get("author").map(String::as_str), Some("ritesh"));
+    assert_eq!(meta.get("project").map(String::as_str), Some("ozone-rust"));
+    let got_bytes = got.body.collect().await.unwrap().into_bytes();
+    assert_eq!(got_bytes.as_ref(), &body[..]);
+
+    let head = s3
+        .head_object()
+        .bucket("bucket1")
+        .key("doc.txt")
+        .send()
+        .await
+        .expect("head");
+    assert_eq!(head.content_type(), Some("text/plain; charset=utf-8"));
+    assert_eq!(
+        head.metadata().and_then(|m| m.get("author")).map(String::as_str),
+        Some("ritesh")
+    );
+
+    for d in &dns {
+        d.handle.abort();
+        tokio::fs::remove_dir_all(&d.dir).await.ok();
+    }
+}

@@ -440,6 +440,7 @@ impl Gateway {
         key: &str,
         principal: &str,
         body: Bytes,
+        metadata: HashMap<String, String>,
     ) -> Result<String, GatewayError> {
         let (ec, ec_wire) = self.bucket_ec(bucket, principal).await?;
         let (loc, client_id, open_version) = self
@@ -454,6 +455,7 @@ impl Gateway {
                 final_size: body.len() as u64,
                 final_locations: vec![loc],
                 etag: etag.clone().into_bytes(),
+                metadata,
                 auth: Some(auth(principal)),
             })
             .await?;
@@ -488,24 +490,24 @@ impl Gateway {
         }
     }
 
-    /// HEAD object: `(size, etag)` from OM metadata, no data read.
+    /// HEAD object: `(size, etag, metadata)` from OM, no data read.
     pub async fn head_object(
         &self,
         bucket: &str,
         key: &str,
         principal: &str,
-    ) -> Result<(u64, String), GatewayError> {
+    ) -> Result<(u64, String, HashMap<String, String>), GatewayError> {
         let info = self.lookup(bucket, key, principal).await?;
-        Ok((info.data_size, etag_of(&info)))
+        Ok((info.data_size, etag_of(&info), info.metadata))
     }
 
-    /// GET object: gather shards, decode, return `(bytes, etag)`.
+    /// GET object: gather shards, decode, return `(bytes, etag, metadata)`.
     pub async fn get_object(
         &self,
         bucket: &str,
         key: &str,
         principal: &str,
-    ) -> Result<(Bytes, String), GatewayError> {
+    ) -> Result<(Bytes, String, HashMap<String, String>), GatewayError> {
         let info = self.lookup(bucket, key, principal).await?;
         let etag = etag_of(&info);
         let ec = to_domain_ec(
@@ -538,7 +540,7 @@ impl Gateway {
                 .await?;
             out.extend_from_slice(&part);
         }
-        Ok((Bytes::from(out), etag))
+        Ok((Bytes::from(out), etag, info.metadata))
     }
 
     /// Read and EC-decode a single block group of `length` user bytes. Gathers

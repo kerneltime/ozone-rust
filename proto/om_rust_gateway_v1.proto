@@ -185,6 +185,9 @@ message CommitKeyRequest {
   repeated KeyLocation final_locations = 5;
   bytes etag = 6;  // gateway-computed; OM stores in metadata[ETAG]
   AuthContext auth = 7;
+  // User metadata to persist on the key: Content-Type and x-amz-meta-* entries.
+  // The OM merges these with the ETag it records.
+  map<string, string> metadata = 8;
 }
 
 message CommitKeyResponse {

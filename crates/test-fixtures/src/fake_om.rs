@@ -450,7 +450,8 @@ impl OmRustGatewayService for FakeOm {
         let req = req.into_inner();
         let tuple = key_tuple(&req.vbk)?;
 
-        let mut metadata: HashMap<String, String> = HashMap::new();
+        // Persist user metadata (Content-Type, x-amz-meta-*), then record the ETag.
+        let mut metadata: HashMap<String, String> = req.metadata;
         metadata.insert(
             ETAG_METADATA_KEY.to_string(),
             String::from_utf8_lossy(&req.etag).into_owned(),
@@ -775,6 +776,7 @@ mod tests {
             final_size: 4096,
             final_locations: vec![loc],
             etag: b"deadbeef".to_vec(),
+            metadata: HashMap::new(),
             auth: None,
         }))
         .await
