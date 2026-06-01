@@ -821,3 +821,102 @@ async fn s3_sdk_conditional_requests() {
         tokio::fs::remove_dir_all(&d.dir).await.ok();
     }
 }
+
+/// Frame `data` as a SigV4 streaming (`aws-chunked`) signed body: each chunk is
+/// `<hexsize>;chunk-signature=<64 hex>\r\n<data>\r\n`, terminated by a zero
+/// chunk. The signatures are placeholders -- the gateway de-frames without
+/// verifying them (verification is the upstream proxy's job).
+fn aws_chunk_sign(data: &[u8], chunk_size: usize) -> Bytes {
+    let sig = "0".repeat(64);
+    let mut out = Vec::new();
+    for chunk in data.chunks(chunk_size) {
+        out.extend_from_slice(format!("{:x};chunk-signature={sig}\r\n", chunk.len()).as_bytes());
+        out.extend_from_slice(chunk);
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(format!("0;chunk-signature={sig}\r\n\r\n").as_bytes());
+    Bytes::from(out)
+}
+
+/// A controlled, multi-chunk SigV4-signed (`aws-chunked`) PUT. Frames a 5 KB
+/// object into ~8 signed chunks by hand and asserts the gateway de-frames and
+/// stores the exact decoded bytes.
+#[tokio::test]
+async fn signed_chunked_put_multiple_chunks() {
+    let (base, dns) = spawn_stack().await;
+    let client: HttpClient = Client::builder(TokioExecutor::new()).build_http();
+
+    let data: Vec<u8> = (0..5000u32).map(|i| (i % 256) as u8).collect();
+    let framed = aws_chunk_sign(&data, 700); // 8 chunks (7 of 700 + 1 of 100)
+
+    let req = Request::builder()
+        .method(Method::PUT)
+        .uri(format!("{base}/bucket1/signed.bin"))
+        .header("x-auth-principal", "tester")
+        .header("x-amz-content-sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD")
+        .header("content-encoding", "aws-chunked")
+        .body(Full::new(framed))
+        .unwrap();
+    let resp = client.request(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "signed chunked PUT");
+
+    let (st, _, got) = http(
+        &client,
+        Method::GET,
+        format!("{base}/bucket1/signed.bin"),
+        Some("tester"),
+        Bytes::new(),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        got.as_ref(),
+        &data[..],
+        "multi-chunk signed PUT must store the exact decoded bytes"
+    );
+
+    for d in &dns {
+        d.handle.abort();
+        tokio::fs::remove_dir_all(&d.dir).await.ok();
+    }
+}
+
+/// A large (1 MiB) PUT through the real SDK, which splits the body into many
+/// SigV4-signed aws-chunked frames -- exercising the multi-chunk signed path
+/// end to end through erasure coding.
+#[tokio::test]
+async fn s3_sdk_large_chunk_signed_put() {
+    use aws_sdk_s3::primitives::ByteStream;
+
+    let (base, dns) = spawn_stack().await;
+    let s3 = s3_client(&base);
+
+    let body: Vec<u8> = (0..1024u32 * 1024).map(|i| (i % 251) as u8).collect();
+    s3.put_object()
+        .bucket("bucket1")
+        .key("big-signed.bin")
+        .body(ByteStream::from(body.clone()))
+        .send()
+        .await
+        .expect("large chunk-signed put");
+
+    let got = s3
+        .get_object()
+        .bucket("bucket1")
+        .key("big-signed.bin")
+        .send()
+        .await
+        .expect("get large object");
+    let got_bytes = got.body.collect().await.unwrap().into_bytes();
+    assert_eq!(got_bytes.len(), body.len(), "length match");
+    assert_eq!(
+        got_bytes.as_ref(),
+        &body[..],
+        "large chunk-signed object must round-trip exactly through EC"
+    );
+
+    for d in &dns {
+        d.handle.abort();
+        tokio::fs::remove_dir_all(&d.dir).await.ok();
+    }
+}
