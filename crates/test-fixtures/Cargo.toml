@@ -8,3 +8,10 @@ authors.workspace = true
 description = "Shared test fixtures, EC golden vector loaders"
 
 [dependencies]
+ozone-grpc-types = { path = "../ozone-grpc-types" }
+tonic = { workspace = true }
+tokio-stream = { workspace = true }
+parking_lot = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

@@ -38,6 +38,7 @@ async-trait = "0.1"
 # HTTP / gRPC
 hyper = { version = "1.5", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
 h2 = "0.4"
 tonic = { version = "0.12", features = ["tls", "tls-roots", "gzip"] }
 tonic-build = { version = "0.12", features = ["prost"] }
@@ -93,6 +94,7 @@ reed-solomon-simd = "3"
 
 # Cryptography (for checksums)
 crc32c = "0.6"
+md-5 = "0.10"
 
 # Misc
 once_cell = "1"

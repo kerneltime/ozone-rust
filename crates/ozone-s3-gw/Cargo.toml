@@ -5,6 +5,33 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Gateway binary"
+description = "S3 gateway for OBS buckets: HTTP S3 -> OM metadata -> EC -> datanodes"
+
+[[bin]]
+name = "ozone-s3-gw"
+path = "src/main.rs"
 
 [dependencies]
+ozone-types = { path = "../ozone-types" }
+ozone-grpc-types = { path = "../ozone-grpc-types" }
+ozone-om-client = { path = "../ozone-om-client" }
+ozone-dn-client = { path = "../ozone-dn-client" }
+ozone-ec = { path = "../ozone-ec" }
+ozone-storage = { path = "../ozone-storage" }
+ozone-observability = { path = "../ozone-observability" }
+tonic = { workspace = true }
+tokio = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+md-5 = { workspace = true }
+
+[dev-dependencies]
+test-fixtures = { path = "../test-fixtures" }
+ozone-dn-server = { path = "../ozone-dn-server" }
+ozone-fjall-store = { path = "../ozone-fjall-store" }
+tokio-stream = { workspace = true }
