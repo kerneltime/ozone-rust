@@ -75,6 +75,38 @@ message HeadBucketResponse {
   string bucket_layout = 3;  // expected "OBJECT_STORE" for OBS
 }
 
+message CreateBucketRequest {
+  string volume_name = 1;
+  string bucket_name = 2;
+  org.apache.ozone.dn.v1.ECReplicationConfig default_ec_config = 3;
+  AuthContext auth = 4;
+}
+
+message CreateBucketResponse {
+  bool created = 1;  // false if the bucket already existed (idempotent create)
+}
+
+message DeleteBucketRequest {
+  string volume_name = 1;
+  string bucket_name = 2;
+  AuthContext auth = 3;
+}
+
+message DeleteBucketResponse {}
+
+message ListBucketsRequest {
+  string volume_name = 1;
+  AuthContext auth = 2;
+}
+
+message ListBucketsResponse {
+  message BucketInfo {
+    string bucket_name = 1;
+    uint64 creation_time_ms = 2;
+  }
+  repeated BucketInfo buckets = 1;
+}
+
 message LookupKeyRequest {
   VolumeBucketKey vbk = 1;
   AuthContext auth = 2;
@@ -261,6 +293,9 @@ message ListMultipartUploadsResponse {
 
 service OmRustGatewayService {
   rpc HeadBucket(HeadBucketRequest) returns (HeadBucketResponse);
+  rpc CreateBucket(CreateBucketRequest) returns (CreateBucketResponse);
+  rpc DeleteBucket(DeleteBucketRequest) returns (DeleteBucketResponse);
+  rpc ListBuckets(ListBucketsRequest) returns (ListBucketsResponse);
 
   rpc LookupKey(LookupKeyRequest) returns (LookupKeyResponse);
   rpc HeadKey(HeadKeyRequest) returns (HeadKeyResponse);

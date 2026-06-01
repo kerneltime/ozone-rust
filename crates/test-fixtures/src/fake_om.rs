@@ -138,6 +138,11 @@ struct State {
     /// per-part state to track here on purpose (see module docs: the gateway is
     /// the authority for in-flight parts; the OM only finalizes on `complete`).
     next_upload_id: u64,
+    /// Buckets that exist, keyed by `(volume, bucket)`, value = creation time ms
+    /// (always 0; no clock). Backs CreateBucket/DeleteBucket/ListBuckets.
+    /// HeadBucket stays permissive (always reports exists) so callers that
+    /// assume pre-provisioned OBS buckets keep working.
+    buckets: HashMap<(String, String), u64>,
 }
 
 /// In-memory fake Ozone Manager.
@@ -159,6 +164,7 @@ impl FakeOm {
                 next_local_id: 1,
                 next_client_id: 1,
                 next_upload_id: 1,
+                buckets: HashMap::new(),
             }),
             pipeline,
         }
@@ -252,6 +258,54 @@ impl OmRustGatewayService for FakeOm {
             default_ec_config: Some(self.ec()),
             bucket_layout: "OBJECT_STORE".to_string(),
         }))
+    }
+
+    /// Create a bucket. Idempotent: `created` is false if it already existed.
+    async fn create_bucket(
+        &self,
+        req: Request<pb::CreateBucketRequest>,
+    ) -> Result<Response<pb::CreateBucketResponse>, Status> {
+        let req = req.into_inner();
+        let created = self
+            .state
+            .lock()
+            .buckets
+            .insert((req.volume_name, req.bucket_name), 0)
+            .is_none();
+        Ok(Response::new(pb::CreateBucketResponse { created }))
+    }
+
+    /// Delete a bucket. Lenient: succeeds whether or not it existed.
+    async fn delete_bucket(
+        &self,
+        req: Request<pb::DeleteBucketRequest>,
+    ) -> Result<Response<pb::DeleteBucketResponse>, Status> {
+        let req = req.into_inner();
+        self.state
+            .lock()
+            .buckets
+            .remove(&(req.volume_name, req.bucket_name));
+        Ok(Response::new(pb::DeleteBucketResponse {}))
+    }
+
+    /// List buckets in a volume, sorted by name.
+    async fn list_buckets(
+        &self,
+        req: Request<pb::ListBucketsRequest>,
+    ) -> Result<Response<pb::ListBucketsResponse>, Status> {
+        let vol = req.into_inner().volume_name;
+        let st = self.state.lock();
+        let mut buckets: Vec<pb::list_buckets_response::BucketInfo> = st
+            .buckets
+            .iter()
+            .filter(|((v, _), _)| *v == vol)
+            .map(|((_, b), t)| pb::list_buckets_response::BucketInfo {
+                bucket_name: b.clone(),
+                creation_time_ms: *t,
+            })
+            .collect();
+        buckets.sort_by(|a, b| a.bucket_name.cmp(&b.bucket_name));
+        Ok(Response::new(pb::ListBucketsResponse { buckets }))
     }
 
     async fn lookup_key(

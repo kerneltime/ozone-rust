@@ -38,8 +38,10 @@ use ozone_grpc_types::om::gw::v1::om_rust_gateway_service_client::OmRustGatewayS
 use ozone_grpc_types::om::gw::v1::{
     AbortMultipartUploadRequest, AbortMultipartUploadResponse, AllocateBlockRequest,
     AllocateBlockResponse, CommitKeyRequest, CommitKeyResponse, CompleteMultipartUploadRequest,
-    CompleteMultipartUploadResponse, CopyKeyRequest, CopyKeyResponse, CreateKeyRequest,
-    CreateKeyResponse, DeleteKeyRequest, DeleteKeyResponse, HeadBucketRequest, HeadBucketResponse,
+    CompleteMultipartUploadResponse, CopyKeyRequest, CopyKeyResponse, CreateBucketRequest,
+    CreateBucketResponse, CreateKeyRequest, CreateKeyResponse, DeleteBucketRequest,
+    DeleteBucketResponse, DeleteKeyRequest, DeleteKeyResponse, HeadBucketRequest, HeadBucketResponse,
+    ListBucketsRequest, ListBucketsResponse,
     HeadKeyRequest, HeadKeyResponse, InitiateMultipartUploadRequest,
     InitiateMultipartUploadResponse, ListKeysRequest, ListKeysResponse,
     ListMultipartUploadsRequest, ListMultipartUploadsResponse, ListPartsRequest, ListPartsResponse,
@@ -135,6 +137,30 @@ impl OmClient {
         req: HeadBucketRequest,
     ) -> Result<HeadBucketResponse, OmClientError> {
         Ok(self.inner.head_bucket(req).await?.into_inner())
+    }
+
+    /// `CreateBucket` — create a bucket (idempotent).
+    pub async fn create_bucket(
+        &mut self,
+        req: CreateBucketRequest,
+    ) -> Result<CreateBucketResponse, OmClientError> {
+        Ok(self.inner.create_bucket(req).await?.into_inner())
+    }
+
+    /// `DeleteBucket` — delete a bucket.
+    pub async fn delete_bucket(
+        &mut self,
+        req: DeleteBucketRequest,
+    ) -> Result<DeleteBucketResponse, OmClientError> {
+        Ok(self.inner.delete_bucket(req).await?.into_inner())
+    }
+
+    /// `ListBuckets` — list the buckets in a volume.
+    pub async fn list_buckets(
+        &mut self,
+        req: ListBucketsRequest,
+    ) -> Result<ListBucketsResponse, OmClientError> {
+        Ok(self.inner.list_buckets(req).await?.into_inner())
     }
 
     /// `LookupKey` — resolve a key to its block locations for reads.

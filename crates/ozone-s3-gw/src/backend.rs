@@ -216,6 +216,51 @@ impl Gateway {
         }
     }
 
+    /// CreateBucket. Returns true if newly created, false if it already existed.
+    pub async fn create_bucket(&self, bucket: &str, principal: &str) -> Result<bool, GatewayError> {
+        let resp = self
+            .om()
+            .create_bucket(om::CreateBucketRequest {
+                volume_name: S3_VOLUME.to_string(),
+                bucket_name: bucket.to_string(),
+                default_ec_config: None,
+                auth: Some(auth(principal)),
+            })
+            .await?;
+        Ok(resp.created)
+    }
+
+    /// DeleteBucket.
+    pub async fn delete_bucket(&self, bucket: &str, principal: &str) -> Result<(), GatewayError> {
+        self.om()
+            .delete_bucket(om::DeleteBucketRequest {
+                volume_name: S3_VOLUME.to_string(),
+                bucket_name: bucket.to_string(),
+                auth: Some(auth(principal)),
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// ListBuckets in the S3 volume, as `(name, creation_time_ms)`.
+    pub async fn list_buckets(
+        &self,
+        principal: &str,
+    ) -> Result<Vec<(String, u64)>, GatewayError> {
+        let resp = self
+            .om()
+            .list_buckets(om::ListBucketsRequest {
+                volume_name: S3_VOLUME.to_string(),
+                auth: Some(auth(principal)),
+            })
+            .await?;
+        Ok(resp
+            .buckets
+            .into_iter()
+            .map(|b| (b.bucket_name, b.creation_time_ms))
+            .collect())
+    }
+
     /// List objects in a bucket (S3 `ListObjectsV2` semantics). OM performs the
     /// prefix filtering and delimiter folding; the gateway just shapes the
     /// result.

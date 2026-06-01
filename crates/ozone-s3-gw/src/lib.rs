@@ -90,6 +90,11 @@ async fn route(
 
     let (bucket, key) = split_path(&path);
     if bucket.is_empty() {
+        // GET / -> ListBuckets; no other verb is valid without a bucket.
+        if method == Method::GET {
+            let buckets = gw.list_buckets(&principal).await?;
+            return Ok(xml_ok(list_buckets_xml(&buckets)));
+        }
         return Err(GatewayError::BadRequest("missing bucket in path".into()));
     }
 
@@ -174,6 +179,18 @@ async fn route(
         (&Method::HEAD, true) => {
             gw.head_bucket(&bucket, &principal).await?;
             Ok(status_only(StatusCode::OK))
+        }
+        (&Method::PUT, true) => {
+            gw.create_bucket(&bucket, &principal).await?;
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(hyper::header::LOCATION, format!("/{bucket}"))
+                .body(Full::new(Bytes::new()))
+                .expect("valid response"))
+        }
+        (&Method::DELETE, true) => {
+            gw.delete_bucket(&bucket, &principal).await?;
+            Ok(status_only(StatusCode::NO_CONTENT))
         }
         (&Method::GET, true) => {
             let q = query.as_deref();
@@ -652,6 +669,24 @@ fn bucket_location_xml(region: &str) -> String {
 <LocationConstraint xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">{}</LocationConstraint>",
         xml_escape(region)
     )
+}
+
+/// `ListAllMyBucketsResult` XML for ListBuckets.
+fn list_buckets_xml(buckets: &[(String, u64)]) -> String {
+    let mut s = String::new();
+    s.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
+    s.push_str("<ListAllMyBucketsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">");
+    s.push_str("<Owner><ID>ozone</ID><DisplayName>ozone</DisplayName></Owner>");
+    s.push_str("<Buckets>");
+    for (name, ctime) in buckets {
+        s.push_str(&format!(
+            "<Bucket><Name>{}</Name><CreationDate>{}</CreationDate></Bucket>",
+            xml_escape(name),
+            iso8601_millis(*ctime)
+        ));
+    }
+    s.push_str("</Buckets></ListAllMyBucketsResult>");
+    s
 }
 
 /// `ListMultipartUploadsResult` XML.

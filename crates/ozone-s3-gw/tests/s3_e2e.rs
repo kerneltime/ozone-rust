@@ -639,3 +639,48 @@ async fn s3_sdk_batch_delete_location_list_uploads() {
         tokio::fs::remove_dir_all(&d.dir).await.ok();
     }
 }
+
+/// Bucket lifecycle via the real SDK: CreateBucket, ListBuckets, DeleteBucket.
+#[tokio::test]
+async fn s3_sdk_bucket_lifecycle() {
+    let (base, dns) = spawn_stack().await;
+    let s3 = s3_client(&base);
+
+    s3.create_bucket()
+        .bucket("alpha")
+        .send()
+        .await
+        .expect("create alpha");
+    s3.create_bucket()
+        .bucket("beta")
+        .send()
+        .await
+        .expect("create beta");
+
+    let names = |out: &aws_sdk_s3::operation::list_buckets::ListBucketsOutput| -> Vec<String> {
+        out.buckets()
+            .iter()
+            .filter_map(|b| b.name().map(String::from))
+            .collect()
+    };
+
+    let list = s3.list_buckets().send().await.expect("list_buckets");
+    let n = names(&list);
+    assert!(n.contains(&"alpha".to_string()), "buckets: {n:?}");
+    assert!(n.contains(&"beta".to_string()), "buckets: {n:?}");
+
+    s3.delete_bucket()
+        .bucket("beta")
+        .send()
+        .await
+        .expect("delete beta");
+    let list2 = s3.list_buckets().send().await.expect("list_buckets 2");
+    let n2 = names(&list2);
+    assert!(n2.contains(&"alpha".to_string()), "buckets: {n2:?}");
+    assert!(!n2.contains(&"beta".to_string()), "beta should be gone: {n2:?}");
+
+    for d in &dns {
+        d.handle.abort();
+        tokio::fs::remove_dir_all(&d.dir).await.ok();
+    }
+}
