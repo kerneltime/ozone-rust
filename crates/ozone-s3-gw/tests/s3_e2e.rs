@@ -107,29 +107,33 @@ fn md5_hex(data: &[u8]) -> String {
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
-#[tokio::test]
-async fn s3_object_lifecycle_with_degraded_read() {
-    // 5 datanodes for an RS-3-2 pipeline (small 1 KiB cells so the object spans
-    // several stripes, exercising the striping layout).
+/// Stand up 5 datanodes (RS-3-2, small 1 KiB cells so objects span several
+/// stripes) + a FakeOm pipeline + the gateway. Returns the gateway base URL and
+/// the datanode handles (for fault injection + cleanup).
+async fn spawn_stack() -> (String, Vec<Datanode>) {
     let mut dns = Vec::new();
     for i in 0..5 {
         dns.push(spawn_datanode(i).await);
     }
     let ec_wire: ozone_grpc_types::dn::v1::EcReplicationConfig =
         ozone_types::EcReplicationConfig::rs(3, 2, 1024).into();
-    let datanode_details: Vec<_> = dns
+    let details: Vec<_> = dns
         .iter()
         .map(|d| datanode_details(&d.uuid, "127.0.0.1", d.addr.port() as u32))
         .collect();
-    let (om_endpoint, _om) = spawn_om(PipelineConfig::new(datanode_details, ec_wire)).await;
-
+    let (om_endpoint, _om) = spawn_om(PipelineConfig::new(details, ec_wire)).await;
     let gateway = Arc::new(Gateway::connect(om_endpoint, "us-east-1").await.unwrap());
     let gw_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", gw_listener.local_addr().unwrap());
     tokio::spawn(async move {
         serve(gateway, gw_listener).await.ok();
     });
+    (base, dns)
+}
 
+#[tokio::test]
+async fn s3_object_lifecycle_with_degraded_read() {
+    let (base, dns) = spawn_stack().await;
     let client: HttpClient = Client::builder(TokioExecutor::new()).build_http();
     let url = format!("{base}/bucket1/dir/object.bin");
 
@@ -217,6 +221,66 @@ async fn s3_object_lifecycle_with_degraded_read() {
     assert_eq!(st, StatusCode::NOT_FOUND, "GET after DELETE");
 
     // Cleanup.
+    for d in &dns {
+        d.handle.abort();
+        tokio::fs::remove_dir_all(&d.dir).await.ok();
+    }
+}
+
+#[tokio::test]
+async fn s3_list_objects_v2_prefix_and_delimiter() {
+    let (base, dns) = spawn_stack().await;
+    let client: HttpClient = Client::builder(TokioExecutor::new()).build_http();
+
+    for key in ["dir1/a.txt", "dir1/b.txt", "top.txt"] {
+        let (st, _, _) = http(
+            &client,
+            Method::PUT,
+            format!("{base}/bucket1/{key}"),
+            Some("tester"),
+            Bytes::from_static(b"x"),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "PUT {key}");
+    }
+
+    // Delimiter "/" folds dir1/ into a common prefix; top.txt stays a key.
+    let (st, _, xml) = http(
+        &client,
+        Method::GET,
+        format!("{base}/bucket1?list-type=2&delimiter=%2F"),
+        Some("tester"),
+        Bytes::new(),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let xml = String::from_utf8_lossy(&xml);
+    assert!(xml.contains("<ListBucketResult"), "not a listing: {xml}");
+    assert!(
+        xml.contains("<CommonPrefixes><Prefix>dir1/</Prefix></CommonPrefixes>"),
+        "expected folded dir1/: {xml}"
+    );
+    assert!(xml.contains("<Key>top.txt</Key>"), "expected top.txt: {xml}");
+    assert!(
+        !xml.contains("<Key>dir1/a.txt</Key>"),
+        "delimiter should hide folded keys: {xml}"
+    );
+
+    // Prefix dir1/ (no delimiter) returns both nested keys.
+    let (st, _, xml) = http(
+        &client,
+        Method::GET,
+        format!("{base}/bucket1?list-type=2&prefix=dir1%2F"),
+        Some("tester"),
+        Bytes::new(),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let xml = String::from_utf8_lossy(&xml);
+    assert!(xml.contains("<Key>dir1/a.txt</Key>"), "{xml}");
+    assert!(xml.contains("<Key>dir1/b.txt</Key>"), "{xml}");
+    assert!(!xml.contains("<Key>top.txt</Key>"), "{xml}");
+
     for d in &dns {
         d.handle.abort();
         tokio::fs::remove_dir_all(&d.dir).await.ok();

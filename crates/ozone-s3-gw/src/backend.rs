@@ -77,6 +77,41 @@ impl From<DnClientError> for GatewayError {
     }
 }
 
+/// One object in a `ListObjectsV2` result.
+#[derive(Debug, Clone)]
+pub struct ObjectEntry {
+    /// Full object key.
+    pub key: String,
+    /// Object size in bytes.
+    pub size: u64,
+    /// ETag (unquoted; the HTTP layer adds quotes).
+    pub etag: String,
+    /// Last-modified time in epoch milliseconds.
+    pub last_modified_ms: u64,
+}
+
+/// A `ListObjectsV2` result: the keys (after prefix/delimiter folding) plus the
+/// folded common prefixes and the continuation cursor.
+#[derive(Debug, Clone)]
+pub struct Listing {
+    /// Bucket name.
+    pub name: String,
+    /// Echoed request prefix.
+    pub prefix: String,
+    /// Echoed request delimiter (empty if none).
+    pub delimiter: String,
+    /// Echoed request max-keys.
+    pub max_keys: u32,
+    /// Whether the result was truncated.
+    pub is_truncated: bool,
+    /// Continuation token for the next page (empty if none).
+    pub next_continuation_token: String,
+    /// Objects in this page.
+    pub contents: Vec<ObjectEntry>,
+    /// Folded common prefixes (directory-like grouping under the delimiter).
+    pub common_prefixes: Vec<String>,
+}
+
 /// The gateway backend. Holds the OM channel and a per-datanode channel cache;
 /// per-call clients are built from these cloneable channels.
 pub struct Gateway {
@@ -143,6 +178,68 @@ impl Gateway {
         } else {
             Err(GatewayError::NoSuchBucket)
         }
+    }
+
+    /// List objects in a bucket (S3 `ListObjectsV2` semantics). OM performs the
+    /// prefix filtering and delimiter folding; the gateway just shapes the
+    /// result.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn list_objects(
+        &self,
+        bucket: &str,
+        principal: &str,
+        prefix: String,
+        delimiter: String,
+        max_keys: u32,
+        continuation_token: String,
+    ) -> Result<Listing, GatewayError> {
+        let mut stream = self
+            .om()
+            .list_keys(om::ListKeysRequest {
+                volume_name: S3_VOLUME.to_string(),
+                bucket_name: bucket.to_string(),
+                prefix: prefix.clone(),
+                delimiter: delimiter.clone(),
+                continuation_token,
+                max_keys,
+                auth: Some(auth(principal)),
+            })
+            .await?;
+
+        let mut contents = Vec::new();
+        let mut common_prefixes = Vec::new();
+        let mut next_continuation_token = String::new();
+        let mut is_truncated = false;
+        while let Some(resp) = stream
+            .message()
+            .await
+            .map_err(|s| GatewayError::Om(Box::new(OmClientError::Rpc(s))))?
+        {
+            for k in resp.keys {
+                let key = k.vbk.as_ref().map(|v| v.key_name.clone()).unwrap_or_default();
+                let etag = etag_of(&k);
+                contents.push(ObjectEntry {
+                    key,
+                    size: k.data_size,
+                    etag,
+                    last_modified_ms: k.modification_time_ms,
+                });
+            }
+            common_prefixes.extend(resp.common_prefixes);
+            next_continuation_token = resp.next_continuation_token;
+            is_truncated = resp.is_truncated;
+        }
+
+        Ok(Listing {
+            name: bucket.to_string(),
+            prefix,
+            delimiter,
+            max_keys,
+            is_truncated,
+            next_continuation_token,
+            contents,
+            common_prefixes,
+        })
     }
 
     /// PUT object: encode, fan shards to datanodes, commit metadata. Returns the
