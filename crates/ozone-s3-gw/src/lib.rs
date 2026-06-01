@@ -76,6 +76,7 @@ async fn route(
     let path = req.uri().path().to_string();
     let query = req.uri().query().map(|q| q.to_string());
     let principal = extract_principal(req.headers());
+    let aws_chunked = is_aws_chunked(req.headers());
 
     let (bucket, key) = split_path(&path);
     if bucket.is_empty() {
@@ -105,7 +106,12 @@ async fn route(
                 .expect("valid response"))
         }
         (&Method::PUT, false) => {
-            let body = collect_body(req).await?;
+            let raw = collect_body(req).await?;
+            let body = if aws_chunked {
+                decode_aws_chunked(&raw)?
+            } else {
+                raw
+            };
             let etag = gw.put_object(&bucket, &key, &principal, body).await?;
             Ok(Response::builder()
                 .status(StatusCode::OK)
@@ -268,6 +274,68 @@ fn pct_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// True if the request body is SigV4 streaming (`aws-chunked`) framed.
+fn is_aws_chunked(headers: &hyper::HeaderMap) -> bool {
+    let streaming_sha = headers
+        .get("x-amz-content-sha256")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.starts_with("STREAMING"))
+        .unwrap_or(false);
+    let chunked_enc = headers
+        .get(hyper::header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.contains("aws-chunked"))
+        .unwrap_or(false);
+    streaming_sha || chunked_enc
+}
+
+/// Decode an `aws-chunked` request body (SigV4 streaming payload). Strips the
+/// per-chunk `<hex-size>;chunk-signature=...\r\n<data>\r\n` framing and the final
+/// zero-size chunk plus any trailers. Chunk signatures are NOT verified — the
+/// upstream proxy owns authentication; the gateway only de-frames the payload so
+/// the stored object is the user's exact bytes.
+fn decode_aws_chunked(raw: &[u8]) -> Result<Bytes, GatewayError> {
+    let mut out = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    loop {
+        let Some(nl) = find_crlf(raw, i) else {
+            return Err(GatewayError::BadRequest(
+                "aws-chunked: missing chunk-size line".into(),
+            ));
+        };
+        let header = &raw[i..nl];
+        i = nl + 2;
+        let size_end = header
+            .iter()
+            .position(|&b| b == b';')
+            .unwrap_or(header.len());
+        let size_str = std::str::from_utf8(&header[..size_end])
+            .map_err(|_| GatewayError::BadRequest("aws-chunked: non-utf8 size".into()))?;
+        let size = usize::from_str_radix(size_str.trim(), 16)
+            .map_err(|_| GatewayError::BadRequest("aws-chunked: bad hex size".into()))?;
+        if size == 0 {
+            break; // terminator chunk; ignore any trailers
+        }
+        if i + size > raw.len() {
+            return Err(GatewayError::BadRequest("aws-chunked: truncated chunk".into()));
+        }
+        out.extend_from_slice(&raw[i..i + size]);
+        i += size;
+        if raw.get(i..i + 2) == Some(b"\r\n") {
+            i += 2; // CRLF after each data chunk
+        }
+    }
+    Ok(Bytes::from(out))
+}
+
+/// Find the next CRLF at or after `from`, returning its start index.
+fn find_crlf(raw: &[u8], from: usize) -> Option<usize> {
+    raw.get(from..)?
+        .windows(2)
+        .position(|w| w == b"\r\n")
+        .map(|p| from + p)
+}
+
 /// Render a [`Listing`](backend::Listing) as an S3 `ListBucketResult` document.
 fn listing_xml(l: &backend::Listing) -> String {
     let mut s = String::new();
@@ -378,6 +446,24 @@ mod tests {
         assert_eq!(extract_principal(&h), "AKIDEXAMPLE");
         h.insert(PRINCIPAL_HEADER, "proxied-user".parse().unwrap());
         assert_eq!(extract_principal(&h), "proxied-user");
+    }
+
+    #[test]
+    fn aws_chunked_decodes_multiple_chunks() {
+        let body = b"5;chunk-signature=a\r\nhello\r\n6;chunk-signature=b\r\nworld!\r\n0;chunk-signature=c\r\n\r\n";
+        assert_eq!(&decode_aws_chunked(body).unwrap()[..], b"helloworld!");
+    }
+
+    #[test]
+    fn aws_chunked_single_chunk() {
+        let body = b"3;chunk-signature=x\r\nabc\r\n0;chunk-signature=y\r\n\r\n";
+        assert_eq!(&decode_aws_chunked(body).unwrap()[..], b"abc");
+    }
+
+    #[test]
+    fn aws_chunked_truncation_is_rejected() {
+        let body = b"9;chunk-signature=a\r\nshort\r\n";
+        assert!(decode_aws_chunked(body).is_err());
     }
 }
 

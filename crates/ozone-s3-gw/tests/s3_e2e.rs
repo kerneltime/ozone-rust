@@ -286,3 +286,133 @@ async fn s3_list_objects_v2_prefix_and_delimiter() {
         tokio::fs::remove_dir_all(&d.dir).await.ok();
     }
 }
+
+/// Build a real AWS S3 SDK client pointed at the gateway. Path-style addressing
+/// (no virtual-host buckets), static creds (the gateway extracts the access key
+/// id from the SigV4 Authorization header as the principal — it does not verify
+/// the signature).
+fn s3_client(base: &str) -> aws_sdk_s3::Client {
+    use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
+    let creds = Credentials::new("AKIDCOMPLIANCE", "secretkey", None, None, "ozone-test");
+    let conf = aws_sdk_s3::Config::builder()
+        .behavior_version(BehaviorVersion::latest())
+        .region(Region::new("us-east-1"))
+        .endpoint_url(base.to_string())
+        .credentials_provider(creds)
+        .force_path_style(true)
+        .build();
+    aws_sdk_s3::Client::from_conf(conf)
+}
+
+/// Compliance check against the real AWS S3 SDK: the SDK signs with SigV4 and
+/// frames the PUT body as `aws-chunked`, exercising the gateway's signature
+/// principal extraction and chunk de-framing, then the full object lifecycle
+/// and listing through a genuine S3 client.
+#[tokio::test]
+async fn s3_sdk_compliance_suite() {
+    use aws_sdk_s3::primitives::ByteStream;
+
+    let (base, dns) = spawn_stack().await;
+    let s3 = s3_client(&base);
+
+    // HEAD bucket.
+    s3.head_bucket()
+        .bucket("bucket1")
+        .send()
+        .await
+        .expect("head_bucket");
+
+    // PUT an object that spans several EC stripes (chunked + signed by the SDK).
+    let body: Vec<u8> = (0..5000u32).map(|i| (i % 256) as u8).collect();
+    let put = s3
+        .put_object()
+        .bucket("bucket1")
+        .key("docs/report.bin")
+        .body(ByteStream::from(body.clone()))
+        .send()
+        .await
+        .expect("put_object");
+    let etag = put.e_tag().unwrap_or_default().to_string();
+    assert!(!etag.is_empty(), "PUT returned an ETag");
+
+    // GET round-trips the exact bytes and the same ETag.
+    let got = s3
+        .get_object()
+        .bucket("bucket1")
+        .key("docs/report.bin")
+        .send()
+        .await
+        .expect("get_object");
+    assert_eq!(got.e_tag().unwrap_or_default(), etag, "GET ETag matches PUT");
+    let got_bytes = got.body.collect().await.expect("collect body").into_bytes();
+    assert_eq!(got_bytes.as_ref(), &body[..], "GET body matches PUT");
+
+    // HEAD reports the size.
+    let head = s3
+        .head_object()
+        .bucket("bucket1")
+        .key("docs/report.bin")
+        .send()
+        .await
+        .expect("head_object");
+    assert_eq!(head.content_length(), Some(5000));
+
+    // ListObjectsV2: prefix returns the keys; delimiter folds the prefix.
+    s3.put_object()
+        .bucket("bucket1")
+        .key("docs/notes.txt")
+        .body(ByteStream::from(vec![1u8, 2, 3]))
+        .send()
+        .await
+        .expect("put notes");
+    let list = s3
+        .list_objects_v2()
+        .bucket("bucket1")
+        .prefix("docs/")
+        .send()
+        .await
+        .expect("list_objects_v2");
+    let keys: Vec<String> = list
+        .contents()
+        .iter()
+        .filter_map(|o| o.key().map(String::from))
+        .collect();
+    assert!(keys.contains(&"docs/report.bin".to_string()), "keys: {keys:?}");
+    assert!(keys.contains(&"docs/notes.txt".to_string()), "keys: {keys:?}");
+
+    let dlist = s3
+        .list_objects_v2()
+        .bucket("bucket1")
+        .delimiter("/")
+        .send()
+        .await
+        .expect("list delimiter");
+    let prefixes: Vec<String> = dlist
+        .common_prefixes()
+        .iter()
+        .filter_map(|c| c.prefix().map(String::from))
+        .collect();
+    assert!(prefixes.contains(&"docs/".to_string()), "prefixes: {prefixes:?}");
+
+    // DELETE then GET -> typed NoSuchKey error.
+    s3.delete_object()
+        .bucket("bucket1")
+        .key("docs/report.bin")
+        .send()
+        .await
+        .expect("delete_object");
+    let err = s3
+        .get_object()
+        .bucket("bucket1")
+        .key("docs/report.bin")
+        .send()
+        .await
+        .expect_err("GET after DELETE must fail");
+    let svc = err.into_service_error();
+    assert!(svc.is_no_such_key(), "expected NoSuchKey, got: {svc:?}");
+
+    for d in &dns {
+        d.handle.abort();
+        tokio::fs::remove_dir_all(&d.dir).await.ok();
+    }
+}

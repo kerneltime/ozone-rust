@@ -102,6 +102,10 @@ uuid = { version = "1", features = ["v4", "serde"] }
 parking_lot = "0.12"
 dashmap = "6"
 
+# Real AWS S3 SDK -- used only by the gateway's S3-compliance test suite to
+# validate the gateway against an actual S3 client (SigV4, path-style, XML).
+aws-sdk-s3 = "1"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
