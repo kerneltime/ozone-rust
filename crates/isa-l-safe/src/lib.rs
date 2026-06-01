@@ -507,6 +507,76 @@ mod tests {
         }
     }
 
+    /// Byte-equivalence with Apache Ozone's Java EC coder, proven WITHOUT a JVM.
+    ///
+    /// Ozone's `RSRawEncoder` builds its generator matrix with
+    /// `RSUtil.genCauchyMatrix` (hadoop-hdds/erasurecode) -- identity rows, then
+    /// parity rows `a[pos] = GF256.gfInv(i ^ j)` over GF(2^8) with primitive
+    /// polynomial 285 (0x11D). Its native coder is literally ISA-L. We port that
+    /// exact construction here and assert it yields the SAME matrix as ISA-L's
+    /// `gf_gen_cauchy1_matrix`. Because both encode by multiplying that matrix
+    /// over the same field, identical matrices imply byte-identical parity --
+    /// so our EC output equals Ozone's, for both its native and pure-Java coders.
+    #[test]
+    fn matrix_byte_identical_to_ozone_java_cauchy() {
+        // GF(2^8) multiply, reduction polynomial 0x11D (low byte 0x1D).
+        fn gf_mul(mut a: u8, mut b: u8) -> u8 {
+            let mut product = 0u8;
+            for _ in 0..8 {
+                if b & 1 != 0 {
+                    product ^= a;
+                }
+                let high = a & 0x80;
+                a <<= 1;
+                if high != 0 {
+                    a ^= 0x1d;
+                }
+                b >>= 1;
+            }
+            product
+        }
+        // Multiplicative inverse in GF(2^8): x^254 (unique, generator-agnostic).
+        fn gf_inv(x: u8) -> u8 {
+            let (mut result, mut base, mut exp) = (1u8, x, 254u32);
+            while exp > 0 {
+                if exp & 1 == 1 {
+                    result = gf_mul(result, base);
+                }
+                base = gf_mul(base, base);
+                exp >>= 1;
+            }
+            result
+        }
+        // Direct port of Ozone's RSUtil.genCauchyMatrix(a, m, k).
+        fn ozone_cauchy(m: usize, k: usize) -> Vec<u8> {
+            let mut a = vec![0u8; m * k];
+            for i in 0..k {
+                a[k * i + i] = 1;
+            }
+            let mut pos = k * k;
+            for i in k..m {
+                for j in 0..k {
+                    a[pos] = gf_inv((i ^ j) as u8);
+                    pos += 1;
+                }
+            }
+            a
+        }
+
+        for cfg in [
+            EcConfig { data: 3, parity: 2 },
+            EcConfig { data: 6, parity: 3 },
+            EcConfig { data: 10, parity: 4 },
+        ] {
+            let isal = build_encode_matrix(cfg);
+            let ozone = ozone_cauchy(cfg.total(), cfg.data);
+            assert_eq!(
+                isal, ozone,
+                "ISA-L generator matrix differs from Ozone's Java Cauchy matrix for {cfg:?}"
+            );
+        }
+    }
+
     #[test]
     fn all_zero_data_yields_all_zero_parity_rs_6_3() {
         let enc = Encoder::new(EcConfig { data: 6, parity: 3 }).unwrap();
