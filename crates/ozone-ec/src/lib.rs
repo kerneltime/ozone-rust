@@ -17,6 +17,8 @@ use isa_l_safe::{
 };
 use thiserror::Error;
 
+pub mod stripe;
+
 /// Ozone EC profile: the `(data, parity, ec_chunk_size)` triple.
 ///
 /// Production defaults from Apache Ozone:
@@ -81,6 +83,22 @@ pub enum EcError {
         got: usize,
         /// Bytes in a full stripe.
         full: usize,
+    },
+    /// A degraded read or reconstruction had fewer than `k` surviving shards.
+    #[error("not enough shards to decode: have {have}, need {need}")]
+    NotEnoughShards {
+        /// Surviving shards available.
+        have: usize,
+        /// Data shards required (`k`).
+        need: usize,
+    },
+    /// The shard slice handed to a stripe operation was not `k+p` long.
+    #[error("expected {expected} shard slots (k+p), got {got}")]
+    ShardCount {
+        /// `k+p`.
+        expected: usize,
+        /// Slots provided.
+        got: usize,
     },
 }
 
