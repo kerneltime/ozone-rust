@@ -5,11 +5,12 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Shared test fixtures, EC golden vector loaders"
+description = "Shared test fixtures: in-memory FakeOm + FakeScm servers"
 
 [dependencies]
 ozone-grpc-types = { path = "../ozone-grpc-types" }
 tonic = { workspace = true }
+tokio = { workspace = true }
 tokio-stream = { workspace = true }
 parking_lot = { workspace = true }
 md-5 = { workspace = true }

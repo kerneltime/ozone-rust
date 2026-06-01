@@ -5,6 +5,20 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Datanode binary"
+description = "Datanode binary: DatanodeGatewayService server + SCM registration loop"
+
+[[bin]]
+name = "ozone-dn"
+path = "src/main.rs"
 
 [dependencies]
+ozone-types = { path = "../ozone-types" }
+ozone-config = { path = "../ozone-config" }
+ozone-observability = { path = "../ozone-observability" }
+ozone-grpc-types = { path = "../ozone-grpc-types" }
+ozone-storage = { path = "../ozone-storage" }
+ozone-fjall-store = { path = "../ozone-fjall-store" }
+ozone-dn-server = { path = "../ozone-dn-server" }
+tokio = { workspace = true }
+tonic = { workspace = true }
+tracing = { workspace = true }

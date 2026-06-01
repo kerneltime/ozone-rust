@@ -17,6 +17,9 @@
 
 #![forbid(unsafe_code)]
 
+pub mod scm;
+pub use scm::{ScmLoopError, ScmRegistration};
+
 use std::pin::Pin;
 use std::sync::Arc;
 
