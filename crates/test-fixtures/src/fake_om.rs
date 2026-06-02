@@ -519,6 +519,27 @@ impl OmRustGatewayService for FakeOm {
         Ok(Response::new(pb::CopyKeyResponse { size, etag }))
     }
 
+    /// Replace the object's full tag set. Tags are stored in the key metadata
+    /// under an `x-amz-tag-<key>` prefix (so they never collide with user
+    /// `x-amz-meta-*` metadata). NotFound if the key is absent.
+    async fn put_object_tagging(
+        &self,
+        req: Request<pb::PutObjectTaggingRequest>,
+    ) -> Result<Response<pb::PutObjectTaggingResponse>, Status> {
+        let req = req.into_inner();
+        let tuple = key_tuple(&req.vbk)?;
+        let mut st = self.state.lock();
+        let info = st
+            .keys
+            .get_mut(&tuple)
+            .ok_or_else(|| Status::not_found(format!("key not found: {}", tuple.2)))?;
+        info.metadata.retain(|k, _| !k.starts_with("x-amz-tag-"));
+        for tag in req.tags {
+            info.metadata.insert(format!("x-amz-tag-{}", tag.key), tag.value);
+        }
+        Ok(Response::new(pb::PutObjectTaggingResponse {}))
+    }
+
     /// Initiate a multipart upload: mint a unique `upload_id` and return it.
     ///
     /// The id is `upload-{n}` where `n` is a monotonic counter (first call

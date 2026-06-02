@@ -822,6 +822,159 @@ async fn s3_sdk_conditional_requests() {
     }
 }
 
+/// Object tagging via the real SDK: read the (empty) initial set, put a two-tag
+/// set, read it back, confirm tags do not leak into user metadata or the body,
+/// overwrite (replace, not merge), delete, and finally that tagging a missing key
+/// surfaces NoSuchKey.
+#[tokio::test]
+async fn s3_sdk_object_tagging() {
+    use aws_sdk_s3::error::ProvideErrorMetadata;
+    use aws_sdk_s3::primitives::ByteStream;
+    use aws_sdk_s3::types::{Tag, Tagging};
+
+    let (base, dns) = spawn_stack().await;
+    let s3 = s3_client(&base);
+
+    s3.put_object()
+        .bucket("bucket1")
+        .key("tagged.bin")
+        .body(ByteStream::from(vec![1u8, 2, 3, 4]))
+        .metadata("author", "ritesh")
+        .send()
+        .await
+        .expect("put object");
+
+    // A fresh object has no tags.
+    let empty = s3
+        .get_object_tagging()
+        .bucket("bucket1")
+        .key("tagged.bin")
+        .send()
+        .await
+        .expect("get_object_tagging (empty)");
+    assert!(empty.tag_set().is_empty(), "new object has no tags");
+
+    let pairs = |out: &aws_sdk_s3::operation::get_object_tagging::GetObjectTaggingOutput| {
+        out.tag_set()
+            .iter()
+            .map(|t| (t.key().to_string(), t.value().to_string()))
+            .collect::<Vec<_>>()
+    };
+
+    // Put a two-tag set; the gateway returns it sorted by key (env, team).
+    let tagging = Tagging::builder()
+        .set_tag_set(Some(vec![
+            Tag::builder().key("team").value("storage").build().unwrap(),
+            Tag::builder().key("env").value("prod").build().unwrap(),
+        ]))
+        .build()
+        .unwrap();
+    s3.put_object_tagging()
+        .bucket("bucket1")
+        .key("tagged.bin")
+        .tagging(tagging)
+        .send()
+        .await
+        .expect("put_object_tagging");
+    let got = s3
+        .get_object_tagging()
+        .bucket("bucket1")
+        .key("tagged.bin")
+        .send()
+        .await
+        .expect("get_object_tagging");
+    assert_eq!(
+        pairs(&got),
+        vec![
+            ("env".to_string(), "prod".to_string()),
+            ("team".to_string(), "storage".to_string()),
+        ]
+    );
+
+    // Tags must NOT leak into the object's user metadata or change its body.
+    let obj = s3
+        .get_object()
+        .bucket("bucket1")
+        .key("tagged.bin")
+        .send()
+        .await
+        .expect("get object");
+    let meta = obj.metadata().expect("user metadata");
+    assert_eq!(meta.get("author").map(String::as_str), Some("ritesh"));
+    assert!(
+        meta.keys().all(|k| !k.contains("tag")),
+        "tags must not surface as user metadata: {meta:?}"
+    );
+    let body = obj.body.collect().await.unwrap().into_bytes();
+    assert_eq!(body.as_ref(), &[1u8, 2, 3, 4]);
+
+    // Overwrite with a single tag -> the set is replaced, not merged.
+    let replaced = Tagging::builder()
+        .set_tag_set(Some(vec![Tag::builder()
+            .key("env")
+            .value("staging")
+            .build()
+            .unwrap()]))
+        .build()
+        .unwrap();
+    s3.put_object_tagging()
+        .bucket("bucket1")
+        .key("tagged.bin")
+        .tagging(replaced)
+        .send()
+        .await
+        .expect("replace tags");
+    let after = s3
+        .get_object_tagging()
+        .bucket("bucket1")
+        .key("tagged.bin")
+        .send()
+        .await
+        .expect("get after replace");
+    assert_eq!(pairs(&after), vec![("env".to_string(), "staging".to_string())]);
+
+    // DeleteObjectTagging -> empty set.
+    s3.delete_object_tagging()
+        .bucket("bucket1")
+        .key("tagged.bin")
+        .send()
+        .await
+        .expect("delete_object_tagging");
+    let cleared = s3
+        .get_object_tagging()
+        .bucket("bucket1")
+        .key("tagged.bin")
+        .send()
+        .await
+        .expect("get after delete");
+    assert!(cleared.tag_set().is_empty(), "tags cleared after delete");
+
+    // Tagging a missing key surfaces NoSuchKey.
+    let err = s3
+        .put_object_tagging()
+        .bucket("bucket1")
+        .key("ghost.bin")
+        .tagging(
+            Tagging::builder()
+                .set_tag_set(Some(vec![Tag::builder()
+                    .key("a")
+                    .value("b")
+                    .build()
+                    .unwrap()]))
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .expect_err("tagging a missing key must fail");
+    assert_eq!(err.code(), Some("NoSuchKey"), "expected NoSuchKey: {err:?}");
+
+    for d in &dns {
+        d.handle.abort();
+        tokio::fs::remove_dir_all(&d.dir).await.ok();
+    }
+}
+
 /// Frame `data` as a SigV4 streaming (`aws-chunked`) signed body: each chunk is
 /// `<hexsize>;chunk-signature=<64 hex>\r\n<data>\r\n`, terminated by a zero
 /// chunk. The signatures are placeholders -- the gateway de-frames without

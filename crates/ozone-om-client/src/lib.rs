@@ -45,7 +45,7 @@ use ozone_grpc_types::om::gw::v1::{
     HeadKeyRequest, HeadKeyResponse, InitiateMultipartUploadRequest,
     InitiateMultipartUploadResponse, ListKeysRequest, ListKeysResponse,
     ListMultipartUploadsRequest, ListMultipartUploadsResponse, ListPartsRequest, ListPartsResponse,
-    LookupKeyRequest, LookupKeyResponse,
+    LookupKeyRequest, LookupKeyResponse, PutObjectTaggingRequest, PutObjectTaggingResponse,
 };
 use tonic::transport::{Channel, Endpoint};
 
@@ -218,6 +218,14 @@ impl OmClient {
         req: CopyKeyRequest,
     ) -> Result<CopyKeyResponse, OmClientError> {
         Ok(self.inner.copy_key(req).await?.into_inner())
+    }
+
+    /// `PutObjectTagging` — replace an object's full tag set.
+    pub async fn put_object_tagging(
+        &mut self,
+        req: PutObjectTaggingRequest,
+    ) -> Result<PutObjectTaggingResponse, OmClientError> {
+        Ok(self.inner.put_object_tagging(req).await?.into_inner())
     }
 
     /// `InitiateMultipartUpload` — begin a multipart upload; returns the upload id.

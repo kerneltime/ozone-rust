@@ -212,6 +212,22 @@ message CopyKeyResponse {
   bytes etag = 2;
 }
 
+message Tag {
+  string key = 1;
+  string value = 2;
+}
+
+// Replace the full tag set on an existing object (S3 PutObjectTagging;
+// DeleteObjectTagging is this with an empty tag list). GetObjectTagging is
+// served by the gateway from LookupKey metadata, so it needs no RPC.
+message PutObjectTaggingRequest {
+  VolumeBucketKey vbk = 1;
+  repeated Tag tags = 2;
+  AuthContext auth = 3;
+}
+
+message PutObjectTaggingResponse {}
+
 // =============================================================
 // Multipart upload
 // =============================================================
@@ -309,6 +325,7 @@ service OmRustGatewayService {
   rpc CommitKey(CommitKeyRequest) returns (CommitKeyResponse);
   rpc DeleteKey(DeleteKeyRequest) returns (DeleteKeyResponse);
   rpc CopyKey(CopyKeyRequest) returns (CopyKeyResponse);
+  rpc PutObjectTagging(PutObjectTaggingRequest) returns (PutObjectTaggingResponse);
 
   rpc InitiateMultipartUpload(InitiateMultipartUploadRequest) returns (InitiateMultipartUploadResponse);
   rpc AbortMultipartUpload(AbortMultipartUploadRequest) returns (AbortMultipartUploadResponse);

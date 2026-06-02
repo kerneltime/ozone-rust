@@ -36,6 +36,9 @@ use ozone_types::{
 const S3_VOLUME: &str = "s3v";
 /// The metadata key under which OM stores the object ETag.
 const ETAG_META_KEY: &str = "ETAG";
+/// Prefix for object tag entries persisted in OM key metadata. Keeps the S3 tag
+/// set namespaced away from user `x-amz-meta-*` metadata and the reserved ETag.
+const TAG_META_PREFIX: &str = "x-amz-tag-";
 
 /// Errors surfaced from the gateway data path. The HTTP layer maps these onto
 /// S3 status codes.
@@ -488,6 +491,57 @@ impl Gateway {
             }
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// PUT object tagging: replace the object's full tag set. Tags are persisted
+    /// in OM key metadata under the `x-amz-tag-` prefix (so they never collide
+    /// with user `x-amz-meta-*` metadata or the reserved ETag). An empty `tags`
+    /// clears all tags, which is exactly how `DeleteObjectTagging` is served. A
+    /// missing key maps to `NoSuchKey`.
+    pub async fn put_object_tagging(
+        &self,
+        bucket: &str,
+        key: &str,
+        principal: &str,
+        tags: Vec<(String, String)>,
+    ) -> Result<(), GatewayError> {
+        match self
+            .om()
+            .put_object_tagging(om::PutObjectTaggingRequest {
+                vbk: Some(vbk(bucket, key)),
+                tags: tags
+                    .into_iter()
+                    .map(|(key, value)| om::Tag { key, value })
+                    .collect(),
+                auth: Some(auth(principal)),
+            })
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(OmClientError::Rpc(s)) if s.code() == tonic::Code::NotFound => {
+                Err(GatewayError::NoSuchKey)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// GET object tagging: read the object's tag set from OM key metadata,
+    /// stripping the `x-amz-tag-` prefix. Returns the tags sorted by key for a
+    /// stable response. A missing key maps to `NoSuchKey`.
+    pub async fn get_object_tagging(
+        &self,
+        bucket: &str,
+        key: &str,
+        principal: &str,
+    ) -> Result<Vec<(String, String)>, GatewayError> {
+        let info = self.lookup(bucket, key, principal).await?;
+        let mut tags: Vec<(String, String)> = info
+            .metadata
+            .into_iter()
+            .filter_map(|(k, v)| k.strip_prefix(TAG_META_PREFIX).map(|t| (t.to_string(), v)))
+            .collect();
+        tags.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(tags)
     }
 
     /// HEAD object: `(size, etag, metadata)` from OM, no data read.

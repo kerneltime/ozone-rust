@@ -114,6 +114,30 @@ async fn route(
     // precedence over the plain object verbs for the same path.
     if !key.is_empty() {
         let q = query.as_deref();
+        // Object tagging subresource (?tagging), dispatched ahead of the plain
+        // object verbs. PutObjectTagging replaces the full tag set; GET reads it;
+        // DELETE clears it (modeled as a put with an empty set).
+        if query_param(q, "tagging").is_some() {
+            if method == Method::PUT {
+                let raw = collect_body(req).await?;
+                let body = if aws_chunked {
+                    decode_aws_chunked(&raw)?
+                } else {
+                    raw
+                };
+                let tags = parse_tagging(&body)?;
+                gw.put_object_tagging(&bucket, &key, &principal, tags).await?;
+                return Ok(status_only(StatusCode::OK));
+            } else if method == Method::GET {
+                let tags = gw.get_object_tagging(&bucket, &key, &principal).await?;
+                return Ok(xml_ok(tagging_xml(&tags)));
+            } else if method == Method::DELETE {
+                gw.put_object_tagging(&bucket, &key, &principal, Vec::new())
+                    .await?;
+                return Ok(status_only(StatusCode::NO_CONTENT));
+            }
+            return Err(GatewayError::BadRequest("unsupported tagging operation".into()));
+        }
         if method == Method::POST && query_param(q, "uploads").is_some() {
             let upload_id = gw.initiate_multipart(&bucket, &key, &principal).await?;
             return Ok(xml_ok(initiate_mpu_xml(&bucket, &key, &upload_id)));
@@ -723,6 +747,70 @@ fn copy_object_xml(etag: &str) -> String {
     )
 }
 
+/// `Tagging` XML for GetObjectTagging (also the body shape PutObjectTagging
+/// accepts). An empty tag set still renders the `<TagSet/>` wrapper.
+fn tagging_xml(tags: &[(String, String)]) -> String {
+    let mut s = String::new();
+    s.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
+    s.push_str("<Tagging xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">");
+    s.push_str("<TagSet>");
+    for (k, v) in tags {
+        s.push_str("<Tag>");
+        s.push_str(&format!("<Key>{}</Key>", xml_escape(k)));
+        s.push_str(&format!("<Value>{}</Value>", xml_escape(v)));
+        s.push_str("</Tag>");
+    }
+    s.push_str("</TagSet>");
+    s.push_str("</Tagging>");
+    s
+}
+
+/// Parse a `Tagging` request body into `(key, value)` pairs, enforcing the S3
+/// limits: at most 10 tags, key length 1..=128, value length 0..=256 (counted in
+/// Unicode scalar values). Tag text is XML-unescaped. An empty `<TagSet/>` yields
+/// an empty vec, which is how DeleteObjectTagging clears the set.
+fn parse_tagging(body: &[u8]) -> Result<Vec<(String, String)>, GatewayError> {
+    let s = String::from_utf8_lossy(body);
+    let mut tags = Vec::new();
+    let mut rest: &str = s.as_ref();
+    while let Some(start) = rest.find("<Tag>") {
+        let after = &rest[start + "<Tag>".len()..];
+        let end = after.find("</Tag>").ok_or_else(|| {
+            GatewayError::BadRequest("malformed Tagging: unterminated <Tag>".into())
+        })?;
+        let block = &after[..end];
+        let key = extract_xml_element(block, "Key")
+            .ok_or_else(|| GatewayError::BadRequest("tag missing <Key>".into()))?;
+        let value = extract_xml_element(block, "Value").unwrap_or("");
+        let (key, value) = (xml_unescape(key), xml_unescape(value));
+        if key.is_empty() || key.chars().count() > 128 {
+            return Err(GatewayError::BadRequest("tag key length out of range".into()));
+        }
+        if value.chars().count() > 256 {
+            return Err(GatewayError::BadRequest("tag value length out of range".into()));
+        }
+        tags.push((key, value));
+        rest = &after[end + "</Tag>".len()..];
+    }
+    if tags.len() > 10 {
+        return Err(GatewayError::BadRequest(
+            "a request can contain at most 10 tags".into(),
+        ));
+    }
+    Ok(tags)
+}
+
+/// Return the inner text of the first `<name>…</name>` element in `haystack`, or
+/// `None` if absent. Used to pull `<Key>`/`<Value>` out of a `<Tag>` block.
+fn extract_xml_element<'a>(haystack: &'a str, name: &str) -> Option<&'a str> {
+    let open = format!("<{name}>");
+    let close = format!("</{name}>");
+    let start = haystack.find(&open)? + open.len();
+    let rest = &haystack[start..];
+    let end = rest.find(&close)?;
+    Some(&rest[..end])
+}
+
 /// Parse an HTTP `Range: bytes=...` header against a known object length,
 /// returning an inclusive `(start, end)`. Returns `None` for unsupported or
 /// unsatisfiable ranges (the caller then serves the full object).
@@ -1066,6 +1154,66 @@ mod tests {
         let mut enc = hyper::HeaderMap::new();
         enc.insert(hyper::header::CONTENT_ENCODING, "aws-chunked".parse().unwrap());
         assert!(is_aws_chunked(&enc));
+    }
+
+    #[test]
+    fn parse_tagging_round_trips_and_validates() {
+        let body = b"<Tagging><TagSet>\
+<Tag><Key>env</Key><Value>prod</Value></Tag>\
+<Tag><Key>team</Key><Value>a&amp;b</Value></Tag>\
+</TagSet></Tagging>";
+        assert_eq!(
+            parse_tagging(body).unwrap(),
+            vec![
+                ("env".to_string(), "prod".to_string()),
+                ("team".to_string(), "a&b".to_string()),
+            ]
+        );
+        // Empty TagSet -> no tags (the DeleteObjectTagging shape).
+        assert_eq!(
+            parse_tagging(b"<Tagging><TagSet></TagSet></Tagging>").unwrap(),
+            Vec::<(String, String)>::new()
+        );
+        // A missing <Value> defaults to empty.
+        assert_eq!(
+            parse_tagging(b"<Tagging><TagSet><Tag><Key>k</Key></Tag></TagSet></Tagging>").unwrap(),
+            vec![("k".to_string(), String::new())]
+        );
+    }
+
+    #[test]
+    fn parse_tagging_rejects_limit_violations() {
+        // > 10 tags.
+        let mut body = String::from("<Tagging><TagSet>");
+        for i in 0..11 {
+            body.push_str(&format!("<Tag><Key>k{i}</Key><Value>v</Value></Tag>"));
+        }
+        body.push_str("</TagSet></Tagging>");
+        assert!(parse_tagging(body.as_bytes()).is_err());
+        // Empty key.
+        assert!(
+            parse_tagging(b"<Tagging><TagSet><Tag><Key></Key><Value>v</Value></Tag></TagSet></Tagging>")
+                .is_err()
+        );
+        // Over-long value (257 chars).
+        let long = "x".repeat(257);
+        let over = format!("<Tagging><TagSet><Tag><Key>k</Key><Value>{long}</Value></Tag></TagSet></Tagging>");
+        assert!(parse_tagging(over.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn tagging_xml_renders_tagset() {
+        let xml = tagging_xml(&[("a".to_string(), "1".to_string())]);
+        assert!(xml.contains("<TagSet><Tag><Key>a</Key><Value>1</Value></Tag></TagSet>"));
+        // Empty set still emits the wrapper.
+        assert!(tagging_xml(&[]).contains("<TagSet></TagSet>"));
+    }
+
+    #[test]
+    fn extract_xml_element_first_match() {
+        assert_eq!(extract_xml_element("<K>v</K>", "K"), Some("v"));
+        assert_eq!(extract_xml_element("<K></K>", "K"), Some(""));
+        assert_eq!(extract_xml_element("<A>x</A>", "K"), None);
     }
 
     #[test]
