@@ -436,19 +436,25 @@ impl Gateway {
     }
 
     /// PUT object: encode + store one block group, then commit the key. Returns
-    /// the object's ETag (MD5 hex, unquoted).
+    /// the object's ETag (MD5 hex, unquoted). `tags` are the object tags from a
+    /// PUT-time `x-amz-tagging` header; they are persisted alongside `metadata`
+    /// under the reserved tag prefix, identical to a later `PutObjectTagging`.
     pub async fn put_object(
         &self,
         bucket: &str,
         key: &str,
         principal: &str,
         body: Bytes,
-        metadata: HashMap<String, String>,
+        mut metadata: HashMap<String, String>,
+        tags: Vec<(String, String)>,
     ) -> Result<String, GatewayError> {
         let (ec, ec_wire) = self.bucket_ec(bucket, principal).await?;
         let (loc, client_id, open_version) = self
             .allocate_and_write(bucket, key, principal, ec, &ec_wire, &body)
             .await?;
+        for (k, v) in tags {
+            metadata.insert(format!("{TAG_META_PREFIX}{k}"), v);
+        }
         let etag = md5_hex(&body);
         self.om()
             .commit_key(om::CommitKeyRequest {
@@ -542,6 +548,20 @@ impl Gateway {
             .collect();
         tags.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(tags)
+    }
+
+    /// GetObjectAttributes data: `(etag, size, last_modified_ms)` from OM, no
+    /// data read. A missing key maps to `NoSuchKey`. (Additional checksums and
+    /// post-completion part records are not stored, so the HTTP layer only
+    /// surfaces ETag and ObjectSize.)
+    pub async fn object_attributes(
+        &self,
+        bucket: &str,
+        key: &str,
+        principal: &str,
+    ) -> Result<(String, u64, u64), GatewayError> {
+        let info = self.lookup(bucket, key, principal).await?;
+        Ok((etag_of(&info), info.data_size, info.modification_time_ms))
     }
 
     /// HEAD object: `(size, etag, metadata)` from OM, no data read.

@@ -99,6 +99,27 @@ async fn route(
         .get(hyper::header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
         .map(String::from);
+    // PUT-time object tags (`x-amz-tagging: k1=v1&k2=v2`) and the attribute
+    // selector for GetObjectAttributes (`x-amz-object-attributes: ETag,...`).
+    let tagging_header = req
+        .headers()
+        .get("x-amz-tagging")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+    // The AWS SDK emits one `x-amz-object-attributes` header line per requested
+    // attribute (the list-header serialization appends rather than joins), so
+    // gather ALL values, not just the first; other clients may send a single
+    // comma-separated line, which the parser also handles.
+    let object_attributes_header = {
+        let joined = req
+            .headers()
+            .get_all("x-amz-object-attributes")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect::<Vec<_>>()
+            .join(",");
+        (!joined.is_empty()).then_some(joined)
+    };
 
     let (bucket, key) = split_path(&path);
     if bucket.is_empty() {
@@ -137,6 +158,33 @@ async fn route(
                 return Ok(status_only(StatusCode::NO_CONTENT));
             }
             return Err(GatewayError::BadRequest("unsupported tagging operation".into()));
+        }
+        // GetObjectAttributes (?attributes). The `x-amz-object-attributes` header
+        // is required and selects which attributes appear in the response; we can
+        // serve ETag and ObjectSize (StorageClass is omitted for the default
+        // class, and additional checksums / part records are not stored).
+        if query_param(q, "attributes").is_some() {
+            if method != Method::GET {
+                return Err(GatewayError::BadRequest("unsupported attributes operation".into()));
+            }
+            let requested = object_attributes_header
+                .as_deref()
+                .map(parse_object_attributes_header)
+                .unwrap_or_default();
+            if requested.is_empty() {
+                return Err(GatewayError::BadRequest(
+                    "missing x-amz-object-attributes header".into(),
+                ));
+            }
+            let (etag, size, mod_ms) = gw.object_attributes(&bucket, &key, &principal).await?;
+            return Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(hyper::header::CONTENT_TYPE, "application/xml")
+                .header(hyper::header::LAST_MODIFIED, http_date(mod_ms))
+                .body(Full::new(Bytes::from(object_attributes_xml(
+                    &requested, &etag, size,
+                ))))
+                .expect("valid response"));
         }
         if method == Method::POST && query_param(q, "uploads").is_some() {
             let upload_id = gw.initiate_multipart(&bucket, &key, &principal).await?;
@@ -266,8 +314,12 @@ async fn route(
             } else {
                 raw
             };
+            let tags = match &tagging_header {
+                Some(h) => parse_tagging_header(h)?,
+                None => Vec::new(),
+            };
             let etag = gw
-                .put_object(&bucket, &key, &principal, body, user_metadata)
+                .put_object(&bucket, &key, &principal, body, user_metadata, tags)
                 .await?;
             Ok(Response::builder()
                 .status(StatusCode::OK)
@@ -765,9 +817,28 @@ fn tagging_xml(tags: &[(String, String)]) -> String {
     s
 }
 
-/// Parse a `Tagging` request body into `(key, value)` pairs, enforcing the S3
-/// limits: at most 10 tags, key length 1..=128, value length 0..=256 (counted in
-/// Unicode scalar values). Tag text is XML-unescaped. An empty `<TagSet/>` yields
+/// Enforce the S3 tagging limits: at most 10 tags, key length 1..=128, value
+/// length 0..=256 (counted in Unicode scalar values). Shared by the XML body
+/// parser and the `x-amz-tagging` header parser.
+fn validate_tags(tags: &[(String, String)]) -> Result<(), GatewayError> {
+    if tags.len() > 10 {
+        return Err(GatewayError::BadRequest(
+            "a request can contain at most 10 tags".into(),
+        ));
+    }
+    for (key, value) in tags {
+        if key.is_empty() || key.chars().count() > 128 {
+            return Err(GatewayError::BadRequest("tag key length out of range".into()));
+        }
+        if value.chars().count() > 256 {
+            return Err(GatewayError::BadRequest("tag value length out of range".into()));
+        }
+    }
+    Ok(())
+}
+
+/// Parse a `Tagging` request body into `(key, value)` pairs (S3 limits enforced
+/// by [`validate_tags`]). Tag text is XML-unescaped. An empty `<TagSet/>` yields
 /// an empty vec, which is how DeleteObjectTagging clears the set.
 fn parse_tagging(body: &[u8]) -> Result<Vec<(String, String)>, GatewayError> {
     let s = String::from_utf8_lossy(body);
@@ -782,21 +853,29 @@ fn parse_tagging(body: &[u8]) -> Result<Vec<(String, String)>, GatewayError> {
         let key = extract_xml_element(block, "Key")
             .ok_or_else(|| GatewayError::BadRequest("tag missing <Key>".into()))?;
         let value = extract_xml_element(block, "Value").unwrap_or("");
-        let (key, value) = (xml_unescape(key), xml_unescape(value));
-        if key.is_empty() || key.chars().count() > 128 {
-            return Err(GatewayError::BadRequest("tag key length out of range".into()));
-        }
-        if value.chars().count() > 256 {
-            return Err(GatewayError::BadRequest("tag value length out of range".into()));
-        }
-        tags.push((key, value));
+        tags.push((xml_unescape(key), xml_unescape(value)));
         rest = &after[end + "</Tag>".len()..];
     }
-    if tags.len() > 10 {
-        return Err(GatewayError::BadRequest(
-            "a request can contain at most 10 tags".into(),
-        ));
+    validate_tags(&tags)?;
+    Ok(tags)
+}
+
+/// Parse an `x-amz-tagging` header (a URL-encoded `k1=v1&k2=v2` query string, as
+/// PutObject sends PUT-time tags) into validated `(key, value)` pairs. An empty
+/// header is no tags.
+fn parse_tagging_header(header: &str) -> Result<Vec<(String, String)>, GatewayError> {
+    let header = header.trim();
+    if header.is_empty() {
+        return Ok(Vec::new());
     }
+    let tags: Vec<(String, String)> = header
+        .split('&')
+        .map(|pair| {
+            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+            (pct_decode(k), pct_decode(v))
+        })
+        .collect();
+    validate_tags(&tags)?;
     Ok(tags)
 }
 
@@ -809,6 +888,73 @@ fn extract_xml_element<'a>(haystack: &'a str, name: &str) -> Option<&'a str> {
     let rest = &haystack[start..];
     let end = rest.find(&close)?;
     Some(&rest[..end])
+}
+
+/// Parse the `x-amz-object-attributes` header into the requested attribute names
+/// (comma-separated, e.g. `ETag,ObjectSize`), dropping blanks.
+fn parse_object_attributes_header(header: &str) -> Vec<String> {
+    header
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+/// `GetObjectAttributesResponse` XML, emitting only the `requested` attributes.
+///
+/// Two S3 quirks are deliberate here: the `<ETag>` is NOT quoted (unlike the
+/// ETag header and every other ETag XML element), and `StorageClass` is omitted
+/// for the default class — which is every OBS object, so it never appears.
+/// `Checksum` and `ObjectParts` are likewise omitted: this gateway stores
+/// neither additional checksums nor queryable post-completion part records.
+fn object_attributes_xml(requested: &[String], etag: &str, size: u64) -> String {
+    let mut s = String::new();
+    s.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
+    s.push_str("<GetObjectAttributesResponse xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">");
+    if requested.iter().any(|a| a == "ETag") {
+        s.push_str(&format!("<ETag>{}</ETag>", xml_escape(etag)));
+    }
+    if requested.iter().any(|a| a == "ObjectSize") {
+        s.push_str(&format!("<ObjectSize>{size}</ObjectSize>"));
+    }
+    s.push_str("</GetObjectAttributesResponse>");
+    s
+}
+
+/// Format epoch milliseconds as an RFC 7231 IMF-fixdate (HTTP `Last-Modified`),
+/// e.g. `Fri, 01 Jan 2021 00:00:00 GMT`. Same civil-from-days core as
+/// [`iso8601_millis`], plus the weekday (1970-01-01 was a Thursday).
+fn http_date(ms: u64) -> String {
+    const DOW: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const MON: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let secs = (ms / 1000) as i64;
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (hh, mm, ss) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    let dow = DOW[(((days % 7) + 4).rem_euclid(7)) as usize];
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    format!(
+        "{}, {:02} {} {:04} {:02}:{:02}:{:02} GMT",
+        dow,
+        d,
+        MON[(m - 1) as usize],
+        year,
+        hh,
+        mm,
+        ss
+    )
 }
 
 /// Parse an HTTP `Range: bytes=...` header against a known object length,
@@ -1214,6 +1360,80 @@ mod tests {
         assert_eq!(extract_xml_element("<K>v</K>", "K"), Some("v"));
         assert_eq!(extract_xml_element("<K></K>", "K"), Some(""));
         assert_eq!(extract_xml_element("<A>x</A>", "K"), None);
+    }
+
+    #[test]
+    fn parse_tagging_header_decodes_and_validates() {
+        assert_eq!(
+            parse_tagging_header("env=prod&team=storage").unwrap(),
+            vec![
+                ("env".to_string(), "prod".to_string()),
+                ("team".to_string(), "storage".to_string()),
+            ]
+        );
+        // Percent-encoded key/value.
+        assert_eq!(
+            parse_tagging_header("a%2Fb=c%20d").unwrap(),
+            vec![("a/b".to_string(), "c d".to_string())]
+        );
+        // Empty header -> no tags.
+        assert_eq!(parse_tagging_header("").unwrap(), Vec::new());
+        // Bare key (no '=') -> empty value.
+        assert_eq!(
+            parse_tagging_header("flag").unwrap(),
+            vec![("flag".to_string(), String::new())]
+        );
+        // Limits are shared with the XML parser: > 10 tags rejected.
+        let many = (0..11)
+            .map(|i| format!("k{i}=v"))
+            .collect::<Vec<_>>()
+            .join("&");
+        assert!(parse_tagging_header(&many).is_err());
+    }
+
+    #[test]
+    fn parse_object_attributes_header_splits() {
+        assert_eq!(
+            parse_object_attributes_header("ETag, ObjectSize ,StorageClass"),
+            vec!["ETag", "ObjectSize", "StorageClass"]
+        );
+        assert!(parse_object_attributes_header("").is_empty());
+        assert!(parse_object_attributes_header("  , ").is_empty());
+    }
+
+    #[test]
+    fn object_attributes_xml_gates_on_requested() {
+        let both = object_attributes_xml(
+            &["ETag".to_string(), "ObjectSize".to_string()],
+            "abc123",
+            4096,
+        );
+        // ETag here is NOT quoted (S3's per-operation quirk).
+        assert!(both.contains("<ETag>abc123</ETag>"), "{both}");
+        assert!(both.contains("<ObjectSize>4096</ObjectSize>"), "{both}");
+        assert!(
+            both.contains("<GetObjectAttributesResponse"),
+            "wrong root element: {both}"
+        );
+        // Only the requested attributes appear.
+        let only_size = object_attributes_xml(&["ObjectSize".to_string()], "abc123", 7);
+        assert!(!only_size.contains("<ETag>"), "{only_size}");
+        assert!(only_size.contains("<ObjectSize>7</ObjectSize>"), "{only_size}");
+    }
+
+    #[test]
+    fn http_date_formats_rfc1123() {
+        assert_eq!(http_date(0), "Thu, 01 Jan 1970 00:00:00 GMT");
+        // 2021-01-01T00:00:00Z was a Friday.
+        assert_eq!(
+            http_date(1_609_459_200_000),
+            "Fri, 01 Jan 2021 00:00:00 GMT"
+        );
+        // 2009-10-12T17:50:00Z was a Monday.
+        assert_eq!(
+            http_date(1_255_369_800_000),
+            "Mon, 12 Oct 2009 17:50:00 GMT"
+        );
     }
 
     #[test]

@@ -975,6 +975,137 @@ async fn s3_sdk_object_tagging() {
     }
 }
 
+/// PUT-time tagging via the real SDK: the `x-amz-tagging` header (SDK
+/// `.tagging("k=v&...")`) sets tags at object-creation time, readable back through
+/// GetObjectTagging — without a separate PutObjectTagging round trip.
+#[tokio::test]
+async fn s3_sdk_put_object_with_tagging_header() {
+    use aws_sdk_s3::primitives::ByteStream;
+
+    let (base, dns) = spawn_stack().await;
+    let s3 = s3_client(&base);
+
+    s3.put_object()
+        .bucket("bucket1")
+        .key("tagged-at-put.bin")
+        .body(ByteStream::from(vec![5u8; 32]))
+        .tagging("env=prod&team=storage")
+        .metadata("author", "ritesh")
+        .send()
+        .await
+        .expect("put with tagging header");
+
+    let got = s3
+        .get_object_tagging()
+        .bucket("bucket1")
+        .key("tagged-at-put.bin")
+        .send()
+        .await
+        .expect("get_object_tagging");
+    let pairs: Vec<(String, String)> = got
+        .tag_set()
+        .iter()
+        .map(|t| (t.key().to_string(), t.value().to_string()))
+        .collect();
+    assert_eq!(
+        pairs,
+        vec![
+            ("env".to_string(), "prod".to_string()),
+            ("team".to_string(), "storage".to_string()),
+        ]
+    );
+
+    // PUT-time tags coexist with user metadata and never leak into it.
+    let obj = s3
+        .get_object()
+        .bucket("bucket1")
+        .key("tagged-at-put.bin")
+        .send()
+        .await
+        .expect("get object");
+    let meta = obj.metadata().expect("user metadata");
+    assert_eq!(meta.get("author").map(String::as_str), Some("ritesh"));
+    assert!(
+        meta.keys().all(|k| !k.contains("tag")),
+        "tags must not surface as user metadata: {meta:?}"
+    );
+
+    for d in &dns {
+        d.handle.abort();
+        tokio::fs::remove_dir_all(&d.dir).await.ok();
+    }
+}
+
+/// GetObjectAttributes via the real SDK: request ETag + ObjectSize and confirm
+/// the unquoted ETag, the byte size, and a populated Last-Modified. Also asserts
+/// the `x-amz-object-attributes` selector header is required (400 without it).
+#[tokio::test]
+async fn s3_sdk_get_object_attributes() {
+    use aws_sdk_s3::error::ProvideErrorMetadata;
+    use aws_sdk_s3::primitives::ByteStream;
+    use aws_sdk_s3::types::ObjectAttributes;
+
+    let (base, dns) = spawn_stack().await;
+    let s3 = s3_client(&base);
+
+    let body: Vec<u8> = (0..4096u32).map(|i| (i % 256) as u8).collect();
+    let put = s3
+        .put_object()
+        .bucket("bucket1")
+        .key("attr.bin")
+        .body(ByteStream::from(body.clone()))
+        .send()
+        .await
+        .expect("put");
+    // The ETag header is quoted; GetObjectAttributes returns it unquoted.
+    let etag_unquoted = put.e_tag().unwrap().trim_matches('"').to_string();
+
+    let attrs = s3
+        .get_object_attributes()
+        .bucket("bucket1")
+        .key("attr.bin")
+        .object_attributes(ObjectAttributes::Etag)
+        .object_attributes(ObjectAttributes::ObjectSize)
+        .send()
+        .await
+        .expect("get_object_attributes");
+    assert_eq!(attrs.e_tag(), Some(etag_unquoted.as_str()), "unquoted ETag");
+    assert_eq!(attrs.object_size(), Some(4096), "object size in bytes");
+    assert!(attrs.last_modified().is_some(), "Last-Modified header present");
+
+    // The attribute selector header is required (the SDK always sends it, so this
+    // path is checked with a raw request).
+    let client: HttpClient = Client::builder(TokioExecutor::new()).build_http();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(format!("{base}/bucket1/attr.bin?attributes"))
+        .header("x-auth-principal", "tester")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let resp = client.request(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "?attributes without the selector header must be rejected"
+    );
+
+    // A missing key surfaces NoSuchKey.
+    let err = s3
+        .get_object_attributes()
+        .bucket("bucket1")
+        .key("ghost.bin")
+        .object_attributes(ObjectAttributes::ObjectSize)
+        .send()
+        .await
+        .expect_err("attributes of a missing key must fail");
+    assert_eq!(err.code(), Some("NoSuchKey"), "expected NoSuchKey: {err:?}");
+
+    for d in &dns {
+        d.handle.abort();
+        tokio::fs::remove_dir_all(&d.dir).await.ok();
+    }
+}
+
 /// Frame `data` as a SigV4 streaming (`aws-chunked`) signed body: each chunk is
 /// `<hexsize>;chunk-signature=<64 hex>\r\n<data>\r\n`, terminated by a zero
 /// chunk. The signatures are placeholders -- the gateway de-frames without
