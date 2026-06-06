@@ -34,7 +34,11 @@ message KeyLocation {
   uint64 offset = 2;
   uint64 length = 3;
   Pipeline pipeline = 4;
-  // Opaque token issued by SCM; gateway forwards verbatim to the DN.
+  // RESERVED / not yet wired. Intended to carry an SCM-issued block-access
+  // token that the gateway would forward to the DN for validation. In this
+  // slice it is always empty: the OM issues none, the gateway forwards nothing,
+  // and the DN validates nothing (capacity/access control is the proxy's job
+  // today). Do not assume it gates DN access.
   bytes block_token = 5;
 }
 
@@ -152,9 +156,15 @@ message ListKeysResponse {
 
 message CreateKeyRequest {
   VolumeBucketKey vbk = 1;
-  uint64 expected_size = 2;  // optional hint for block allocation
+  // Hint for how many blocks to pre-allocate. The gateway sends the object size
+  // but this OM does no size-based pre-allocation (it returns one block and the
+  // gateway calls AllocateBlock for the rest), so it is currently advisory only.
+  uint64 expected_size = 2;
   org.apache.ozone.dn.v1.ECReplicationConfig ec_config = 3;
-  map<string, string> metadata = 4;  // user x-amz-meta-* metadata
+  // RESERVED / not yet consumed on this path: the gateway sends user metadata
+  // (Content-Type + x-amz-meta-* + tags) on CommitKey, not here, so this map is
+  // empty in practice today.
+  map<string, string> metadata = 4;
   AuthContext auth = 5;
 }
 
@@ -168,7 +178,9 @@ message AllocateBlockRequest {
   uint64 client_id = 1;
   uint64 open_version = 2;
   VolumeBucketKey vbk = 3;
-  // Optional: exclude list of DN UUIDs that failed in earlier blocks
+  // RESERVED / not yet honored: intended exclude-list of DN UUIDs that failed in
+  // earlier blocks, for placement to avoid. This OM has a single static pipeline
+  // and ignores it; the gateway sends it empty.
   repeated string exclude_dn_uuids = 4;
   AuthContext auth = 5;
 }

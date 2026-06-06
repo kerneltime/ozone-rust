@@ -29,9 +29,10 @@ message ChunkInfo {
   uint64 offset = 2;
   uint64 len = 3;
   ChecksumData checksum_data = 4;
-  // For EC: optional per-stripe checksum bundle. Only present on
-  // replica-1 (first data) and on all parity replicas (k+1..k+p)
-  // per Ozone's existing convention. See Phase 1 EC spec.
+  // RESERVED / not yet produced or consumed. Intended for EC per-stripe
+  // checksums (on replica-1 and the parity replicas, per Ozone convention) to
+  // support stripe-granular verification/reconstruction. The current path
+  // verifies whole shards via `checksum_data` and never sets or reads this.
   StripeChecksum stripe_checksum = 5;
 }
 
@@ -155,8 +156,10 @@ message GetContainerInfoResponse {
 
 message PutBlockRequest {
   BlockData block_data = 1;
-  // If true, the block is the EC stripe-trailing block; needed to
-  // record blockGroupLen correctly for partial-stripe reconstruction.
+  // RESERVED / not yet acted on. Intended to mark the stripe-trailing block so
+  // the DN can record blockGroupLen for future stripe-checksum-based partial
+  // reconstruction. The DN currently ignores this flag, and reads take the
+  // block-group length from OM (`KeyLocation.length`), not from stored metadata.
   bool eof = 2;
   string request_id = 3;
 }

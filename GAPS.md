@@ -212,17 +212,15 @@ backed when it is not. Each must be either wired or clearly annotated.
   multi-block is implemented. **Action (later)**: implement the `allocate_block`
   loop + multi-block read assembly.
 
-### B3 [MAJOR] SCM integration is partial — OPEN
-- **Verified**: datanode never calls `container_report` (grep). SCM command
-  handler acts on only 2 of 10 oneof variants; the SCM-driven `DeleteContainer`
-  deletes metadata only (leaks chunk bytes) while no GC/reclaimer exists; the
-  heartbeat `NodeReport` is a fixed stub (`capacity_bytes: 0`).
-- **Now**: a real SCM would never learn which containers a Rust DN holds; SCM
-  container deletion orphans chunk files; no replication/reconstruction/decommission
-  is driven.
-- **Action**: send FULL/INCREMENTAL container reports; make the SCM delete path
-  also drop chunks; populate a real `NodeReport`; document the unhandled commands
-  and the absent reclaimer.
+### B3 [MAJOR] SCM integration is partial — DONE (this branch, partial; remainder documented)
+- **Fixed**: the SCM-driven `DeleteContainer` now reclaims chunk bytes too (no
+  more leak), and the datanode sends a FULL `ContainerReport` after registration
+  so SCM learns its containers. Both covered by `scm_loop.rs` tests.
+- **Remaining (documented, lower value)**: `NodeReport.capacity_bytes` is still 0
+  (needs a filesystem `statvfs`-style call / dependency); the other 8 SCM command
+  variants stay no-ops (no replication/reconstruction/decommission is driven in
+  this codebase); `bcsi_id`/`replica_index` in the report are 0. These are
+  forward-looking — nothing in this repo consumes them yet.
 
 ### B4 [MINOR] Inert plumbing kept "consistent for the future" — OPEN/DOC
 - `stripe_checksum`, `eof`, and `blockGroupLen` are written/stored but never read
