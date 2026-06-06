@@ -656,6 +656,30 @@ async fn s3_sdk_copy_object_and_range_get() {
     let ranged_bytes = ranged.body.collect().await.unwrap().into_bytes();
     assert_eq!(ranged_bytes.as_ref(), &body[100..200], "range bytes match");
 
+    // Unsatisfiable range (past EOF) -> 416 with Content-Range: bytes */total,
+    // never a silent full-body 200. Raw HTTP so we can read the exact status.
+    let client: HttpClient = Client::builder(TokioExecutor::new()).build_http();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(format!("{base}/bucket1/src.bin"))
+        .header("x-auth-principal", "tester")
+        .header(header::RANGE, "bytes=2000-3000")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let resp = client.request(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::RANGE_NOT_SATISFIABLE,
+        "out-of-range GET must be 416"
+    );
+    assert_eq!(
+        resp.headers()
+            .get(header::CONTENT_RANGE)
+            .and_then(|v| v.to_str().ok()),
+        Some("bytes */1000"),
+        "416 must carry Content-Range: bytes */total"
+    );
+
     for d in &dns {
         d.handle.abort();
         tokio::fs::remove_dir_all(&d.dir).await.ok();

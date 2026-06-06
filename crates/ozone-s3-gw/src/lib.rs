@@ -347,22 +347,31 @@ async fn route(
             // object is decoded in full and sliced (range-aware EC reads are a
             // later optimization).
             if let Some(range) = &range_header {
-                if let Some((start, end)) = parse_range(range, data.len()) {
-                    let total = data.len();
-                    let slice = data.slice(start..end + 1);
-                    return Ok(apply_object_metadata(
-                        Response::builder()
-                            .status(StatusCode::PARTIAL_CONTENT)
-                            .header(hyper::header::ETAG, quote(&etag))
-                            .header(
-                                hyper::header::CONTENT_RANGE,
-                                format!("bytes {start}-{end}/{total}"),
-                            )
-                            .header(hyper::header::CONTENT_LENGTH, slice.len()),
-                        &metadata,
-                    )
-                    .body(Full::new(slice))
-                    .expect("valid response"));
+                match parse_range(range, data.len()) {
+                    RangeSpec::Satisfiable(start, end) => {
+                        let total = data.len();
+                        let slice = data.slice(start..end + 1);
+                        return Ok(apply_object_metadata(
+                            Response::builder()
+                                .status(StatusCode::PARTIAL_CONTENT)
+                                .header(hyper::header::ETAG, quote(&etag))
+                                .header(
+                                    hyper::header::CONTENT_RANGE,
+                                    format!("bytes {start}-{end}/{total}"),
+                                )
+                                .header(hyper::header::CONTENT_LENGTH, slice.len()),
+                            &metadata,
+                        )
+                        .body(Full::new(slice))
+                        .expect("valid response"));
+                    }
+                    // Valid byte-range syntax but out of bounds -> 416, never a
+                    // silent full-body 200.
+                    RangeSpec::Unsatisfiable => {
+                        return Ok(range_not_satisfiable_response(data.len()));
+                    }
+                    // Not a usable byte range -> fall through to the full object.
+                    RangeSpec::Whole => {}
                 }
             }
             Ok(apply_object_metadata(
@@ -957,36 +966,77 @@ fn http_date(ms: u64) -> String {
     )
 }
 
-/// Parse an HTTP `Range: bytes=...` header against a known object length,
-/// returning an inclusive `(start, end)`. Returns `None` for unsupported or
-/// unsatisfiable ranges (the caller then serves the full object).
-fn parse_range(header: &str, total: usize) -> Option<(usize, usize)> {
+/// Outcome of parsing a `Range` header against a known object length.
+#[derive(Debug, PartialEq, Eq)]
+enum RangeSpec {
+    /// No usable byte-range header (wrong unit or malformed) — serve the whole
+    /// object with `200`.
+    Whole,
+    /// A satisfiable range: inclusive `(start, end)` byte offsets.
+    Satisfiable(usize, usize),
+    /// Syntactically a byte range but not satisfiable for this object — the
+    /// caller must answer `416 Range Not Satisfiable`.
+    Unsatisfiable,
+}
+
+/// Parse a single HTTP `Range: bytes=...` header against a known object length.
+///
+/// Distinguishes "not a byte range / malformed" (serve the whole object, like
+/// S3) from "valid byte-range syntax but out of bounds" (which must be a 416,
+/// never a silent full-body 200). Multi-range (`bytes=0-9,20-29`) is not
+/// supported and is treated as [`RangeSpec::Whole`].
+fn parse_range(header: &str, total: usize) -> RangeSpec {
+    let Some(spec) = header.trim().strip_prefix("bytes=") else {
+        return RangeSpec::Whole; // wrong unit -> ignore the header
+    };
+    let Some((s, e)) = spec.split_once('-') else {
+        return RangeSpec::Whole; // malformed -> ignore the header
+    };
     if total == 0 {
-        return None;
+        return RangeSpec::Unsatisfiable; // any range over an empty object
     }
-    let spec = header.trim().strip_prefix("bytes=")?;
-    let (s, e) = spec.split_once('-')?; // a single range only
     let last = total - 1;
     let (start, end) = if s.is_empty() {
-        // Suffix range: the final N bytes.
-        let n: usize = e.trim().parse().ok()?;
+        // Suffix range: the final N bytes. `bytes=-0` is unsatisfiable.
+        let Ok(n) = e.trim().parse::<usize>() else {
+            return RangeSpec::Whole;
+        };
         if n == 0 {
-            return None;
+            return RangeSpec::Unsatisfiable;
         }
         (total.saturating_sub(n), last)
     } else {
-        let start: usize = s.trim().parse().ok()?;
+        let Ok(start) = s.trim().parse::<usize>() else {
+            return RangeSpec::Whole;
+        };
         let end = if e.trim().is_empty() {
             last
         } else {
-            e.trim().parse::<usize>().ok()?.min(last)
+            match e.trim().parse::<usize>() {
+                Ok(v) => v.min(last),
+                Err(_) => return RangeSpec::Whole,
+            }
         };
         (start, end)
     };
     if start > end || start > last {
-        return None;
+        return RangeSpec::Unsatisfiable;
     }
-    Some((start, end))
+    RangeSpec::Satisfiable(start, end)
+}
+
+/// A `416 Range Not Satisfiable` response with the S3 `InvalidRange` body and the
+/// required `Content-Range: bytes */{total}` header.
+fn range_not_satisfiable_response(total: usize) -> Response<Full<Bytes>> {
+    let xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+<Error><Code>InvalidRange</Code>\
+<Message>The requested range is not satisfiable</Message></Error>";
+    Response::builder()
+        .status(StatusCode::RANGE_NOT_SATISFIABLE)
+        .header(hyper::header::CONTENT_RANGE, format!("bytes */{total}"))
+        .header(hyper::header::CONTENT_TYPE, "application/xml")
+        .body(Full::new(Bytes::from(xml)))
+        .expect("valid response")
 }
 
 /// Extract the `<Key>` values from a `DeleteObjects` request body.
@@ -1236,18 +1286,22 @@ mod tests {
 
     #[test]
     fn parse_range_forms() {
+        use RangeSpec::*;
         // bytes 0-9 of 100 -> inclusive (0, 9).
-        assert_eq!(parse_range("bytes=0-9", 100), Some((0, 9)));
+        assert_eq!(parse_range("bytes=0-9", 100), Satisfiable(0, 9));
         // open-ended -> to last byte.
-        assert_eq!(parse_range("bytes=50-", 100), Some((50, 99)));
+        assert_eq!(parse_range("bytes=50-", 100), Satisfiable(50, 99));
         // suffix -> last 10 bytes.
-        assert_eq!(parse_range("bytes=-10", 100), Some((90, 99)));
+        assert_eq!(parse_range("bytes=-10", 100), Satisfiable(90, 99));
         // end clamped to last byte.
-        assert_eq!(parse_range("bytes=90-999", 100), Some((90, 99)));
-        // unsatisfiable / malformed -> None (caller serves full object).
-        assert_eq!(parse_range("bytes=200-300", 100), None);
-        assert_eq!(parse_range("items=0-9", 100), None);
-        assert_eq!(parse_range("bytes=0-9", 0), None);
+        assert_eq!(parse_range("bytes=90-999", 100), Satisfiable(90, 99));
+        // valid byte-range syntax but out of bounds -> 416, not a silent 200.
+        assert_eq!(parse_range("bytes=200-300", 100), Unsatisfiable);
+        assert_eq!(parse_range("bytes=-0", 100), Unsatisfiable);
+        assert_eq!(parse_range("bytes=0-9", 0), Unsatisfiable);
+        // wrong unit / malformed -> serve the whole object.
+        assert_eq!(parse_range("items=0-9", 100), Whole);
+        assert_eq!(parse_range("bytes=abc", 100), Whole);
     }
 
     #[test]

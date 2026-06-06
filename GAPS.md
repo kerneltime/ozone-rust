@@ -87,7 +87,7 @@ Each is cheap, within the stated scope, and (critically) needs a test that can
 - **Test**: flip a byte in one on-disk shard file, GET still returns exact bytes
   (reconstructed), and a corrupted-beyond-recovery case errors instead of lying.
 
-### A2 [MAJOR] Multipart Complete does not validate part order / duplicates — OPEN
+### A2 [MAJOR] Multipart Complete does not validate part order / duplicates — DONE (this branch)
 - **Where**: `backend.rs` `complete_multipart` + `lib.rs` `parse_complete_parts`
   (preserves client document order). Masked by `fake_om.rs:610` `sort_by_key`.
 - **Now**: out-of-order parts are silently sorted into order by the OM instead of
