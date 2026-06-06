@@ -1083,7 +1083,11 @@ fn parse_http_date(s: &str) -> Option<u64> {
     let hh: i64 = t.next()?.parse().ok()?;
     let mm: i64 = t.next()?.parse().ok()?;
     let ss: i64 = t.next()?.parse().ok()?;
-    if !(1..=31).contains(&day) || !(0..=23).contains(&hh) || mm > 59 || ss > 60 {
+    if !(1..=31).contains(&day)
+        || !(0..=23).contains(&hh)
+        || !(0..=59).contains(&mm)
+        || !(0..=60).contains(&ss)
+    {
         return None;
     }
     let secs = days_from_civil(year, month, day) * 86_400 + hh * 3600 + mm * 60 + ss;
