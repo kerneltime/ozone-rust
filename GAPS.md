@@ -158,7 +158,7 @@ Each is cheap, within the stated scope, and (critically) needs a test that can
 - **Test**: `If-Modified-Since` in the future → 304; `If-Unmodified-Since` in the
   past → 412.
 
-### A8 [MINOR] Multipart: no min part size, no part-number range — OPEN
+### A8 [MINOR] Multipart: no min part size, no part-number range — DONE (this branch)
 - **Where**: `upload_part` takes any `u32` part number and any size; `lib.rs` only
   checks the number parses.
 - **Now**: `partNumber=0` or `4_000_000_000` is accepted; a <5 MiB non-final part
@@ -167,15 +167,21 @@ Each is cheap, within the stated scope, and (critically) needs a test that can
   non-last part < 5 MiB (`EntityTooSmall`).
 - **Test**: `partNumber=0` → 400; tiny non-final part → complete 400.
 
-### A9 [MINOR] Error bodies thin; all input errors collapse to `InvalidRequest` — OPEN
+### A9 [MINOR] Error bodies thin; specific input-error codes collapse to `InvalidRequest` — DEFERRED
 - **Where**: `error_response` emits only `<Code>`/`<Message>` (no `RequestId`/
   `Resource`); every `BadRequest` serializes as `InvalidRequest`/400.
-- **Now**: SDK control flow still works (Code is parsed), but specific codes
-  (`InvalidTag`, `MalformedXML`, `InvalidPartOrder`, `EntityTooSmall`) are not
-  surfaced and there is no server correlation id.
-- **Fix**: add a typed error-code path (carry an S3 code on `BadRequest`
-  variants), emit `<RequestId>` + `<Resource>`. Lower priority; do alongside
-  A2/A6/A8 which need the specific codes anyway.
+- **Status**: the load-bearing behaviors from A2/A6/A8 ship with the CORRECT HTTP
+  status (400) and correct semantics; only the precise `<Code>` STRING differs
+  from AWS — InvalidPartOrder, EntityTooSmall, InvalidTag, MalformedXML all
+  currently read as `InvalidRequest`. Per-key DeleteObjects codes ARE precise now
+  (via `GatewayError::s3_code()`). What remains is purely the sub-code strings for
+  `BadRequest` plus the `<RequestId>`/`<Resource>` fields.
+- **Why deferred**: requires threading an S3 code through every `BadRequest`
+  construction (a broad, mechanical refactor) for a MINOR, SDK-tolerated nicety —
+  AWS SDKs branch on the HTTP status and parse `Code` leniently. Worth doing as a
+  focused pass if strict code-string parity is required.
+- **Fix**: carry an optional S3 code on `BadRequest` (or add typed variants),
+  emit `<RequestId>` + `<Resource>`.
 
 ---
 
