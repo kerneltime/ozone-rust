@@ -74,7 +74,7 @@ These are genuinely proven and should not be re-litigated:
 Each is cheap, within the stated scope, and (critically) needs a test that can
 *fail* — which often means making FakeOm stricter first.
 
-### A1 [HIGH] Read path never verifies shard integrity — OPEN
+### A1 [HIGH] Read path never verifies shard integrity — DONE (528c96e)
 - **Where**: `backend.rs:650` — `read_chunk(&block_slot, &chunk, false)` with
   `chunk.checksum_data = None`. Verified: the only read_chunk call passes
   `verify=false`.

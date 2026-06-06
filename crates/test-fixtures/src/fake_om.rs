@@ -582,13 +582,13 @@ impl OmRustGatewayService for FakeOm {
     /// its `part_number`, the 16-byte BINARY MD5 of that part's bytes in `etag`
     /// (NOT hex), the part's byte `size`, and the part's block-group
     /// `locations`. From these we build the final key:
-    /// - Parts are sorted by `part_number` ascending (defensive; the gateway may
-    ///   already sort).
-    /// - `final_locations` = every part's `locations` concatenated in sorted
-    ///   order.
+    /// - `final_locations` = every part's `locations` concatenated in the order
+    ///   the gateway sent them. The gateway validates the parts are strictly
+    ///   ascending with no duplicates, so the OM does NOT re-sort (re-sorting
+    ///   here would mask a gateway that failed to enforce ordering).
     /// - `final_size` = the sum of the part `size`s.
     /// - The object ETag is the AWS-compliant multipart form:
-    ///   `hex(md5(concat(part.etag for each sorted part))) + "-" + N`, where the
+    ///   `hex(md5(concat(part.etag for each part))) + "-" + N`, where the
     ///   concatenation is over the raw 16-byte binary part digests, the outer
     ///   MD5 is lowercase-hex-encoded, and `N` is the part count. This string is
     ///   stored under `metadata["ETAG"]` (mirroring `commit_key`) and returned
@@ -603,11 +603,10 @@ impl OmRustGatewayService for FakeOm {
         let req = req.into_inner();
         let tuple = key_tuple(&req.vbk)?;
 
-        let mut parts = req.parts;
+        let parts = req.parts;
         if parts.is_empty() {
             return Err(Status::invalid_argument("no parts"));
         }
-        parts.sort_by_key(|p| p.part_number);
 
         let final_size: u64 = parts.iter().map(|p| p.size).sum();
         let final_locations: Vec<pb::KeyLocation> =

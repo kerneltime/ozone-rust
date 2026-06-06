@@ -812,6 +812,14 @@ impl Gateway {
         if ordered_part_numbers.is_empty() {
             return Err(GatewayError::BadRequest("complete with no parts".into()));
         }
+        // Parts must be strictly ascending with no duplicates (S3 InvalidPartOrder).
+        // The OM trusts this order verbatim, so the gateway must enforce it here
+        // rather than silently re-sorting a malformed request.
+        if ordered_part_numbers.windows(2).any(|w| w[0] >= w[1]) {
+            return Err(GatewayError::BadRequest(
+                "parts must be in ascending order with no duplicates".into(),
+            ));
+        }
         let parts: Vec<om::Part> = {
             let reg = self.mpu.lock().await;
             let stored = reg.get(upload_id).ok_or(GatewayError::NoSuchUpload)?;

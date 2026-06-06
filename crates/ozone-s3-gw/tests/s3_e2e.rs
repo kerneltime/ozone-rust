@@ -551,6 +551,63 @@ async fn s3_sdk_multipart_upload() {
     }
 }
 
+/// Multipart Complete must reject non-ascending or duplicate part numbers
+/// (S3 `InvalidPartOrder`) rather than silently re-sorting. Uses raw HTTP for
+/// Complete so the part order on the wire is controlled exactly.
+#[tokio::test]
+async fn s3_multipart_rejects_out_of_order_and_duplicate_parts() {
+    use aws_sdk_s3::primitives::ByteStream;
+
+    let (base, dns) = spawn_stack().await;
+    let s3 = s3_client(&base);
+    let client: HttpClient = Client::builder(TokioExecutor::new()).build_http();
+
+    let create = s3
+        .create_multipart_upload()
+        .bucket("bucket1")
+        .key("mp.bin")
+        .send()
+        .await
+        .expect("create");
+    let upload_id = create.upload_id().unwrap().to_string();
+    for (n, body) in [(1i32, vec![1u8; 3000]), (2i32, vec![2u8; 2000])] {
+        s3.upload_part()
+            .bucket("bucket1")
+            .key("mp.bin")
+            .upload_id(&upload_id)
+            .part_number(n)
+            .body(ByteStream::from(body))
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("upload {n}: {e:?}"));
+    }
+
+    let complete = |parts: &[u32]| {
+        let mut b = String::from("<CompleteMultipartUpload>");
+        for p in parts {
+            b.push_str(&format!("<Part><PartNumber>{p}</PartNumber></Part>"));
+        }
+        b.push_str("</CompleteMultipartUpload>");
+        b
+    };
+    let url = format!("{base}/bucket1/mp.bin?uploadId={upload_id}");
+
+    // Out-of-order [2,1] -> 400.
+    let (st, _, _) = http(&client, Method::POST, url.clone(), Some("t"), Bytes::from(complete(&[2, 1]))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "out-of-order parts must be rejected");
+    // Duplicate [1,1] -> 400.
+    let (st, _, _) = http(&client, Method::POST, url.clone(), Some("t"), Bytes::from(complete(&[1, 1]))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "duplicate parts must be rejected");
+    // Ascending [1,2] completes.
+    let (st, _, _) = http(&client, Method::POST, url.clone(), Some("t"), Bytes::from(complete(&[1, 2]))).await;
+    assert_eq!(st, StatusCode::OK, "ascending parts must complete");
+
+    for d in &dns {
+        d.handle.abort();
+        tokio::fs::remove_dir_all(&d.dir).await.ok();
+    }
+}
+
 /// CopyObject and ranged GET through the real AWS SDK.
 #[tokio::test]
 async fn s3_sdk_copy_object_and_range_get() {
