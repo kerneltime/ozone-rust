@@ -605,26 +605,30 @@ impl Gateway {
         Ok((etag_of(&info), info.data_size, info.modification_time_ms))
     }
 
-    /// HEAD object: `(size, etag, metadata)` from OM, no data read.
+    /// HEAD object: `(size, etag, metadata, last_modified_ms)` from OM, no data
+    /// read.
     pub async fn head_object(
         &self,
         bucket: &str,
         key: &str,
         principal: &str,
-    ) -> Result<(u64, String, HashMap<String, String>), GatewayError> {
+    ) -> Result<(u64, String, HashMap<String, String>, u64), GatewayError> {
         let info = self.lookup(bucket, key, principal).await?;
-        Ok((info.data_size, etag_of(&info), info.metadata))
+        let mod_ms = info.modification_time_ms;
+        Ok((info.data_size, etag_of(&info), info.metadata, mod_ms))
     }
 
-    /// GET object: gather shards, decode, return `(bytes, etag, metadata)`.
+    /// GET object: gather shards, decode, return `(bytes, etag, metadata,
+    /// last_modified_ms)`.
     pub async fn get_object(
         &self,
         bucket: &str,
         key: &str,
         principal: &str,
-    ) -> Result<(Bytes, String, HashMap<String, String>), GatewayError> {
+    ) -> Result<(Bytes, String, HashMap<String, String>, u64), GatewayError> {
         let info = self.lookup(bucket, key, principal).await?;
         let etag = etag_of(&info);
+        let mod_ms = info.modification_time_ms;
         let ec = to_domain_ec(
             info.ec_config
                 .as_ref()
@@ -655,7 +659,7 @@ impl Gateway {
                 .await?;
             out.extend_from_slice(&part);
         }
-        Ok((Bytes::from(out), etag, info.metadata))
+        Ok((Bytes::from(out), etag, info.metadata, mod_ms))
     }
 
     /// Read and EC-decode a single block group of `length` user bytes. Gathers

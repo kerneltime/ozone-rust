@@ -136,7 +136,7 @@ Each is cheap, within the stated scope, and (critically) needs a test that can
 - **Test**: self-copy with REPLACE changes Content-Type; self-copy pure COPY →
   400 InvalidRequest.
 
-### A6 [MAJOR] DeleteObjects: wrong per-key codes, no quiet mode, no 1000 cap — OPEN
+### A6 [MAJOR] DeleteObjects: wrong per-key codes, no quiet mode, no 1000 cap — DONE (this branch)
 - **Where**: `lib.rs` `delete_result_xml` hardcodes `<Code>InternalError</Code>`;
   `parse_delete_request` ignores `<Quiet>`; no batch-size check.
 - **Now**: a real per-key failure (e.g. NoSuchBucket mid-batch) reports as

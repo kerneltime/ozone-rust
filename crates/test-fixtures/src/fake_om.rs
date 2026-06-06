@@ -50,10 +50,12 @@
 //!   counter), starting at 1 for the first allocation. `container_id` is always
 //!   `1`. `client_id` (returned by `create_key`) is a separate monotonic
 //!   counter starting at 1.
-//! - All timestamps (`creation_time_ms`, `modification_time_ms`,
-//!   `commit_time_ms`) are `0`. No wall clock is wired into this fixture on
-//!   purpose: tests that assert on timestamps would be non-deterministic, and
-//!   the gateway does not depend on OM-supplied timestamps for correctness.
+//! - No wall clock is wired into this fixture: `commit_time_ms` and bucket
+//!   creation times are `0`, and committed object keys use a FIXED
+//!   `creation_time_ms`/`modification_time_ms` ([`FAKE_OBJECT_TIME_MS`]). The
+//!   fixed object time is deterministic (so timestamp assertions are stable) yet
+//!   non-zero, so the gateway's Last-Modified header and date-conditional request
+//!   handling (If-Modified-Since / If-Unmodified-Since) are actually exercisable.
 //!
 //! # ETag handling
 //! `commit_key` receives the gateway-computed ETag as raw bytes. We store it in
@@ -85,6 +87,13 @@ const CONTAINER_ID: u64 = 1;
 
 /// Fixed pipeline id reported in every allocated [`pb::Pipeline`].
 const PIPELINE_ID: &str = "pipeline-1";
+
+/// Fixed object creation/modification time (2021-01-01T00:00:00Z in ms). A real
+/// OM stamps wall-clock time; the fake uses a constant so Last-Modified and the
+/// date-conditional request paths (If-Modified-Since / If-Unmodified-Since) are
+/// deterministic and actually exercisable (a zero time would make every object
+/// look epoch-old).
+const FAKE_OBJECT_TIME_MS: u64 = 1_609_459_200_000;
 
 /// The static EC pipeline a [`FakeOm`] allocates from.
 ///
@@ -491,8 +500,8 @@ impl OmRustGatewayService for FakeOm {
         let info = pb::OmKeyInfoLite {
             vbk: req.vbk,
             data_size: req.final_size,
-            creation_time_ms: 0,
-            modification_time_ms: 0,
+            creation_time_ms: FAKE_OBJECT_TIME_MS,
+            modification_time_ms: FAKE_OBJECT_TIME_MS,
             locations: req.final_locations,
             metadata,
             ec_config: Some(self.ec()),
@@ -675,8 +684,8 @@ impl OmRustGatewayService for FakeOm {
         let info = pb::OmKeyInfoLite {
             vbk: req.vbk,
             data_size: final_size,
-            creation_time_ms: 0,
-            modification_time_ms: 0,
+            creation_time_ms: FAKE_OBJECT_TIME_MS,
+            modification_time_ms: FAKE_OBJECT_TIME_MS,
             locations: final_locations,
             metadata,
             ec_config: Some(self.ec()),

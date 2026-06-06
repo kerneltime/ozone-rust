@@ -1437,6 +1437,68 @@ async fn s3_sdk_get_object_attributes() {
     }
 }
 
+/// Date-based conditional GETs (If-Modified-Since / If-Unmodified-Since) and the
+/// Last-Modified response header. Raw HTTP so exact statuses are observable; the
+/// object's mtime is FakeOm's fixed 2021-01-01.
+#[tokio::test]
+async fn s3_date_conditional_requests() {
+    use aws_sdk_s3::primitives::ByteStream;
+
+    let (base, dns) = spawn_stack().await;
+    let s3 = s3_client(&base);
+    s3.put_object()
+        .bucket("bucket1")
+        .key("d.bin")
+        .body(ByteStream::from(vec![1u8; 10]))
+        .send()
+        .await
+        .expect("put");
+
+    let client: HttpClient = Client::builder(TokioExecutor::new()).build_http();
+    let url = format!("{base}/bucket1/d.bin");
+    let after = "Sat, 01 Jan 2022 00:00:00 GMT"; // after the object's 2021 mtime
+    let before = "Wed, 01 Jan 2020 00:00:00 GMT"; // before it
+
+    let cases = [
+        ("if-modified-since", after, StatusCode::NOT_MODIFIED),
+        ("if-modified-since", before, StatusCode::OK),
+        ("if-unmodified-since", before, StatusCode::PRECONDITION_FAILED),
+        ("if-unmodified-since", after, StatusCode::OK),
+    ];
+    for (h, v, want) in cases {
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(url.clone())
+            .header("x-auth-principal", "t")
+            .header(h, v)
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let st = client.request(req).await.unwrap().status();
+        assert_eq!(st, want, "GET {h}: {v}");
+    }
+
+    // HEAD carries a correct Last-Modified header.
+    let req = Request::builder()
+        .method(Method::HEAD)
+        .uri(url.clone())
+        .header("x-auth-principal", "t")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let resp = client.request(req).await.unwrap();
+    assert_eq!(
+        resp.headers()
+            .get(header::LAST_MODIFIED)
+            .and_then(|v| v.to_str().ok()),
+        Some("Fri, 01 Jan 2021 00:00:00 GMT"),
+        "Last-Modified header"
+    );
+
+    for d in &dns {
+        d.handle.abort();
+        tokio::fs::remove_dir_all(&d.dir).await.ok();
+    }
+}
+
 /// Frame `data` as a SigV4 streaming (`aws-chunked`) signed body: each chunk is
 /// `<hexsize>;chunk-signature=<64 hex>\r\n<data>\r\n`, terminated by a zero
 /// chunk. The signatures are placeholders -- the gateway de-frames without

@@ -113,6 +113,16 @@ async fn route(
         .get(hyper::header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
         .map(String::from);
+    let if_modified_since = req
+        .headers()
+        .get(hyper::header::IF_MODIFIED_SINCE)
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+    let if_unmodified_since = req
+        .headers()
+        .get(hyper::header::IF_UNMODIFIED_SINCE)
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
     // PUT-time object tags (`x-amz-tagging: k1=v1&k2=v2`) and the attribute
     // selector for GetObjectAttributes (`x-amz-object-attributes: ETag,...`).
     let tagging_header = req
@@ -375,13 +385,23 @@ async fn route(
                 .expect("valid response"))
         }
         (&Method::GET, false) => {
-            // Conditional GET: evaluate preconditions against the ETag without
-            // reading data (an extra metadata lookup, only when conditions exist).
-            if if_match.is_some() || if_none_match.is_some() {
-                let (_, etag, _) = gw.head_object(&bucket, &key, &principal).await?;
-                if let Some(status) =
-                    precondition_status(if_match.as_deref(), if_none_match.as_deref(), &etag)
-                {
+            // Conditional GET: evaluate preconditions against the ETag and
+            // last-modified time without reading data (an extra metadata lookup,
+            // only when some conditional header is present).
+            if if_match.is_some()
+                || if_none_match.is_some()
+                || if_modified_since.is_some()
+                || if_unmodified_since.is_some()
+            {
+                let (_, etag, _, mod_ms) = gw.head_object(&bucket, &key, &principal).await?;
+                if let Some(status) = precondition_status(
+                    if_match.as_deref(),
+                    if_none_match.as_deref(),
+                    if_modified_since.as_deref(),
+                    if_unmodified_since.as_deref(),
+                    &etag,
+                    mod_ms,
+                ) {
                     return Ok(if status == StatusCode::NOT_MODIFIED {
                         status_only(status)
                     } else {
@@ -389,7 +409,7 @@ async fn route(
                     });
                 }
             }
-            let (data, etag, metadata) = gw.get_object(&bucket, &key, &principal).await?;
+            let (data, etag, metadata, mod_ms) = gw.get_object(&bucket, &key, &principal).await?;
             // Range request -> 206 Partial Content with Content-Range. The
             // object is decoded in full and sliced (range-aware EC reads are a
             // later optimization).
@@ -402,6 +422,7 @@ async fn route(
                             Response::builder()
                                 .status(StatusCode::PARTIAL_CONTENT)
                                 .header(hyper::header::ETAG, quote(&etag))
+                                .header(hyper::header::LAST_MODIFIED, http_date(mod_ms))
                                 .header(
                                     hyper::header::CONTENT_RANGE,
                                     format!("bytes {start}-{end}/{total}"),
@@ -425,6 +446,7 @@ async fn route(
                 Response::builder()
                     .status(StatusCode::OK)
                     .header(hyper::header::ETAG, quote(&etag))
+                    .header(hyper::header::LAST_MODIFIED, http_date(mod_ms))
                     .header(hyper::header::CONTENT_LENGTH, data.len()),
                 &metadata,
             )
@@ -432,10 +454,15 @@ async fn route(
             .expect("valid response"))
         }
         (&Method::HEAD, false) => {
-            let (size, etag, metadata) = gw.head_object(&bucket, &key, &principal).await?;
-            if let Some(status) =
-                precondition_status(if_match.as_deref(), if_none_match.as_deref(), &etag)
-            {
+            let (size, etag, metadata, mod_ms) = gw.head_object(&bucket, &key, &principal).await?;
+            if let Some(status) = precondition_status(
+                if_match.as_deref(),
+                if_none_match.as_deref(),
+                if_modified_since.as_deref(),
+                if_unmodified_since.as_deref(),
+                &etag,
+                mod_ms,
+            ) {
                 return Ok(if status == StatusCode::NOT_MODIFIED {
                     status_only(status)
                 } else {
@@ -446,6 +473,7 @@ async fn route(
                 Response::builder()
                     .status(StatusCode::OK)
                     .header(hyper::header::ETAG, quote(&etag))
+                    .header(hyper::header::LAST_MODIFIED, http_date(mod_ms))
                     .header(hyper::header::CONTENT_LENGTH, size),
                 &metadata,
             )
@@ -565,23 +593,47 @@ fn apply_object_metadata(
     builder
 }
 
-/// Evaluate If-Match / If-None-Match against an object's (unquoted) ETag for a
-/// read. Returns `Some(412)` if If-Match fails, `Some(304)` if If-None-Match
-/// matches, else `None` (proceed).
+/// Evaluate the read preconditions against an object's (unquoted) ETag and
+/// last-modified time, following RFC 7232 precedence: If-Match takes priority
+/// over If-Unmodified-Since, and If-None-Match over If-Modified-Since. Returns
+/// `Some(412)` if If-Match / If-Unmodified-Since fails, `Some(304)` if
+/// If-None-Match / If-Modified-Since indicates not-modified, else `None`
+/// (proceed). An unparseable date header is ignored. This is for GET/HEAD only
+/// (a matched If-None-Match yields 304, not 412).
 fn precondition_status(
     if_match: Option<&str>,
     if_none_match: Option<&str>,
+    if_modified_since: Option<&str>,
+    if_unmodified_since: Option<&str>,
     etag: &str,
+    last_modified_ms: u64,
 ) -> Option<StatusCode> {
     let quoted = format!("\"{etag}\"");
+    let modified_secs = last_modified_ms / 1000;
+    // If-Match wins over If-Unmodified-Since when both are present.
     if let Some(im) = if_match {
         if !etag_list_matches(im, &quoted) {
             return Some(StatusCode::PRECONDITION_FAILED);
         }
+    } else if let Some(ius) = if_unmodified_since {
+        if let Some(threshold) = parse_http_date(ius) {
+            // Modified strictly after the threshold -> precondition fails.
+            if modified_secs > threshold {
+                return Some(StatusCode::PRECONDITION_FAILED);
+            }
+        }
     }
+    // If-None-Match wins over If-Modified-Since when both are present.
     if let Some(inm) = if_none_match {
         if etag_list_matches(inm, &quoted) {
             return Some(StatusCode::NOT_MODIFIED);
+        }
+    } else if let Some(ims) = if_modified_since {
+        if let Some(threshold) = parse_http_date(ims) {
+            // Not modified since the threshold -> 304.
+            if modified_secs <= threshold {
+                return Some(StatusCode::NOT_MODIFIED);
+            }
         }
     }
     None
@@ -1012,6 +1064,50 @@ fn http_date(ms: u64) -> String {
         mm,
         ss
     )
+}
+
+/// Parse an RFC 1123 / RFC 7231 IMF-fixdate (`Wed, 12 Oct 2009 17:50:00 GMT`)
+/// into epoch seconds. Returns `None` for anything not in that single format
+/// (the obsolete RFC 850 / asctime forms are rare from real clients and SDKs and
+/// are treated as "no usable date" by the caller). Inverse of [`http_date`].
+fn parse_http_date(s: &str) -> Option<u64> {
+    // Drop the leading weekday and comma if present.
+    let rest = s.split_once(',').map(|(_, r)| r).unwrap_or(s);
+    let mut it = rest.split_whitespace();
+    let day: i64 = it.next()?.parse().ok()?;
+    let month = month_num(it.next()?)?;
+    let year: i64 = it.next()?.parse().ok()?;
+    let time = it.next()?;
+    // A trailing "GMT" (or any zone token) is ignored; HTTP dates are always GMT.
+    let mut t = time.split(':');
+    let hh: i64 = t.next()?.parse().ok()?;
+    let mm: i64 = t.next()?.parse().ok()?;
+    let ss: i64 = t.next()?.parse().ok()?;
+    if !(1..=31).contains(&day) || !(0..=23).contains(&hh) || mm > 59 || ss > 60 {
+        return None;
+    }
+    let secs = days_from_civil(year, month, day) * 86_400 + hh * 3600 + mm * 60 + ss;
+    u64::try_from(secs).ok()
+}
+
+/// Month abbreviation (`Jan`..`Dec`) to 1..=12.
+fn month_num(m: &str) -> Option<i64> {
+    const MON: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    MON.iter().position(|x| *x == m).map(|i| i as i64 + 1)
+}
+
+/// Days since 1970-01-01 for a civil (year, month, day) — Howard Hinnant's
+/// `days_from_civil`, the inverse of the civil-from-days decomposition in
+/// [`http_date`]/[`iso8601_millis`].
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
 }
 
 /// Outcome of parsing a `Range` header against a known object length.
@@ -1553,29 +1649,71 @@ mod tests {
     }
 
     #[test]
+    fn parse_http_date_round_trips() {
+        assert_eq!(parse_http_date("Thu, 01 Jan 1970 00:00:00 GMT"), Some(0));
+        assert_eq!(
+            parse_http_date("Fri, 01 Jan 2021 00:00:00 GMT"),
+            Some(1_609_459_200)
+        );
+        assert_eq!(
+            parse_http_date("Mon, 12 Oct 2009 17:50:00 GMT"),
+            Some(1_255_369_800)
+        );
+        // Inverse of http_date.
+        assert_eq!(
+            parse_http_date(&http_date(1_700_000_000_000)),
+            Some(1_700_000_000)
+        );
+        // Unparseable -> None (the caller then ignores the condition).
+        assert_eq!(parse_http_date("not a date"), None);
+        assert_eq!(parse_http_date(""), None);
+    }
+
+    #[test]
     fn precondition_logic() {
         let etag = "abc123";
         let q = "\"abc123\"";
-        // If-None-Match matching (or *) -> 304 Not Modified.
+        let ts = 1_609_459_200_000; // object last-modified 2021-01-01
+        let after = "Sat, 01 Jan 2022 00:00:00 GMT"; // threshold after the object
+        let before = "Wed, 01 Jan 2020 00:00:00 GMT"; // threshold before the object
+        // ETag-only conditions (no dates).
+        let etag_only = |im, inm| precondition_status(im, inm, None, None, etag, ts);
+        assert_eq!(etag_only(None, Some(q)), Some(StatusCode::NOT_MODIFIED));
+        assert_eq!(etag_only(None, Some("*")), Some(StatusCode::NOT_MODIFIED));
+        assert_eq!(etag_only(None, Some("\"other\"")), None);
+        assert_eq!(etag_only(Some(q), None), None);
+        assert_eq!(etag_only(Some("*"), None), None);
         assert_eq!(
-            precondition_status(None, Some(q), etag),
-            Some(StatusCode::NOT_MODIFIED)
-        );
-        assert_eq!(
-            precondition_status(None, Some("*"), etag),
-            Some(StatusCode::NOT_MODIFIED)
-        );
-        // If-None-Match not matching -> proceed.
-        assert_eq!(precondition_status(None, Some("\"other\""), etag), None);
-        // If-Match matching (or *) -> proceed; otherwise 412.
-        assert_eq!(precondition_status(Some(q), None, etag), None);
-        assert_eq!(precondition_status(Some("*"), None, etag), None);
-        assert_eq!(
-            precondition_status(Some("\"other\""), None, etag),
+            etag_only(Some("\"other\""), None),
             Some(StatusCode::PRECONDITION_FAILED)
         );
-        // Comma-separated list form.
-        assert_eq!(precondition_status(Some("\"x\", \"abc123\""), None, etag), None);
+        assert_eq!(etag_only(Some("\"x\", \"abc123\""), None), None);
+
+        // Date conditions.
+        // If-Modified-Since after the object's mtime -> not modified -> 304.
+        assert_eq!(
+            precondition_status(None, None, Some(after), None, etag, ts),
+            Some(StatusCode::NOT_MODIFIED)
+        );
+        // If-Modified-Since before -> modified -> proceed.
+        assert_eq!(precondition_status(None, None, Some(before), None, etag, ts), None);
+        // If-Unmodified-Since after -> not modified -> proceed.
+        assert_eq!(precondition_status(None, None, None, Some(after), etag, ts), None);
+        // If-Unmodified-Since before -> modified -> 412.
+        assert_eq!(
+            precondition_status(None, None, None, Some(before), etag, ts),
+            Some(StatusCode::PRECONDITION_FAILED)
+        );
+        // Precedence: If-Match beats If-Unmodified-Since (which alone would 412).
+        assert_eq!(
+            precondition_status(Some(q), None, None, Some(before), etag, ts),
+            None
+        );
+        // Precedence: If-None-Match beats If-Modified-Since (which alone -> 304).
+        assert_eq!(
+            precondition_status(None, Some("\"other\""), Some(after), None, etag, ts),
+            None
+        );
     }
 }
 
