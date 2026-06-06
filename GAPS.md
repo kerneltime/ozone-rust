@@ -190,7 +190,7 @@ Each is cheap, within the stated scope, and (critically) needs a test that can
 These are real code with real gaps that would let a reader believe a behavior is
 backed when it is not. Each must be either wired or clearly annotated.
 
-### B1 [MAJOR-misleading] `block_token` is fully inert — OPEN
+### B1 [MAJOR-misleading] `block_token` is fully inert — DONE (this branch: documented; full wiring deferred to security milestone)
 - **Verified**: grep finds no non-empty write and no read outside tests — it is
   only ever `Vec::new()` (`backend.rs`, `fake_om.rs`).
 - **Now**: the proto comment says "Opaque token issued by SCM; gateway forwards
@@ -222,7 +222,7 @@ backed when it is not. Each must be either wired or clearly annotated.
   this codebase); `bcsi_id`/`replica_index` in the report are 0. These are
   forward-looking — nothing in this repo consumes them yet.
 
-### B4 [MINOR] Inert plumbing kept "consistent for the future" — OPEN/DOC
+### B4 [MINOR] Inert plumbing kept "consistent for the future" — DONE (this branch: annotated reserved)
 - `stripe_checksum`, `eof`, and `blockGroupLen` are written/stored but never read
   on any live path (the read path uses `loc.length` from OM). `CreateKey.metadata`
   is always sent empty (user metadata rides on `CommitKey` instead).
