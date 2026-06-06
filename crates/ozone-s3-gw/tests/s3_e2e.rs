@@ -107,6 +107,21 @@ fn md5_hex(data: &[u8]) -> String {
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Recursively collect every stored chunk file (those under a `chunks/`
+/// directory) below `dir`. Used to inject on-disk shard corruption.
+fn collect_chunk_files(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                collect_chunk_files(&p, out);
+            } else if p.components().any(|c| c.as_os_str() == "chunks") {
+                out.push(p);
+            }
+        }
+    }
+}
+
 /// Stand up 5 datanodes (RS-3-2, small 1 KiB cells so objects span several
 /// stripes) + a FakeOm pipeline + the gateway. Returns the gateway base URL and
 /// the datanode handles (for fault injection + cleanup).
@@ -221,6 +236,41 @@ async fn s3_object_lifecycle_with_degraded_read() {
     assert_eq!(st, StatusCode::NOT_FOUND, "GET after DELETE");
 
     // Cleanup.
+    for d in &dns {
+        d.handle.abort();
+        tokio::fs::remove_dir_all(&d.dir).await.ok();
+    }
+}
+
+#[tokio::test]
+async fn s3_corrupted_shard_is_detected_and_reconstructed() {
+    let (base, dns) = spawn_stack().await;
+    let client: HttpClient = Client::builder(TokioExecutor::new()).build_http();
+    let url = format!("{base}/bucket1/corrupt.bin");
+
+    // Object spanning several stripes so the data shard on datanode 0 holds real
+    // bytes (datanode 0 = data shard slot 1, per spawn_stack's pipeline order).
+    let body = Bytes::from((0..8000u32).map(|i| (i % 256) as u8).collect::<Vec<u8>>());
+    let (st, _, _) = http(&client, Method::PUT, url.clone(), Some("tester"), body.clone()).await;
+    assert_eq!(st, StatusCode::OK, "PUT");
+
+    // Corrupt one byte of that datanode's stored shard, in place on disk.
+    let mut files = Vec::new();
+    collect_chunk_files(&dns[0].dir, &mut files);
+    assert!(!files.is_empty(), "expected a stored chunk under datanode 0");
+    let mut bytes = std::fs::read(&files[0]).unwrap();
+    assert!(!bytes.is_empty(), "shard file is non-empty");
+    bytes[0] ^= 0xFF;
+    std::fs::write(&files[0], &bytes).unwrap();
+
+    // GET still returns the exact object: the datanode detects the bad checksum
+    // (DataLoss), the gateway treats that shard as missing, and EC reconstructs
+    // it from the survivors. Without read-path verification this GET would return
+    // corrupt bytes (the corrupted data shard would be reassembled directly).
+    let (st, _, got) = http(&client, Method::GET, url.clone(), Some("tester"), Bytes::new()).await;
+    assert_eq!(st, StatusCode::OK, "GET after shard corruption");
+    assert_eq!(got, body, "corrupted shard must be detected and reconstructed");
+
     for d in &dns {
         d.handle.abort();
         tokio::fs::remove_dir_all(&d.dir).await.ok();

@@ -404,8 +404,27 @@ impl DatanodeGatewayService for DatanodeService {
             .await
             .map_err(storage_status)?;
         if req.verify {
-            if let Some(cd) = &chunk.checksum_data {
-                checksum::verify(&data, cd).map_err(|e| Status::data_loss(e.to_string()))?;
+            // Prefer a caller-supplied checksum; otherwise verify the bytes we
+            // read against the checksum recorded for this chunk at PutBlock time.
+            // This makes a corrupted-on-disk shard surface as DataLoss so the
+            // gateway can degrade to an EC reconstruct instead of returning bad
+            // bytes (the gateway's read requests carry no checksum of their own).
+            let expected = match &chunk.checksum_data {
+                Some(cd) => Some(cd.clone()),
+                None => self
+                    .meta
+                    .get_block(&block)
+                    .await
+                    .map_err(storage_status)?
+                    .and_then(|bd| {
+                        bd.chunks
+                            .into_iter()
+                            .find(|c| c.chunk_name == chunk.chunk_name)
+                    })
+                    .and_then(|c| c.checksum_data),
+            };
+            if let Some(cd) = expected {
+                checksum::verify(&data, &cd).map_err(|e| Status::data_loss(e.to_string()))?;
             }
         }
         let frames = frame(data);

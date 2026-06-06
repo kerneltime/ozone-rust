@@ -647,7 +647,11 @@ impl Gateway {
                 checksum_data: None,
                 stripe_checksum: None,
             };
-            if let Ok(b) = dnc.read_chunk(&block_slot, &chunk, false).await {
+            // verify=true: the datanode checks the shard against its stored
+            // checksum. A corrupted shard then fails the read and is left absent,
+            // so the EC decoder reconstructs it from the survivors rather than
+            // decoding corrupt bytes.
+            if let Ok(b) = dnc.read_chunk(&block_slot, &chunk, true).await {
                 shard_bufs[slot - 1] = Some(b.to_vec());
             }
         }
