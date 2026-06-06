@@ -925,6 +925,52 @@ async fn s3_sdk_batch_delete_location_list_uploads() {
     }
 }
 
+/// DeleteObjects quiet mode via the real SDK: successful keys are suppressed in
+/// the response (only errors would appear), and the keys are actually deleted.
+#[tokio::test]
+async fn s3_sdk_delete_objects_quiet_mode() {
+    use aws_sdk_s3::primitives::ByteStream;
+    use aws_sdk_s3::types::{Delete, ObjectIdentifier};
+
+    let (base, dns) = spawn_stack().await;
+    let s3 = s3_client(&base);
+    for k in ["q1.txt", "q2.txt"] {
+        s3.put_object()
+            .bucket("bucket1")
+            .key(k)
+            .body(ByteStream::from(vec![1u8]))
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("put {k}: {e:?}"));
+    }
+
+    let del = Delete::builder()
+        .objects(ObjectIdentifier::builder().key("q1.txt").build().unwrap())
+        .objects(ObjectIdentifier::builder().key("q2.txt").build().unwrap())
+        .quiet(true)
+        .build()
+        .unwrap();
+    let res = s3
+        .delete_objects()
+        .bucket("bucket1")
+        .delete(del)
+        .send()
+        .await
+        .expect("delete quiet");
+    assert!(res.deleted().is_empty(), "quiet mode suppresses Deleted entries");
+    assert!(res.errors().is_empty(), "no per-key errors");
+    // The keys are really gone.
+    assert!(
+        s3.get_object().bucket("bucket1").key("q1.txt").send().await.is_err(),
+        "q1 deleted"
+    );
+
+    for d in &dns {
+        d.handle.abort();
+        tokio::fs::remove_dir_all(&d.dir).await.ok();
+    }
+}
+
 /// Bucket lifecycle via the real SDK: CreateBucket, ListBuckets, DeleteBucket.
 #[tokio::test]
 async fn s3_sdk_bucket_lifecycle() {

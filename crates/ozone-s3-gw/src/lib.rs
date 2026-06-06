@@ -260,9 +260,14 @@ async fn route(
             } else {
                 raw
             };
-            let keys = parse_delete_request(&body)?;
+            let (keys, quiet) = parse_delete_request(&body)?;
+            if keys.len() > 1000 {
+                return Err(GatewayError::BadRequest(
+                    "a delete request can contain at most 1000 keys".into(),
+                ));
+            }
             let results = gw.delete_objects(&bucket, &keys, &principal).await;
-            return Ok(xml_ok(delete_result_xml(&results)));
+            return Ok(xml_ok(delete_result_xml(&results, quiet)));
         }
         if method == Method::GET && query_param(q, "location").is_some() {
             return Ok(xml_ok(bucket_location_xml(&gw.region)));
@@ -490,12 +495,13 @@ fn quote(etag: &str) -> String {
 /// Render a [`GatewayError`] as an S3 `<Error>` XML body with the right status.
 fn error_response(e: GatewayError) -> Response<Full<Bytes>> {
     let message = e.to_string();
-    let (status, code) = match e {
-        GatewayError::NoSuchKey => (StatusCode::NOT_FOUND, "NoSuchKey"),
-        GatewayError::NoSuchBucket => (StatusCode::NOT_FOUND, "NoSuchBucket"),
-        GatewayError::NoSuchUpload => (StatusCode::NOT_FOUND, "NoSuchUpload"),
-        GatewayError::BadRequest(_) => (StatusCode::BAD_REQUEST, "InvalidRequest"),
-        _ => (StatusCode::INTERNAL_SERVER_ERROR, "InternalError"),
+    let code = e.s3_code();
+    let status = match e {
+        GatewayError::NoSuchKey | GatewayError::NoSuchBucket | GatewayError::NoSuchUpload => {
+            StatusCode::NOT_FOUND
+        }
+        GatewayError::BadRequest(_) => StatusCode::BAD_REQUEST,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     let xml = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>{code}</Code><Message>{}</Message></Error>",
@@ -1081,9 +1087,13 @@ fn range_not_satisfiable_response(total: usize) -> Response<Full<Bytes>> {
         .expect("valid response")
 }
 
-/// Extract the `<Key>` values from a `DeleteObjects` request body.
-fn parse_delete_request(body: &[u8]) -> Result<Vec<String>, GatewayError> {
+/// Extract the `<Key>` values and the `<Quiet>` flag from a `DeleteObjects`
+/// request body. In quiet mode the response reports only errors.
+fn parse_delete_request(body: &[u8]) -> Result<(Vec<String>, bool), GatewayError> {
     let s = String::from_utf8_lossy(body);
+    let quiet = extract_xml_element(&s, "Quiet")
+        .map(|v| v.trim().eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
     let mut keys = Vec::new();
     let mut rest: &str = s.as_ref();
     while let Some(start) = rest.find("<Key>") {
@@ -1097,7 +1107,7 @@ fn parse_delete_request(body: &[u8]) -> Result<Vec<String>, GatewayError> {
     if keys.is_empty() {
         return Err(GatewayError::BadRequest("no keys in delete request".into()));
     }
-    Ok(keys)
+    Ok((keys, quiet))
 }
 
 /// Reverse of [`xml_escape`] for text taken from request XML.
@@ -1109,17 +1119,23 @@ fn xml_unescape(s: &str) -> String {
         .replace("&amp;", "&") // must be last
 }
 
-/// `DeleteResult` XML for a batch delete.
-fn delete_result_xml(results: &[(String, Option<String>)]) -> String {
+/// `DeleteResult` XML for a batch delete. In `quiet` mode, successful keys are
+/// omitted and only errors are reported.
+fn delete_result_xml(results: &[(String, Option<(String, String)>)], quiet: bool) -> String {
     let mut s = String::new();
     s.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
     s.push_str("<DeleteResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">");
     for (key, err) in results {
         match err {
-            None => s.push_str(&format!("<Deleted><Key>{}</Key></Deleted>", xml_escape(key))),
-            Some(msg) => s.push_str(&format!(
-                "<Error><Key>{}</Key><Code>InternalError</Code><Message>{}</Message></Error>",
+            None => {
+                if !quiet {
+                    s.push_str(&format!("<Deleted><Key>{}</Key></Deleted>", xml_escape(key)));
+                }
+            }
+            Some((code, msg)) => s.push_str(&format!(
+                "<Error><Key>{}</Key><Code>{}</Code><Message>{}</Message></Error>",
                 xml_escape(key),
+                xml_escape(code),
                 xml_escape(msg)
             )),
         }
@@ -1349,10 +1365,14 @@ mod tests {
     #[test]
     fn parse_delete_request_extracts_keys() {
         let body = b"<Delete><Object><Key>a/b</Key></Object><Object><Key>c&amp;d</Key></Object></Delete>";
-        assert_eq!(
-            parse_delete_request(body).unwrap(),
-            vec!["a/b".to_string(), "c&d".to_string()]
-        );
+        let (keys, quiet) = parse_delete_request(body).unwrap();
+        assert_eq!(keys, vec!["a/b".to_string(), "c&d".to_string()]);
+        assert!(!quiet, "no <Quiet> -> verbose");
+        // Quiet flag is parsed.
+        let q = b"<Delete><Quiet>true</Quiet><Object><Key>x</Key></Object></Delete>";
+        let (keys, quiet) = parse_delete_request(q).unwrap();
+        assert_eq!(keys, vec!["x".to_string()]);
+        assert!(quiet, "<Quiet>true</Quiet> -> quiet");
         assert!(parse_delete_request(b"<Delete></Delete>").is_err());
     }
 

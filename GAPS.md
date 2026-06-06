@@ -123,7 +123,7 @@ Each is cheap, within the stated scope, and (critically) needs a test that can
 - **Test**: put 5 keys, `max-keys=2` → 2 keys + `IsTruncated=true` + token; follow
   the token → remaining keys, no overlap.
 
-### A5 [MAJOR] CopyObject ignores metadata/tagging directives; no self-copy guard — OPEN
+### A5 [MAJOR] CopyObject ignores metadata/tagging directives; no self-copy guard — DONE (this branch)
 - **Where**: `backend.rs` `copy_object` always does a reference copy that clones
   source metadata+tags; `lib.rs` copy branch reads neither directive.
 - **Now**: `x-amz-metadata-directive=REPLACE` / `x-amz-tagging-directive=REPLACE`

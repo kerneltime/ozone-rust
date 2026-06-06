@@ -71,6 +71,21 @@ pub enum GatewayError {
     Internal(String),
 }
 
+impl GatewayError {
+    /// The S3 `<Code>` string for this error. Shared by the top-level error
+    /// response and the per-key entries of a batch `DeleteObjects` result so the
+    /// two never drift.
+    pub fn s3_code(&self) -> &'static str {
+        match self {
+            GatewayError::NoSuchKey => "NoSuchKey",
+            GatewayError::NoSuchBucket => "NoSuchBucket",
+            GatewayError::NoSuchUpload => "NoSuchUpload",
+            GatewayError::BadRequest(_) => "InvalidRequest",
+            _ => "InternalError",
+        }
+    }
+}
+
 impl From<OmClientError> for GatewayError {
     fn from(e: OmClientError) -> Self {
         GatewayError::Om(Box::new(e))
@@ -742,19 +757,20 @@ impl Gateway {
     }
 
     /// Batch delete (S3 `DeleteObjects`). Deletes each key independently and
-    /// returns per-key outcomes: `(key, None)` on success, `(key, Some(msg))` on
-    /// error. Since object DELETE is idempotent, deleting an absent key succeeds.
+    /// returns per-key outcomes: `(key, None)` on success, `(key, Some((code,
+    /// message)))` on error, where `code` is the S3 error code. Since object
+    /// DELETE is idempotent, deleting an absent key succeeds.
     pub async fn delete_objects(
         &self,
         bucket: &str,
         keys: &[String],
         principal: &str,
-    ) -> Vec<(String, Option<String>)> {
+    ) -> Vec<(String, Option<(String, String)>)> {
         let mut results = Vec::with_capacity(keys.len());
         for key in keys {
             match self.delete_object(bucket, key, principal).await {
                 Ok(()) => results.push((key.clone(), None)),
-                Err(e) => results.push((key.clone(), Some(e.to_string()))),
+                Err(e) => results.push((key.clone(), Some((e.s3_code().to_string(), e.to_string())))),
             }
         }
         results
