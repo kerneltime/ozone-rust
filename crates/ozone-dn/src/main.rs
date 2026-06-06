@@ -40,7 +40,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .first()
         .expect("validated: data_dirs is non-empty");
     let chunks = Arc::new(FileChunkStore::new(data_root));
-    let service = DatanodeService::new(meta.clone(), chunks);
+    let service = DatanodeService::new(meta.clone(), chunks.clone());
 
     // SCM registration + heartbeat loop in the background; if SCM is down the
     // loop logs and exits, but the datanode keeps serving the gateway.
@@ -53,6 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             setup_time_ms: 0,
         },
         meta: meta.clone(),
+        chunks: chunks.clone(),
         heartbeat_interval: cfg.heartbeat_interval,
     };
     let scm_endpoint = format!("http://{}", cfg.scm_address);

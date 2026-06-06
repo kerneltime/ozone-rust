@@ -14,9 +14,10 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio_stream::wrappers::ReceiverStream;
 
+use ozone_grpc_types::dn::v1 as dn;
 use ozone_grpc_types::scm::dn::v1 as pb;
 use ozone_scm_client::{ScmClient, ScmClientError};
-use ozone_storage::MetaStore;
+use ozone_storage::{ChunkStore, MetaStore, StorageError};
 use ozone_types::{ContainerId, ContainerState};
 
 /// Failure of the registration/heartbeat loop.
@@ -28,14 +29,19 @@ pub enum ScmLoopError {
     /// The heartbeat response stream errored.
     #[error(transparent)]
     Stream(#[from] tonic::Status),
+    /// A local store read failed while building a report.
+    #[error(transparent)]
+    Storage(#[from] StorageError),
 }
 
-/// What the datanode registers to SCM with, plus the store commands act on.
+/// What the datanode registers to SCM with, plus the stores commands act on.
 pub struct ScmRegistration {
     /// This datanode's identity (uuid, addresses, version).
     pub datanode_id: pb::DatanodeId,
-    /// Metadata store that container lifecycle commands are applied to.
+    /// Metadata store that container lifecycle commands + reports read/write.
     pub meta: Arc<dyn MetaStore>,
+    /// Chunk store, so a DeleteContainer command also reclaims chunk bytes.
+    pub chunks: Arc<dyn ChunkStore>,
     /// Fallback heartbeat interval if SCM does not dictate one.
     pub heartbeat_interval: Duration,
 }
@@ -70,6 +76,13 @@ impl ScmRegistration {
             self.heartbeat_interval
         };
         tracing::info!(uuid = %uuid, "registered with SCM");
+
+        // Tell SCM which containers this datanode holds (a FULL report). Without
+        // it a real SCM never learns this DN's replicas. Best-effort: a report
+        // failure must not abort the heartbeat loop.
+        if let Err(e) = self.send_full_container_report(&mut client, &uuid).await {
+            tracing::warn!("initial container report failed: {e}");
+        }
 
         // Bidirectional heartbeat: a ticker task emits heartbeats; this task
         // consumes responses and dispatches their commands.
@@ -115,13 +128,53 @@ impl ScmRegistration {
             Some(Payload::DeleteContainer(c)) => {
                 if let Some(cid) = c.container_id {
                     let id = ContainerId(cid.id);
+                    // Metadata first, then chunk bytes (same order as the
+                    // gateway-facing DeleteContainer): a crash between the two
+                    // leaves reclaimable orphan files, not dangling metadata.
+                    // Deleting only metadata here would leak the chunk bytes.
                     if let Err(e) = self.meta.delete_container(id).await {
-                        tracing::warn!(%id, "delete-container command failed: {e}");
+                        tracing::warn!(%id, "delete-container (metadata) failed: {e}");
+                    }
+                    if let Err(e) = self.chunks.delete_container(id).await {
+                        tracing::warn!(%id, "delete-container (chunks) failed: {e}");
                     }
                 }
             }
             _ => tracing::debug!(cmd_id = cmd.cmd_id, "ignoring unhandled SCM command"),
         }
+    }
+
+    /// Send a single FULL [`pb::ContainerReportRequest`] listing every container
+    /// this datanode holds, and drain SCM's acks. `bcsi_id`/`replica_index` are
+    /// reported as 0 (this slice does not track per-container BCSI or a single
+    /// container-level replica index).
+    async fn send_full_container_report(
+        &self,
+        client: &mut ScmClient,
+        uuid: &str,
+    ) -> Result<(), ScmLoopError> {
+        let reports: Vec<pb::ContainerReport> = self
+            .meta
+            .list_containers()
+            .await?
+            .into_iter()
+            .map(|c| pb::ContainerReport {
+                container_id: Some(dn::ContainerId { id: c.container_id.0 }),
+                state: dn::container_state::State::from(c.state) as i32,
+                used_bytes: c.used_bytes,
+                block_count: c.block_count,
+                bcsi_id: 0,
+                replica_index: 0,
+            })
+            .collect();
+        let req = pb::ContainerReportRequest {
+            datanode_uuid: uuid.to_string(),
+            kind: pb::container_report_request::Kind::Full as i32,
+            reports,
+        };
+        let mut acks = client.container_report(tokio_stream::once(req)).await?;
+        while acks.message().await?.is_some() {}
+        Ok(())
     }
 }
 

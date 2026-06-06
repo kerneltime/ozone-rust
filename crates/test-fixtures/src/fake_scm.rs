@@ -12,6 +12,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use parking_lot::Mutex;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status, Streaming};
@@ -29,6 +30,8 @@ pub struct FakeScm {
     heartbeats: Arc<AtomicU64>,
     /// Commands delivered once, on the first heartbeat response of each stream.
     commands: Vec<pb::ScmCommand>,
+    /// Every container-report request this SCM has received (for assertions).
+    reports: Arc<Mutex<Vec<pb::ContainerReportRequest>>>,
 }
 
 impl Default for FakeScm {
@@ -45,6 +48,7 @@ impl FakeScm {
             heartbeat_interval_sec: 1,
             heartbeats: Arc::new(AtomicU64::new(0)),
             commands: Vec::new(),
+            reports: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -60,6 +64,12 @@ impl FakeScm {
     /// [`FakeScm::into_server`] consumes `self`, then poll it from the test.
     pub fn heartbeat_counter(&self) -> Arc<AtomicU64> {
         self.heartbeats.clone()
+    }
+
+    /// A shared handle to the container-report requests this SCM has received.
+    /// Clone it BEFORE [`FakeScm::into_server`] consumes `self`.
+    pub fn received_reports(&self) -> Arc<Mutex<Vec<pb::ContainerReportRequest>>> {
+        self.reports.clone()
     }
 
     /// Wrap in the tonic server for `Server::add_service`.
@@ -140,10 +150,12 @@ impl ScmRustDatanodeService for FakeScm {
         req: Request<Streaming<pb::ContainerReportRequest>>,
     ) -> Result<Response<Self::ContainerReportStream>, Status> {
         let mut inbound = req.into_inner();
+        let reports = self.reports.clone();
         let (tx, rx) = tokio::sync::mpsc::channel(8);
         tokio::spawn(async move {
             let mut seq = 0u64;
-            while let Ok(Some(_report)) = inbound.message().await {
+            while let Ok(Some(report)) = inbound.message().await {
+                reports.lock().push(report);
                 seq += 1;
                 if tx
                     .send(Ok(pb::ContainerReportAck { acked_seq: seq }))

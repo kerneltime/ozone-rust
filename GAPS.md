@@ -201,7 +201,7 @@ backed when it is not. Each must be either wired or clearly annotated.
   this slice. **Action (security milestone)**: wire SCM-issued token →
   gateway → DN + DN validation.
 
-### B2 [MAJOR] Multi-block write path wired but never called; no size guard — OPEN
+### B2 [MAJOR] Multi-block write path wired but never called; no size guard — DONE (this branch)
 - **Verified**: gateway never calls `allocate_block` (grep). `allocate_and_write`
   writes exactly one block group; `get_object` reads `info.locations` which a
   simple PUT only populates with one entry.
