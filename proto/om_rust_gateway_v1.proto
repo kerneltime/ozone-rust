@@ -205,6 +205,16 @@ message CopyKeyRequest {
   VolumeBucketKey source = 1;
   VolumeBucketKey dest = 2;
   AuthContext auth = 3;
+  // CopyObject directives. When replace_metadata is true the destination's user
+  // metadata (Content-Type + x-amz-meta-*) is taken from `metadata` instead of
+  // cloned from the source; the ETag is always preserved (the data is unchanged)
+  // and the source tags are preserved unless replace_tags is also set. When
+  // replace_tags is true the destination's tags are taken from `tags` instead of
+  // cloned from the source.
+  bool replace_metadata = 4;
+  map<string, string> metadata = 5;
+  bool replace_tags = 6;
+  repeated Tag tags = 7;
 }
 
 message CopyKeyResponse {

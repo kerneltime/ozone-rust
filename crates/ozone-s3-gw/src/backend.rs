@@ -143,6 +143,23 @@ pub type PartSummary = (u32, String, u64);
 /// An upload summary for `ListMultipartUploads`: `(upload_id, key)`.
 pub type UploadSummary = (String, String);
 
+/// CopyObject directives resolved from the request headers. With both directives
+/// at their `COPY` default the destination clones the source's metadata and tags.
+#[derive(Default)]
+pub struct CopyDirectives {
+    /// `x-amz-metadata-directive: REPLACE` — set the destination's user metadata
+    /// from [`CopyDirectives::metadata`] instead of cloning the source's.
+    pub replace_metadata: bool,
+    /// Replacement user metadata (Content-Type + `x-amz-meta-*`); used only when
+    /// `replace_metadata`.
+    pub metadata: HashMap<String, String>,
+    /// `x-amz-tagging-directive: REPLACE` — set the destination's tags from
+    /// [`CopyDirectives::tags`] instead of cloning the source's.
+    pub replace_tags: bool,
+    /// Replacement tags; used only when `replace_tags`.
+    pub tags: Vec<(String, String)>,
+}
+
 /// The gateway backend. Holds the OM channel, a per-datanode channel cache, and
 /// the in-flight multipart registry; per-call clients are built from the
 /// cloneable channels.
@@ -481,6 +498,7 @@ impl Gateway {
         src_bucket: &str,
         src_key: &str,
         principal: &str,
+        directives: CopyDirectives,
     ) -> Result<(String, u64), GatewayError> {
         match self
             .om()
@@ -488,6 +506,14 @@ impl Gateway {
                 source: Some(vbk(src_bucket, src_key)),
                 dest: Some(vbk(dest_bucket, dest_key)),
                 auth: Some(auth(principal)),
+                replace_metadata: directives.replace_metadata,
+                metadata: directives.metadata,
+                replace_tags: directives.replace_tags,
+                tags: directives
+                    .tags
+                    .into_iter()
+                    .map(|(key, value)| om::Tag { key, value })
+                    .collect(),
             })
             .await
         {

@@ -109,7 +109,7 @@ Each is cheap, within the stated scope, and (critically) needs a test that can
   `Content-Range: bytes */{total}`). Likely a 3-state return from `parse_range`.
 - **Test**: `bytes=200-300` on a 100-byte object → 416 with `Content-Range`.
 
-### A4 [MAJOR] `max-keys` unenforced; listing stream over-drained — OPEN
+### A4 [MAJOR] `max-keys` unenforced; listing stream over-drained — DONE (this branch)
 - **Where**: `backend.rs` `list_objects` drains the entire `list_keys` stream into
   one page (overwriting `is_truncated`/`next_continuation_token` with the last
   message's values); `lib.rs` parses `max-keys` and forwards it without capping.

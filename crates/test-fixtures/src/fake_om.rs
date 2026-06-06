@@ -545,6 +545,23 @@ impl OmRustGatewayService for FakeOm {
             .map(|s| s.as_bytes().to_vec())
             .unwrap_or_default();
         info.vbk = Some(dest);
+        // metadata-directive=REPLACE: drop the source's user metadata (Content-Type
+        // + x-amz-meta-*), keep the ETag and (for now) the tags, then apply the
+        // request's user metadata.
+        if req.replace_metadata {
+            info.metadata
+                .retain(|k, _| k == ETAG_METADATA_KEY || k.starts_with("x-amz-tag-"));
+            for (k, v) in req.metadata {
+                info.metadata.insert(k, v);
+            }
+        }
+        // tagging-directive=REPLACE: drop cloned tags, apply the request's.
+        if req.replace_tags {
+            info.metadata.retain(|k, _| !k.starts_with("x-amz-tag-"));
+            for tag in req.tags {
+                info.metadata.insert(format!("x-amz-tag-{}", tag.key), tag.value);
+            }
+        }
         st.keys.insert(dest_tuple, info);
 
         Ok(Response::new(pb::CopyKeyResponse { size, etag }))

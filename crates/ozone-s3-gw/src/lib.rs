@@ -83,6 +83,20 @@ async fn route(
         .get("x-amz-copy-source")
         .and_then(|v| v.to_str().ok())
         .map(String::from);
+    // CopyObject directives: REPLACE swaps in the request's metadata/tags, COPY
+    // (the default when the header is absent) clones the source's.
+    let replace_metadata = req
+        .headers()
+        .get("x-amz-metadata-directive")
+        .and_then(|v| v.to_str().ok())
+        .map(|d| d.eq_ignore_ascii_case("REPLACE"))
+        .unwrap_or(false);
+    let replace_tags = req
+        .headers()
+        .get("x-amz-tagging-directive")
+        .and_then(|v| v.to_str().ok())
+        .map(|d| d.eq_ignore_ascii_case("REPLACE"))
+        .unwrap_or(false);
     let range_header = req
         .headers()
         .get(hyper::header::RANGE)
@@ -309,8 +323,30 @@ async fn route(
             // PutObject with x-amz-copy-source is a server-side CopyObject.
             if let Some(source) = &copy_source {
                 let (src_bucket, src_key) = parse_copy_source(source)?;
+                // Self-copy is illegal unless metadata is being replaced (the
+                // canonical "update metadata in place" idiom).
+                if src_bucket == bucket && src_key == key && !replace_metadata {
+                    return Err(GatewayError::BadRequest(
+                        "copy destination is the same as the source without replacing metadata"
+                            .into(),
+                    ));
+                }
+                let tags = if replace_tags {
+                    match &tagging_header {
+                        Some(h) => parse_tagging_header(h)?,
+                        None => Vec::new(),
+                    }
+                } else {
+                    Vec::new()
+                };
+                let directives = backend::CopyDirectives {
+                    replace_metadata,
+                    metadata: user_metadata.clone(),
+                    replace_tags,
+                    tags,
+                };
                 let (etag, _size) = gw
-                    .copy_object(&bucket, &key, &src_bucket, &src_key, &principal)
+                    .copy_object(&bucket, &key, &src_bucket, &src_key, &principal, directives)
                     .await?;
                 return Ok(xml_ok(copy_object_xml(&etag)));
             }

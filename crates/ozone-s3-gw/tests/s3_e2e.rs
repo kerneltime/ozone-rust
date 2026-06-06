@@ -753,6 +753,93 @@ async fn s3_sdk_copy_object_and_range_get() {
     }
 }
 
+/// CopyObject metadata directives via the real SDK: REPLACE swaps in new
+/// metadata, COPY (default) clones the source's, self-copy with REPLACE updates
+/// in place, and a pure-COPY self-copy is rejected.
+#[tokio::test]
+async fn s3_sdk_copy_object_metadata_directive() {
+    use aws_sdk_s3::error::ProvideErrorMetadata;
+    use aws_sdk_s3::primitives::ByteStream;
+    use aws_sdk_s3::types::MetadataDirective;
+
+    let (base, dns) = spawn_stack().await;
+    let s3 = s3_client(&base);
+
+    s3.put_object()
+        .bucket("bucket1")
+        .key("orig.bin")
+        .body(ByteStream::from(vec![1u8; 10]))
+        .content_type("text/plain")
+        .metadata("k", "v1")
+        .send()
+        .await
+        .expect("put orig");
+
+    // REPLACE to a new key: new content-type + metadata, not the source's.
+    s3.copy_object()
+        .bucket("bucket1")
+        .key("copy.bin")
+        .copy_source("bucket1/orig.bin")
+        .metadata_directive(MetadataDirective::Replace)
+        .content_type("application/json")
+        .metadata("k", "v2")
+        .send()
+        .await
+        .expect("copy REPLACE");
+    let got = s3.get_object().bucket("bucket1").key("copy.bin").send().await.unwrap();
+    assert_eq!(got.content_type(), Some("application/json"), "REPLACE content-type");
+    assert_eq!(
+        got.metadata().and_then(|m| m.get("k")).map(String::as_str),
+        Some("v2"),
+        "REPLACE metadata"
+    );
+
+    // Default COPY clones the source metadata.
+    s3.copy_object()
+        .bucket("bucket1")
+        .key("copy2.bin")
+        .copy_source("bucket1/orig.bin")
+        .send()
+        .await
+        .expect("copy COPY");
+    let got2 = s3.get_object().bucket("bucket1").key("copy2.bin").send().await.unwrap();
+    assert_eq!(got2.content_type(), Some("text/plain"), "COPY clones content-type");
+    assert_eq!(
+        got2.metadata().and_then(|m| m.get("k")).map(String::as_str),
+        Some("v1"),
+        "COPY clones metadata"
+    );
+
+    // Self-copy with REPLACE updates metadata in place.
+    s3.copy_object()
+        .bucket("bucket1")
+        .key("orig.bin")
+        .copy_source("bucket1/orig.bin")
+        .metadata_directive(MetadataDirective::Replace)
+        .content_type("text/markdown")
+        .send()
+        .await
+        .expect("self-copy REPLACE");
+    let got3 = s3.get_object().bucket("bucket1").key("orig.bin").send().await.unwrap();
+    assert_eq!(got3.content_type(), Some("text/markdown"), "self-copy REPLACE updates in place");
+
+    // Pure-COPY self-copy is rejected.
+    let err = s3
+        .copy_object()
+        .bucket("bucket1")
+        .key("orig.bin")
+        .copy_source("bucket1/orig.bin")
+        .send()
+        .await
+        .expect_err("self-copy without REPLACE must fail");
+    assert_eq!(err.code(), Some("InvalidRequest"), "{err:?}");
+
+    for d in &dns {
+        d.handle.abort();
+        tokio::fs::remove_dir_all(&d.dir).await.ok();
+    }
+}
+
 /// Batch delete, GetBucketLocation, and ListMultipartUploads via the real SDK.
 #[tokio::test]
 async fn s3_sdk_batch_delete_location_list_uploads() {
