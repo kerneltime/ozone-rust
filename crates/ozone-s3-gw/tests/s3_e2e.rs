@@ -555,8 +555,9 @@ async fn s3_sdk_multipart_upload() {
         .expect("create_multipart_upload");
     let upload_id = create.upload_id().expect("upload id").to_string();
 
-    // Two parts, each spanning multiple EC stripes.
-    let part1: Vec<u8> = (0..3000u32).map(|i| (i % 256) as u8).collect();
+    // Part 1 is non-last, so it must meet the S3 5 MiB minimum; part 2 (the last
+    // part) may be small. Both span multiple EC stripes.
+    let part1: Vec<u8> = (0..5 * 1024 * 1024u32).map(|i| (i % 256) as u8).collect();
     let part2: Vec<u8> = (0..2000u32).map(|i| ((i + 99) % 256) as u8).collect();
 
     let mut completed_parts = Vec::new();
@@ -618,6 +619,102 @@ async fn s3_sdk_multipart_upload() {
     }
 }
 
+/// Multipart limits: a non-last part below 5 MiB fails Complete (EntityTooSmall),
+/// a single small part is fine (last part exempt), and part numbers outside
+/// 1..=10000 are rejected at UploadPart.
+#[tokio::test]
+async fn s3_multipart_part_size_and_number_limits() {
+    use aws_sdk_s3::error::ProvideErrorMetadata;
+    use aws_sdk_s3::primitives::ByteStream;
+    use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+
+    let (base, dns) = spawn_stack().await;
+    let s3 = s3_client(&base);
+    let client: HttpClient = Client::builder(TokioExecutor::new()).build_http();
+
+    // Two small parts: the first (non-last) is below 5 MiB -> EntityTooSmall.
+    let create = s3.create_multipart_upload().bucket("bucket1").key("small.bin").send().await.unwrap();
+    let uid = create.upload_id().unwrap().to_string();
+    let mut completed = Vec::new();
+    for n in [1i32, 2] {
+        let up = s3
+            .upload_part()
+            .bucket("bucket1")
+            .key("small.bin")
+            .upload_id(&uid)
+            .part_number(n)
+            .body(ByteStream::from(vec![7u8; 1000]))
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("upload {n}: {e:?}"));
+        completed.push(
+            CompletedPart::builder()
+                .part_number(n)
+                .e_tag(up.e_tag().unwrap_or_default())
+                .build(),
+        );
+    }
+    let err = s3
+        .complete_multipart_upload()
+        .bucket("bucket1")
+        .key("small.bin")
+        .upload_id(&uid)
+        .multipart_upload(CompletedMultipartUpload::builder().set_parts(Some(completed)).build())
+        .send()
+        .await
+        .expect_err("a non-last part below 5 MiB must fail");
+    assert_eq!(err.code(), Some("InvalidRequest"), "{err:?}");
+    s3.abort_multipart_upload().bucket("bucket1").key("small.bin").upload_id(&uid).send().await.ok();
+
+    // A single small part is the last part, so the minimum does not apply.
+    let create = s3.create_multipart_upload().bucket("bucket1").key("one.bin").send().await.unwrap();
+    let uid = create.upload_id().unwrap().to_string();
+    let up = s3
+        .upload_part()
+        .bucket("bucket1")
+        .key("one.bin")
+        .upload_id(&uid)
+        .part_number(1)
+        .body(ByteStream::from(vec![7u8; 1000]))
+        .send()
+        .await
+        .unwrap();
+    s3.complete_multipart_upload()
+        .bucket("bucket1")
+        .key("one.bin")
+        .upload_id(&uid)
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .set_parts(Some(vec![CompletedPart::builder()
+                    .part_number(1)
+                    .e_tag(up.e_tag().unwrap_or_default())
+                    .build()]))
+                .build(),
+        )
+        .send()
+        .await
+        .expect("a single small (last) part completes");
+
+    // Part numbers outside 1..=10000 are rejected (raw HTTP; the SDK clamps).
+    let create = s3.create_multipart_upload().bucket("bucket1").key("range.bin").send().await.unwrap();
+    let uid = create.upload_id().unwrap().to_string();
+    for pn in ["0", "10001"] {
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri(format!("{base}/bucket1/range.bin?partNumber={pn}&uploadId={uid}"))
+            .header("x-auth-principal", "t")
+            .body(Full::new(Bytes::from_static(b"x")))
+            .unwrap();
+        let st = client.request(req).await.unwrap().status();
+        assert_eq!(st, StatusCode::BAD_REQUEST, "partNumber {pn} must be rejected");
+    }
+
+    for d in &dns {
+        d.handle.abort();
+        tokio::fs::remove_dir_all(&d.dir).await.ok();
+    }
+}
+
 /// Multipart Complete must reject non-ascending or duplicate part numbers
 /// (S3 `InvalidPartOrder`) rather than silently re-sorting. Uses raw HTTP for
 /// Complete so the part order on the wire is controlled exactly.
@@ -659,15 +756,21 @@ async fn s3_multipart_rejects_out_of_order_and_duplicate_parts() {
     };
     let url = format!("{base}/bucket1/mp.bin?uploadId={upload_id}");
 
-    // Out-of-order [2,1] -> 400.
+    // Out-of-order [2,1] -> 400 (order is checked before part size).
     let (st, _, _) = http(&client, Method::POST, url.clone(), Some("t"), Bytes::from(complete(&[2, 1]))).await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "out-of-order parts must be rejected");
     // Duplicate [1,1] -> 400.
     let (st, _, _) = http(&client, Method::POST, url.clone(), Some("t"), Bytes::from(complete(&[1, 1]))).await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "duplicate parts must be rejected");
-    // Ascending [1,2] completes.
-    let (st, _, _) = http(&client, Method::POST, url.clone(), Some("t"), Bytes::from(complete(&[1, 2]))).await;
-    assert_eq!(st, StatusCode::OK, "ascending parts must complete");
+    // (Successful ascending completion is covered by s3_sdk_multipart_upload,
+    // which uses a 5 MiB first part; these tiny parts would hit EntityTooSmall.)
+    s3.abort_multipart_upload()
+        .bucket("bucket1")
+        .key("mp.bin")
+        .upload_id(&upload_id)
+        .send()
+        .await
+        .expect("abort");
 
     for d in &dns {
         d.handle.abort();

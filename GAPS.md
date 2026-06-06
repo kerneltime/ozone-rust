@@ -147,7 +147,7 @@ Each is cheap, within the stated scope, and (critically) needs a test that can
   `MalformedXML`.
 - **Test**: quiet batch of existing keys → empty `<DeleteResult>`; 1001 keys → 400.
 
-### A7 [MAJOR] `If-Modified-Since` / `If-Unmodified-Since` ignored — OPEN
+### A7 [MAJOR] `If-Modified-Since` / `If-Unmodified-Since` ignored — DONE (this branch)
 - **Where**: neither header is read anywhere in `src/` (grep-confirmed). Only
   If-Match/If-None-Match are evaluated.
 - **Now**: date-conditional GET/HEAD always returns 200 — broken cache

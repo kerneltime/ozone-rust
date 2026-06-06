@@ -39,6 +39,10 @@ const ETAG_META_KEY: &str = "ETAG";
 /// Prefix for object tag entries persisted in OM key metadata. Keeps the S3 tag
 /// set namespaced away from user `x-amz-meta-*` metadata and the reserved ETag.
 const TAG_META_PREFIX: &str = "x-amz-tag-";
+/// Minimum size of every multipart part except the last (S3 `EntityTooSmall`).
+const MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
+/// Inclusive upper bound on multipart part numbers (S3 allows 1..=10000).
+const MAX_PART_NUMBER: u32 = 10_000;
 
 /// Errors surfaced from the gateway data path. The HTTP layer maps these onto
 /// S3 status codes.
@@ -821,6 +825,11 @@ impl Gateway {
         part_number: u32,
         body: Bytes,
     ) -> Result<String, GatewayError> {
+        if !(1..=MAX_PART_NUMBER).contains(&part_number) {
+            return Err(GatewayError::BadRequest(format!(
+                "part number {part_number} out of range (1..={MAX_PART_NUMBER})"
+            )));
+        }
         if !self.mpu.lock().await.contains_key(upload_id) {
             return Err(GatewayError::NoSuchUpload);
         }
@@ -870,10 +879,19 @@ impl Gateway {
             let reg = self.mpu.lock().await;
             let stored = reg.get(upload_id).ok_or(GatewayError::NoSuchUpload)?;
             let mut v = Vec::with_capacity(ordered_part_numbers.len());
-            for &pn in ordered_part_numbers {
+            let last_idx = ordered_part_numbers.len() - 1;
+            for (idx, &pn) in ordered_part_numbers.iter().enumerate() {
                 let part = stored.parts.get(&pn).ok_or_else(|| {
                     GatewayError::BadRequest(format!("part {pn} was not uploaded"))
                 })?;
+                // Every part except the last must meet the 5 MiB minimum
+                // (S3 EntityTooSmall).
+                if idx != last_idx && part.size < MIN_PART_SIZE {
+                    return Err(GatewayError::BadRequest(format!(
+                        "part {pn} ({} bytes) is smaller than the {MIN_PART_SIZE}-byte minimum",
+                        part.size
+                    )));
+                }
                 v.push(om::Part {
                     part_number: pn,
                     etag: part.etag_binary.clone(),
