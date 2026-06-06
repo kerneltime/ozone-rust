@@ -288,6 +288,35 @@ async fn s3_corrupted_shard_is_detected_and_reconstructed() {
 }
 
 #[tokio::test]
+async fn s3_empty_object_round_trip() {
+    let (base, dns) = spawn_stack().await;
+    let client: HttpClient = Client::builder(TokioExecutor::new()).build_http();
+    let url = format!("{base}/bucket1/empty.bin");
+
+    // A 0-byte object stores zero block groups; its ETag is the MD5 of empty.
+    let (st, hdr, _) = http(&client, Method::PUT, url.clone(), Some("tester"), Bytes::new()).await;
+    assert_eq!(st, StatusCode::OK, "empty PUT");
+    assert_eq!(
+        hdr.get(header::ETAG).unwrap().to_str().unwrap(),
+        format!("\"{}\"", md5_hex(b"")),
+    );
+
+    let (st, hdr, got) = http(&client, Method::GET, url.clone(), Some("tester"), Bytes::new()).await;
+    assert_eq!(st, StatusCode::OK, "empty GET");
+    assert_eq!(hdr.get(header::CONTENT_LENGTH).unwrap(), "0");
+    assert!(got.is_empty(), "empty object has no body");
+
+    let (st, hdr, _) = http(&client, Method::HEAD, url.clone(), Some("tester"), Bytes::new()).await;
+    assert_eq!(st, StatusCode::OK, "empty HEAD");
+    assert_eq!(hdr.get(header::CONTENT_LENGTH).unwrap(), "0");
+
+    for d in &dns {
+        d.handle.abort();
+        tokio::fs::remove_dir_all(&d.dir).await.ok();
+    }
+}
+
+#[tokio::test]
 async fn s3_multi_block_object_round_trip_and_degraded() {
     // Small block groups (2 KiB) so a 9 KB object spans 5 groups (4 full + 1).
     let (base, dns) = spawn_stack_with_block_size(Some(2048)).await;

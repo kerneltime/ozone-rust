@@ -249,11 +249,15 @@ single-failure degraded read."*
 - **C4** Degraded read proven end-to-end for only a single failure; max-`p` and
   parity-only-survivor recovery proven only at the pure-EC layer, not through the
   gateway+DN wire path.
-- **C5** No GC/reclaimer: orphaned blocks from multipart abort and SCM-deleted
-  containers accumulate forever (referenced in comments as if it exists; it does
-  not).
-- **C6** Scale/concurrency untested: pagination beyond one page, concurrent PUTs
-  to one key, concurrent uploads, multi-block large objects.
+- **C5** No GC/reclaimer: orphaned blocks accumulate forever (referenced in
+  comments as if it exists; it does not). Sources: multipart abort, SCM-deleted
+  containers, and now also a partial multi-block write — if AllocateBlock or a
+  shard write fails on segment N of M, segments 1..N-1 are written but the key is
+  never committed, orphaning those shards. Same no-rollback property the
+  single-block path always had, with a larger window.
+- **C6** Scale/concurrency untested: concurrent PUTs to one key, concurrent
+  uploads. (Pagination beyond one page and multi-block large objects are now
+  covered by the A4 and B2 e2e tests respectively.)
 
 ---
 
