@@ -126,6 +126,12 @@ fn collect_chunk_files(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
 /// stripes) + a FakeOm pipeline + the gateway. Returns the gateway base URL and
 /// the datanode handles (for fault injection + cleanup).
 async fn spawn_stack() -> (String, Vec<Datanode>) {
+    spawn_stack_with_block_size(None).await
+}
+
+/// Like [`spawn_stack`] but optionally forces a small EC block-group size so a
+/// modest object spans several block groups (the multi-block path).
+async fn spawn_stack_with_block_size(block_group_size: Option<usize>) -> (String, Vec<Datanode>) {
     let mut dns = Vec::new();
     for i in 0..5 {
         dns.push(spawn_datanode(i).await);
@@ -137,7 +143,11 @@ async fn spawn_stack() -> (String, Vec<Datanode>) {
         .map(|d| datanode_details(&d.uuid, "127.0.0.1", d.addr.port() as u32))
         .collect();
     let (om_endpoint, _om) = spawn_om(PipelineConfig::new(details, ec_wire)).await;
-    let gateway = Arc::new(Gateway::connect(om_endpoint, "us-east-1").await.unwrap());
+    let mut gw = Gateway::connect(om_endpoint, "us-east-1").await.unwrap();
+    if let Some(n) = block_group_size {
+        gw.set_block_group_size(n);
+    }
+    let gateway = Arc::new(gw);
     let gw_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", gw_listener.local_addr().unwrap());
     tokio::spawn(async move {
@@ -270,6 +280,131 @@ async fn s3_corrupted_shard_is_detected_and_reconstructed() {
     let (st, _, got) = http(&client, Method::GET, url.clone(), Some("tester"), Bytes::new()).await;
     assert_eq!(st, StatusCode::OK, "GET after shard corruption");
     assert_eq!(got, body, "corrupted shard must be detected and reconstructed");
+
+    for d in &dns {
+        d.handle.abort();
+        tokio::fs::remove_dir_all(&d.dir).await.ok();
+    }
+}
+
+#[tokio::test]
+async fn s3_multi_block_object_round_trip_and_degraded() {
+    // Small block groups (2 KiB) so a 9 KB object spans 5 groups (4 full + 1).
+    let (base, dns) = spawn_stack_with_block_size(Some(2048)).await;
+    let client: HttpClient = Client::builder(TokioExecutor::new()).build_http();
+    let url = format!("{base}/bucket1/multiblock.bin");
+
+    let body = Bytes::from((0..9000u32).map(|i| (i % 256) as u8).collect::<Vec<u8>>());
+    let want_etag = md5_hex(&body);
+
+    let (st, hdr, _) = http(&client, Method::PUT, url.clone(), Some("tester"), body.clone()).await;
+    assert_eq!(st, StatusCode::OK, "multi-block PUT");
+    assert_eq!(
+        hdr.get(header::ETAG).unwrap().to_str().unwrap(),
+        format!("\"{want_etag}\"")
+    );
+
+    // GET concatenates every block group back to the exact object.
+    let (st, _, got) = http(&client, Method::GET, url.clone(), Some("tester"), Bytes::new()).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(got, body, "multi-block GET must reassemble every block group");
+
+    // HEAD reports the full object size.
+    let (st, hdr, _) = http(&client, Method::HEAD, url.clone(), Some("tester"), Bytes::new()).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(hdr.get(header::CONTENT_LENGTH).unwrap(), "9000");
+
+    // Prove the object was actually split, not stored as one oversized block:
+    // 9000 bytes / 2048 = 5 block groups, so each datanode holds 5 shard files
+    // (its one replica slot per group). The old single-block path would store 1.
+    let mut files = Vec::new();
+    collect_chunk_files(&dns[1].dir, &mut files);
+    assert_eq!(files.len(), 5, "expected 5 block groups per datanode, got {}", files.len());
+
+    // A range straddling block-group boundaries returns the right slice.
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(url.clone())
+        .header("x-auth-principal", "tester")
+        .header(header::RANGE, "bytes=2000-4100")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let resp = client.request(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+    let ranged = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(ranged.as_ref(), &body[2000..=4100], "cross-block range slice");
+
+    // Degraded read across ALL block groups: killing the datanode holding data
+    // shard slot 1 removes that shard from every group; each must reconstruct.
+    dns[0].handle.abort();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (st, _, got) = http(&client, Method::GET, url.clone(), Some("tester"), Bytes::new()).await;
+    assert_eq!(st, StatusCode::OK, "degraded multi-block GET");
+    assert_eq!(got, body, "every block group must reconstruct from survivors");
+
+    for d in &dns {
+        d.handle.abort();
+        tokio::fs::remove_dir_all(&d.dir).await.ok();
+    }
+}
+
+#[tokio::test]
+async fn s3_multipart_part_spans_blocks() {
+    use aws_sdk_s3::primitives::ByteStream;
+    use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+
+    // 2 MiB block groups: the 5 MiB first part spans three groups.
+    let (base, dns) = spawn_stack_with_block_size(Some(2 * 1024 * 1024)).await;
+    let s3 = s3_client(&base);
+
+    let create = s3
+        .create_multipart_upload()
+        .bucket("bucket1")
+        .key("mp-mb.bin")
+        .send()
+        .await
+        .expect("create");
+    let uid = create.upload_id().unwrap().to_string();
+    let part1: Vec<u8> = (0..5 * 1024 * 1024u32).map(|i| (i % 256) as u8).collect();
+    let part2: Vec<u8> = (0..1000u32).map(|i| ((i + 7) % 256) as u8).collect();
+    let mut completed = Vec::new();
+    for (n, b) in [(1i32, &part1), (2i32, &part2)] {
+        let up = s3
+            .upload_part()
+            .bucket("bucket1")
+            .key("mp-mb.bin")
+            .upload_id(&uid)
+            .part_number(n)
+            .body(ByteStream::from(b.clone()))
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("upload {n}: {e:?}"));
+        completed.push(
+            CompletedPart::builder()
+                .part_number(n)
+                .e_tag(up.e_tag().unwrap_or_default())
+                .build(),
+        );
+    }
+    s3.complete_multipart_upload()
+        .bucket("bucket1")
+        .key("mp-mb.bin")
+        .upload_id(&uid)
+        .multipart_upload(CompletedMultipartUpload::builder().set_parts(Some(completed)).build())
+        .send()
+        .await
+        .expect("complete multi-block multipart");
+
+    let got = s3.get_object().bucket("bucket1").key("mp-mb.bin").send().await.unwrap();
+    let bytes = got.body.collect().await.unwrap().into_bytes();
+    let mut expected = part1.clone();
+    expected.extend_from_slice(&part2);
+    assert_eq!(
+        bytes.len(),
+        expected.len(),
+        "reassembled length (part1 spans 3 block groups)"
+    );
+    assert_eq!(bytes.as_ref(), &expected[..], "multi-block multipart reassembles exactly");
 
     for d in &dns {
         d.handle.abort();

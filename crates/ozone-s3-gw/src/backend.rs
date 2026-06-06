@@ -7,8 +7,10 @@
 //! missing data shards).
 //!
 //! # Assumptions of this slice
-//! - One block group per object (the object fits a single OM-allocated block).
-//!   Multi-block (very large) objects are a later extension.
+//! - An object (or multipart part) is split into block groups of at most
+//!   `block_group_size` user bytes; each block group is independently
+//!   erasure-coded and allocated from OM (`CreateKey` pre-allocation, then
+//!   `AllocateBlock`). A read concatenates the groups in committed order.
 //! - One chunk ("0") per shard, holding that shard's full bytes.
 //! - Trust-the-proxy auth: the principal is taken verbatim from the gateway's
 //!   caller (the secure proxy), and `proxy_attested` is set true. The gateway
@@ -43,6 +45,12 @@ const TAG_META_PREFIX: &str = "x-amz-tag-";
 const MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
 /// Inclusive upper bound on multipart part numbers (S3 allows 1..=10000).
 const MAX_PART_NUMBER: u32 = 10_000;
+/// Default maximum user bytes per EC block group. An object (or multipart part)
+/// larger than this is split across several block groups, each independently
+/// erasure-coded and allocated from OM. 256 MiB mirrors Ozone's default block
+/// size; tests override it (see [`Gateway::set_block_group_size`]) so a small
+/// object exercises the multi-block path.
+const DEFAULT_BLOCK_GROUP_SIZE: usize = 256 * 1024 * 1024;
 
 /// Errors surfaced from the gateway data path. The HTTP layer maps these onto
 /// S3 status codes.
@@ -145,8 +153,9 @@ struct MpuPart {
     etag_binary: Vec<u8>,
     /// Part size in bytes.
     size: u64,
-    /// The part's stored block group.
-    location: om::KeyLocation,
+    /// The part's stored block group(s) — more than one if the part exceeded the
+    /// block-group size.
+    locations: Vec<om::KeyLocation>,
 }
 
 /// In-flight multipart upload: its target key plus the parts uploaded so far.
@@ -193,6 +202,8 @@ pub struct Gateway {
     mpu: Mutex<HashMap<String, MpuUpload>>,
     /// S3 region reported in responses (informational for OBS).
     pub region: String,
+    /// Max user bytes per EC block group; larger writes span multiple groups.
+    block_group_size: usize,
 }
 
 impl Gateway {
@@ -211,7 +222,14 @@ impl Gateway {
             dn_channels: Mutex::new(HashMap::new()),
             mpu: Mutex::new(HashMap::new()),
             region: region.into(),
+            block_group_size: DEFAULT_BLOCK_GROUP_SIZE,
         })
+    }
+
+    /// Override the max user bytes per EC block group. Clamped to at least 1.
+    /// Intended for tests (and tuning) so a small object spans multiple groups.
+    pub fn set_block_group_size(&mut self, bytes: usize) {
+        self.block_group_size = bytes.max(1);
     }
 
     fn om(&self) -> OmClient {
@@ -386,10 +404,13 @@ impl Gateway {
         Ok((ec, ec_wire))
     }
 
-    /// Allocate a block from OM, EC-encode `body`, and write the k+p shards to
-    /// the pipeline datanodes (one shard per replica slot). Returns the
-    /// committed-shape [`om::KeyLocation`] plus the OM `client_id`/`open_version`
-    /// (the simple PUT path needs them for `CommitKey`; multipart discards them).
+    /// Erasure-code `body` and store it as one or more block groups, splitting at
+    /// `block_group_size` and allocating blocks from OM as needed (the first from
+    /// `CreateKey`'s pre-allocation, the rest via `AllocateBlock`). Returns the
+    /// committed-shape locations in object order plus the OM
+    /// `client_id`/`open_version` (the simple PUT path needs them for `CommitKey`;
+    /// multipart keeps the locations and discards the ids). An empty body yields
+    /// no block groups (a 0-byte object has no data blocks).
     async fn allocate_and_write(
         &self,
         bucket: &str,
@@ -398,10 +419,7 @@ impl Gateway {
         ec: EcReplicationConfig,
         ec_wire: &dn::EcReplicationConfig,
         body: &[u8],
-    ) -> Result<(om::KeyLocation, u64, u64), GatewayError> {
-        let profile = ec_profile(ec);
-        let shards = ozone_ec::stripe::encode_object(profile, body)?;
-
+    ) -> Result<(Vec<om::KeyLocation>, u64, u64), GatewayError> {
         let ck = self
             .om()
             .create_key(om::CreateKeyRequest {
@@ -413,11 +431,44 @@ impl Gateway {
             })
             .await?;
         let (client_id, open_version) = (ck.client_id, ck.open_version);
-        let block = ck
-            .pre_allocated_blocks
-            .into_iter()
-            .next()
-            .ok_or_else(|| GatewayError::Internal("OM returned no pre-allocated block".into()))?;
+        let mut pre_allocated: std::collections::VecDeque<om::KeyLocation> =
+            ck.pre_allocated_blocks.into();
+
+        let mut locations = Vec::new();
+        for segment in body.chunks(self.block_group_size) {
+            let block = match pre_allocated.pop_front() {
+                Some(b) => b,
+                None => self
+                    .om()
+                    .allocate_block(om::AllocateBlockRequest {
+                        client_id,
+                        open_version,
+                        vbk: Some(vbk(bucket, key)),
+                        exclude_dn_uuids: Vec::new(),
+                        auth: Some(auth(principal)),
+                    })
+                    .await?
+                    .new_block
+                    .ok_or_else(|| {
+                        GatewayError::Internal("OM returned no allocated block".into())
+                    })?,
+            };
+            locations.push(self.write_block_group(block, ec, segment).await?);
+        }
+        Ok((locations, client_id, open_version))
+    }
+
+    /// EC-encode one `segment` and write its `k+p` shards to the datanodes of the
+    /// given pre-allocated `block`'s pipeline (one shard per replica slot).
+    /// Returns the committed-shape [`om::KeyLocation`] for that block group.
+    async fn write_block_group(
+        &self,
+        block: om::KeyLocation,
+        ec: EcReplicationConfig,
+        segment: &[u8],
+    ) -> Result<om::KeyLocation, GatewayError> {
+        let profile = ec_profile(ec);
+        let shards = ozone_ec::stripe::encode_object(profile, segment)?;
         let pipeline = block
             .pipeline
             .ok_or_else(|| GatewayError::Internal("block has no pipeline".into()))?;
@@ -457,18 +508,17 @@ impl Gateway {
                 .await?;
             let mut bd = BlockData::new(block_slot);
             bd.chunks.push(chunk);
-            bd.set_block_group_len(body.len() as u64);
+            bd.set_block_group_len(segment.len() as u64);
             dnc.put_block(&bd, true).await?;
         }
 
-        let loc = om::KeyLocation {
+        Ok(om::KeyLocation {
             block_id: Some(group),
             offset: 0,
-            length: body.len() as u64,
+            length: segment.len() as u64,
             pipeline: Some(pipeline),
             block_token: Vec::new(),
-        };
-        Ok((loc, client_id, open_version))
+        })
     }
 
     /// PUT object: encode + store one block group, then commit the key. Returns
@@ -485,7 +535,7 @@ impl Gateway {
         tags: Vec<(String, String)>,
     ) -> Result<String, GatewayError> {
         let (ec, ec_wire) = self.bucket_ec(bucket, principal).await?;
-        let (loc, client_id, open_version) = self
+        let (locations, client_id, open_version) = self
             .allocate_and_write(bucket, key, principal, ec, &ec_wire, &body)
             .await?;
         for (k, v) in tags {
@@ -498,7 +548,7 @@ impl Gateway {
                 open_version,
                 vbk: Some(vbk(bucket, key)),
                 final_size: body.len() as u64,
-                final_locations: vec![loc],
+                final_locations: locations,
                 etag: etag.clone().into_bytes(),
                 metadata,
                 auth: Some(auth(principal)),
@@ -834,7 +884,7 @@ impl Gateway {
             return Err(GatewayError::NoSuchUpload);
         }
         let (ec, ec_wire) = self.bucket_ec(bucket, principal).await?;
-        let (location, _, _) = self
+        let (locations, _, _) = self
             .allocate_and_write(bucket, key, principal, ec, &ec_wire, &body)
             .await?;
         let etag_binary = md5_binary(&body);
@@ -847,7 +897,7 @@ impl Gateway {
                 etag_hex: etag_hex.clone(),
                 etag_binary,
                 size: body.len() as u64,
-                location,
+                locations,
             },
         );
         Ok(etag_hex)
@@ -896,7 +946,7 @@ impl Gateway {
                     part_number: pn,
                     etag: part.etag_binary.clone(),
                     size: part.size,
-                    locations: vec![part.location.clone()],
+                    locations: part.locations.clone(),
                 });
             }
             v
