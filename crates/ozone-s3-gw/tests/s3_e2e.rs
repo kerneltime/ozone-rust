@@ -337,6 +337,73 @@ async fn s3_list_objects_v2_prefix_and_delimiter() {
     }
 }
 
+/// ListObjectsV2 pagination via the real SDK: max-keys caps the page, the
+/// response is truncated with a continuation token, and following the token walks
+/// the remaining keys with no overlap or gaps.
+#[tokio::test]
+async fn s3_list_objects_v2_pagination() {
+    use aws_sdk_s3::primitives::ByteStream;
+
+    let (base, dns) = spawn_stack().await;
+    let s3 = s3_client(&base);
+    for k in ["k1", "k2", "k3", "k4", "k5"] {
+        s3.put_object()
+            .bucket("bucket1")
+            .key(k)
+            .body(ByteStream::from(vec![1u8]))
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("put {k}: {e:?}"));
+    }
+
+    let page_keys = |out: &aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output| {
+        out.contents()
+            .iter()
+            .filter_map(|o| o.key().map(String::from))
+            .collect::<Vec<_>>()
+    };
+
+    let p1 = s3
+        .list_objects_v2()
+        .bucket("bucket1")
+        .max_keys(2)
+        .send()
+        .await
+        .expect("page 1");
+    assert_eq!(page_keys(&p1), vec!["k1", "k2"], "page 1 capped at max-keys");
+    assert_eq!(p1.is_truncated(), Some(true), "page 1 truncated");
+    let t1 = p1.next_continuation_token().expect("token 1").to_string();
+
+    let p2 = s3
+        .list_objects_v2()
+        .bucket("bucket1")
+        .max_keys(2)
+        .continuation_token(t1)
+        .send()
+        .await
+        .expect("page 2");
+    assert_eq!(page_keys(&p2), vec!["k3", "k4"], "page 2 follows the token");
+    assert_eq!(p2.is_truncated(), Some(true));
+    let t2 = p2.next_continuation_token().expect("token 2").to_string();
+
+    let p3 = s3
+        .list_objects_v2()
+        .bucket("bucket1")
+        .max_keys(2)
+        .continuation_token(t2)
+        .send()
+        .await
+        .expect("page 3");
+    assert_eq!(page_keys(&p3), vec!["k5"], "final page");
+    assert_eq!(p3.is_truncated(), Some(false), "final page not truncated");
+    assert!(p3.next_continuation_token().is_none(), "no token past the end");
+
+    for d in &dns {
+        d.handle.abort();
+        tokio::fs::remove_dir_all(&d.dir).await.ok();
+    }
+}
+
 /// Build a real AWS S3 SDK client pointed at the gateway. Path-style addressing
 /// (no virtual-host buckets), static creds (the gateway extracts the access key
 /// id from the SigV4 Authorization header as the principal — it does not verify

@@ -100,7 +100,7 @@ Each is cheap, within the stated scope, and (critically) needs a test that can
   fail.
 - **Test**: complete with `[2,1]` → 400 InvalidPartOrder; `[1,1]` → 400.
 
-### A3 [MAJOR] Unsatisfiable Range returns 200 + full body instead of 416 — OPEN
+### A3 [MAJOR] Unsatisfiable Range returns 200 + full body instead of 416 — DONE (this branch)
 - **Where**: `lib.rs` `parse_range` returns `None` for BOTH "no bytes= prefix" and
   "valid syntax but unsatisfiable"; the GET handler serves the full object on
   `None`.

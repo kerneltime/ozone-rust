@@ -280,9 +280,15 @@ async fn route(
             let q = query.as_deref();
             let prefix = query_param(q, "prefix").unwrap_or_default();
             let delimiter = query_param(q, "delimiter").unwrap_or_default();
-            let max_keys = query_param(q, "max-keys")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1000u32);
+            // max-keys: default 1000, clamp above 1000 (S3 caps, not errors), but
+            // a non-integer value is a 400 (S3 InvalidArgument).
+            let max_keys = match query_param(q, "max-keys") {
+                None => 1000u32,
+                Some(v) => match v.trim().parse::<u32>() {
+                    Ok(n) => n.min(1000),
+                    Err(_) => return Err(GatewayError::BadRequest("invalid max-keys".into())),
+                },
+            };
             let token = query_param(q, "continuation-token").unwrap_or_default();
             let listing = gw
                 .list_objects(&bucket, &principal, prefix, delimiter, max_keys, token)

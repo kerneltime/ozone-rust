@@ -344,22 +344,25 @@ impl OmRustGatewayService for FakeOm {
 
     type ListKeysStream = BoxStream<pb::ListKeysResponse>;
 
-    /// List keys under `prefix`, optionally folding `delimiter`.
+    /// List keys under `prefix`, optionally folding `delimiter`, with real
+    /// pagination over `max_keys` / `continuation_token`.
     ///
-    /// Pagination is a no-op: this always emits exactly one response with
-    /// `is_truncated = false` and an empty continuation token, regardless of
-    /// `max_keys` or `continuation_token`. When `delimiter` is non-empty, the
-    /// substring of `key_name` after `prefix` up to (and including) the first
-    /// delimiter is folded into `common_prefixes` (deduplicated, insertion
-    /// order preserved) and that key is omitted from `keys`; keys with no
-    /// delimiter in their remainder are returned in `keys` as usual.
+    /// Builds the delimiter-folded sequence of listing entries — each entry is
+    /// either a key or a folded `common_prefix` (the substring of `key_name`
+    /// after `prefix` up to and including the first delimiter) — sorted by listing
+    /// name with prefixes deduplicated. Pagination is over this MERGED sequence so
+    /// the continuation token is stable across keys and prefixes, and both keys
+    /// and common prefixes count toward `max_keys` (matching S3 `KeyCount`). The
+    /// continuation token is the listing name of the last entry returned on the
+    /// previous page; the next page resumes strictly after it. Emitting real
+    /// `is_truncated` / `next_continuation_token` lets the gateway's pagination be
+    /// exercised — re-faking it (one untruncated page) would mask that path.
     async fn list_keys(
         &self,
         req: Request<pb::ListKeysRequest>,
     ) -> Result<Response<Self::ListKeysStream>, Status> {
         let req = req.into_inner();
-        let mut keys: Vec<pb::OmKeyInfoLite> = Vec::new();
-        let mut common_prefixes: Vec<String> = Vec::new();
+        let max_keys = req.max_keys as usize;
 
         let state = self.state.lock();
         let mut matching: Vec<&pb::OmKeyInfoLite> = state
@@ -377,14 +380,13 @@ impl OmRustGatewayService for FakeOm {
             ak.cmp(bk)
         });
 
+        // Merged entry sequence: (listing_name, Some(key) | None=common-prefix).
+        let mut entries: Vec<(String, Option<pb::OmKeyInfoLite>)> = Vec::new();
+        let mut seen_prefix: std::collections::HashSet<String> = std::collections::HashSet::new();
         for info in matching {
-            let key_name = info
-                .vbk
-                .as_ref()
-                .map(|v| v.key_name.as_str())
-                .unwrap_or("");
+            let key_name = info.vbk.as_ref().map(|v| v.key_name.as_str()).unwrap_or("");
             if req.delimiter.is_empty() {
-                keys.push(info.clone());
+                entries.push((key_name.to_string(), Some(info.clone())));
                 continue;
             }
             let remainder = &key_name[req.prefix.len()..];
@@ -392,20 +394,49 @@ impl OmRustGatewayService for FakeOm {
                 Some(idx) => {
                     let end = idx + req.delimiter.len();
                     let common = format!("{}{}", req.prefix, &remainder[..end]);
-                    if !common_prefixes.contains(&common) {
-                        common_prefixes.push(common);
+                    if seen_prefix.insert(common.clone()) {
+                        entries.push((common, None));
                     }
                 }
-                None => keys.push(info.clone()),
+                None => entries.push((key_name.to_string(), Some(info.clone()))),
             }
         }
         drop(state);
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // Resume strictly after the continuation token.
+        if !req.continuation_token.is_empty() {
+            let token = req.continuation_token.clone();
+            entries.retain(|(name, _)| name.as_str() > token.as_str());
+        }
+
+        // Truncate to max_keys; the token is the last returned entry's name.
+        let (is_truncated, next_continuation_token) = if entries.len() > max_keys {
+            let token = if max_keys == 0 {
+                String::new()
+            } else {
+                entries[max_keys - 1].0.clone()
+            };
+            entries.truncate(max_keys);
+            (true, token)
+        } else {
+            (false, String::new())
+        };
+
+        let mut keys = Vec::new();
+        let mut common_prefixes = Vec::new();
+        for (name, info) in entries {
+            match info {
+                Some(k) => keys.push(k),
+                None => common_prefixes.push(name),
+            }
+        }
 
         let resp = pb::ListKeysResponse {
             keys,
             common_prefixes,
-            next_continuation_token: String::new(),
-            is_truncated: false,
+            next_continuation_token,
+            is_truncated,
         };
         let stream = tokio_stream::once(Ok(resp));
         Ok(Response::new(Box::pin(stream)))
