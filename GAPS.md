@@ -260,8 +260,14 @@ single-failure degraded read."*
   proven by the two-gateway e2e test. (Cross-OM-process durability is still
   bounded by FakeOm being in-memory; a real persistent OM closes that via the
   same RPCs.)
-- **C3** Durability/persistence/crash-consistency unproven (FakeOm is in-memory;
-  no fsync/flush story validated end-to-end).
+- **C3** DATANODE durability PROVEN (`ozone-dn-server/tests/durability.rs`): EC
+  shards + block + container metadata survive a drop+reopen of the real
+  `FjallMetaStore`+`FileChunkStore` and verify clean — across the core case, at
+  scale with pagination, under concurrent writes, and overwrite-keeps-latest.
+  Still open: the OM/SCM side is in-memory (FakeOm/FakeScm), so OM-metadata
+  durability and a fsync-on-the-hot-path policy are not validated; chunk writes
+  are crash-safe by atomic create-then-rename but an explicit fsync-before-rename
+  policy is not asserted.
 - **C4** Degraded read proven end-to-end for only a single failure; max-`p` and
   parity-only-survivor recovery proven only at the pure-EC layer, not through the
   gateway+DN wire path.
