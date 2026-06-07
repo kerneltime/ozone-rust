@@ -625,13 +625,14 @@ impl OmRustGatewayService for FakeOm {
         Ok(Response::new(pb::PutObjectTaggingResponse {}))
     }
 
-    /// Initiate a multipart upload: mint a unique `upload_id` and return it.
+    /// Initiate a multipart upload: mint a unique `upload_id` and persist the
+    /// upload so later parts/complete/list can find it.
     ///
-    /// The id is `upload-{n}` where `n` is a monotonic counter (first call
-    /// yields `upload-1`). Nothing else is persisted: the request's `vbk` is not
-    /// recorded here, and no part state is created. The gateway is the authority
-    /// for the in-flight upload from this point until `complete`/`abort` (see
-    /// module docs).
+    /// The id is `upload-{n}` where `n` is a monotonic counter (first call yields
+    /// `upload-1`). A [`StoredUpload`] is recorded under that id, capturing the
+    /// request's `vbk` and an initiated timestamp, with an empty part map. A
+    /// missing `vbk` is `InvalidArgument`. The OM is the authority for the
+    /// in-flight upload until `complete`/`abort` (see module docs).
     async fn initiate_multipart_upload(
         &self,
         req: Request<pb::InitiateMultipartUploadRequest>,
