@@ -377,46 +377,57 @@ async fn scrub_then_repair_heals_shard_at_rest() {
 
 // ---- self-heal loop (scrubber -> SCM report -> ReconstructEC -> repair) ----
 
-/// The survivor pipeline for the 5-DN topology when slot 1 is the rebuild target:
-/// peers are slots 2..5 on dns[1..5].
+/// The full 5-slot pipeline (all datanodes). `handle_reconstruct` excludes the
+/// slot(s) being rebuilt, so this is correct for any target slot.
 fn pipeline_fixture(dns: &[Dn]) -> PipelineFixture {
     PipelineFixture {
-        sources: (1..5).map(|i| datanode_id(&dns[i])).collect(),
-        source_replica_indexes: (1..5u32)
+        sources: (0..5).map(|i| datanode_id(&dns[i])).collect(),
+        source_replica_indexes: (0..5u32)
             .map(|i| (dns[i as usize].uuid.clone(), i + 1))
             .collect(),
         ec_config: ec().into(),
     }
 }
 
-/// Serve `fake` as the SCM, and run a scrubber (short interval) + SCM loop on the
-/// TARGET (dns[0]) wired together via the repair channel. NO ScmCommand is built
-/// by any caller — repair is driven entirely by the closed loop.
-async fn spawn_self_heal(dns: &[Dn], fake: FakeScm) {
-    let scm_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let scm_addr = scm_listener.local_addr().unwrap();
+/// Serve `fake` as the SCM; return its endpoint.
+async fn serve_fake_scm(fake: FakeScm) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         Server::builder()
             .add_service(fake.into_server())
-            .serve_with_incoming(TcpListenerStream::new(scm_listener))
+            .serve_with_incoming(TcpListenerStream::new(listener))
             .await
             .ok();
     });
+    format!("http://{addr}")
+}
+
+/// Run a scrubber (short interval) + SCM loop on `dn`, wired via the repair
+/// channel, against the SCM at `scm_endpoint`. NO ScmCommand is built — repair is
+/// driven entirely by the closed loop.
+fn spawn_heal_stack(dn: &Dn, scm_endpoint: String) {
     let (tx, rx) = tokio::sync::mpsc::channel(64);
-    let scrubber = Scrubber::new(dns[0].meta.clone(), dns[0].chunks.clone());
+    let scrubber = Scrubber::new(dn.meta.clone(), dn.chunks.clone());
     tokio::spawn(async move {
         scrubber.run(Duration::from_millis(25), tx).await;
     });
     let reg = ScmRegistration {
-        datanode_id: datanode_id(&dns[0]),
-        meta: dns[0].meta.clone(),
-        chunks: dns[0].chunks.clone(),
+        datanode_id: datanode_id(dn),
+        meta: dn.meta.clone(),
+        chunks: dn.chunks.clone(),
         heartbeat_interval: Duration::from_millis(50),
         repairs: Some(rx),
     };
     tokio::spawn(async move {
-        reg.run(format!("http://{scm_addr}")).await.ok();
+        reg.run(scm_endpoint).await.ok();
     });
+}
+
+/// Serve `fake` and run the self-heal stack on the single target dns[0].
+async fn spawn_self_heal(dns: &[Dn], fake: FakeScm) {
+    let endpoint = serve_fake_scm(fake).await;
+    spawn_heal_stack(&dns[0], endpoint);
 }
 
 async fn poll_verified_read(target: &mut DnClient, local: u64, slot: u8, tries: usize) -> Option<Vec<u8>> {
@@ -549,6 +560,82 @@ async fn self_heal_gives_up_cleanly_when_unrecoverable() {
         .await
         .expect("intact block group must still be served after a failed repair");
     assert_eq!(live, o2[0]);
+
+    for d in &dns {
+        d.handle.abort();
+        tokio::fs::remove_dir_all(&d.dir).await.ok();
+    }
+}
+
+#[tokio::test]
+async fn concurrent_self_heal_of_two_slots() {
+    let mut dns = Vec::new();
+    for i in 0..5 {
+        dns.push(spawn_dn(i).await);
+    }
+    let originals = seed_block_group(&dns, LOCAL, &(0..PAYLOAD_LEN).map(|i| (i * 3 + 1) as u8).collect::<Vec<_>>()).await;
+    // Corrupt two DATA shards at once -- slot 1 (dns[0]) and slot 2 (dns[1]). Both
+    // must self-heal even though each repair may read the OTHER (still-corrupt)
+    // shard as a candidate source. Survivors among slots 3,4,5 (= k=3) always
+    // suffice, so the loop converges regardless of interleaving.
+    corrupt_chunk(&dns[0], LOCAL, 1);
+    corrupt_chunk(&dns[1], LOCAL, 2);
+
+    let fake = FakeScm::with_pipeline(pipeline_fixture(&dns));
+    let endpoint = serve_fake_scm(fake).await;
+    spawn_heal_stack(&dns[0], endpoint.clone());
+    spawn_heal_stack(&dns[1], endpoint);
+
+    let mut t0 = DnClient::connect(format!("http://{}", dns[0].addr)).await.unwrap();
+    let mut t1 = DnClient::connect(format!("http://{}", dns[1].addr)).await.unwrap();
+    let h0 = poll_verified_read(&mut t0, LOCAL, 1, 250).await.expect("slot 1 self-heals");
+    let h1 = poll_verified_read(&mut t1, LOCAL, 2, 250).await.expect("slot 2 self-heals");
+    assert_eq!(h0, originals[0], "slot 1 healed to the original bytes");
+    assert_eq!(h1, originals[1], "slot 2 healed to the original bytes");
+
+    for d in &dns {
+        d.handle.abort();
+        tokio::fs::remove_dir_all(&d.dir).await.ok();
+    }
+}
+
+#[tokio::test]
+async fn concurrent_repairs_of_same_shard_are_idempotent() {
+    let mut dns = Vec::new();
+    for i in 0..5 {
+        dns.push(spawn_dn(i).await);
+    }
+    let originals = seed_block_group(&dns, LOCAL, &(0..PAYLOAD_LEN).map(|i| (i * 3 + 1) as u8).collect::<Vec<_>>()).await;
+    corrupt_chunk(&dns[0], LOCAL, 1);
+
+    let sources: Vec<(u8, String)> = (1..5)
+        .map(|i| ((i + 1) as u8, format!("http://{}", dns[i].addr)))
+        .collect();
+    let mk_input = || repair::RepairInput {
+        container: ContainerId(CONTAINER),
+        local: LocalId(LOCAL),
+        ec: ec(),
+        block_group_len: PAYLOAD_LEN as u64,
+        missing_slots: vec![1],
+        sources: sources.clone(),
+    };
+    // Two repairs of the SAME shard, concurrently. decode->re-encode is
+    // deterministic and write_chunk is atomic (create-then-rename to a per-call
+    // temp), so the final on-disk shard is exactly one complete, correct write --
+    // never an interleaved/torn file.
+    let (r1, r2) = tokio::join!(
+        repair::reconstruct_and_persist(&dns[0].meta, &dns[0].chunks, mk_input()),
+        repair::reconstruct_and_persist(&dns[0].meta, &dns[0].chunks, mk_input()),
+    );
+    assert!(r1.is_ok() && r2.is_ok(), "both concurrent repairs succeed: {r1:?} {r2:?}");
+
+    let mut t0 = DnClient::connect(format!("http://{}", dns[0].addr)).await.unwrap();
+    let (b, c) = verify_read(1);
+    let healed = t0
+        .read_chunk(&b, &c, true)
+        .await
+        .expect("shard verifies clean after two concurrent repairs");
+    assert_eq!(healed.as_ref(), &originals[0][..], "no torn/interleaved write");
 
     for d in &dns {
         d.handle.abort();

@@ -114,7 +114,11 @@ impl ScmRegistration {
                 while let Some(req) = repairs.recv().await {
                     let key = (req.container, req.slot);
                     if !reported.insert(key) {
-                        continue; // already reported this shard; suppress until it heals
+                        // Already reported this (container, slot): suppress duplicates
+                        // for the process lifetime (a healed shard stops producing
+                        // findings; the latch is cleared on restart). Only re-armed
+                        // below, on a send failure.
+                        continue;
                     }
                     if let Err(e) =
                         send_unhealthy_report(&mut reporter, &meta, &drain_uuid, req.container, req.slot)

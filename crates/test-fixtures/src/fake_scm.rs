@@ -27,6 +27,20 @@ use ozone_grpc_types::scm::dn::v1::scm_rust_datanode_service_server::{
 /// Monotonic command ids for synthesized commands (unique is all that matters).
 static NEXT_CMD_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Whether `cmd` should be delivered to the datanode heartbeating as `uuid`. A
+/// real SCM routes each command to its target DN's heartbeat; a `ReconstructEC`
+/// names explicit `targets`, so it goes ONLY to a matching DN (otherwise a peer's
+/// heartbeat would consume — and then ignore — another DN's command, losing it).
+/// Commands without datanode targets deliver to any heartbeat.
+fn command_targets(cmd: &pb::ScmCommand, uuid: &str) -> bool {
+    match &cmd.payload {
+        Some(pb::scm_command::Payload::ReconstructEcContainers(c)) => {
+            c.targets.iter().any(|t| t.uuid == uuid)
+        }
+        _ => true,
+    }
+}
+
 /// The survivor pipeline + EC config a ReconstructEC needs — what only the
 /// cluster (OM/SCM) knows. A test configures this once via [`FakeScm::with_pipeline`]
 /// and the fake uses it to turn an inbound UNHEALTHY report into a real command.
@@ -163,7 +177,7 @@ impl ScmRustDatanodeService for FakeScm {
         tokio::spawn(async move {
             let mut first = true;
             // Ends on Ok(None) (clean close) or Err (transport drop).
-            while let Ok(Some(_hb)) = inbound.message().await {
+            while let Ok(Some(hb)) = inbound.message().await {
                 counter.fetch_add(1, Ordering::Relaxed);
                 let mut cmds = if first {
                     first = false;
@@ -171,12 +185,20 @@ impl ScmRustDatanodeService for FakeScm {
                 } else {
                     Vec::new()
                 };
-                // Drain any commands synthesized from inbound reports (self-heal).
+                // Deliver synthesized commands (self-heal) only to their target DN,
+                // leaving others queued for the DN they name — so two datanodes
+                // heartbeating one SCM don't consume each other's commands.
                 {
                     let mut q = pending.lock();
+                    let mut keep = VecDeque::with_capacity(q.len());
                     while let Some(c) = q.pop_front() {
-                        cmds.push(c);
+                        if command_targets(&c, &hb.datanode_uuid) {
+                            cmds.push(c);
+                        } else {
+                            keep.push_back(c);
+                        }
                     }
+                    *q = keep;
                 }
                 if tx
                     .send(Ok(pb::HeartbeatResponse { commands: cmds }))
