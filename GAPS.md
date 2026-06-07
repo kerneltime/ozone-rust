@@ -53,14 +53,19 @@ These are genuinely proven and should not be re-litigated:
   Cauchy GF matrix and full cells; the *trailing partial-stripe parity on-disk
   layout* is intentionally NOT asserted byte-identical to Ozone Java
   (`stripe.rs:20-25`). "Byte-identical to Java" must always carry this caveat.
-- **EC repair-at-rest** — `crates/ozone-dn-server/src/{repair.rs,scrub.rs}`. A
-  missing/corrupt shard is reconstructed from peers and PERSISTED (bytes +
-  checksum + metadata); two triggers (SCM `ReconstructEC` command + bit-rot
-  scrubber). Proven by `ozone-dn-server/tests/ec_repair.rs` (at-rest heal for both
-  triggers, fail-without-fix) + `ozone-ec/tests/repair_identity.rs` (decode→
-  re-encode reproduces every shard, so no new EC code). Remaining production step:
-  a real SCM that converts a scrubber's incremental container report into a
-  `ReconstructEC` command — both datanode halves of that loop are done/tested.
+- **EC repair-at-rest + CLOSED self-healing loop** —
+  `crates/ozone-dn-server/src/{repair.rs,scrub.rs,scm.rs}`. A missing/corrupt shard
+  is reconstructed from peers and PERSISTED (bytes + checksum + metadata). The full
+  loop is automatic: the scrubber detects rot → the SCM loop reports the replica
+  UNHEALTHY (rising-edge latched) → SCM issues a `ReconstructEC` → the datanode
+  self-enumerates its block groups at the missing slot (lengths from its own intact
+  metadata), re-verifies (idempotent), and heals. Proven by
+  `ozone-dn-server/tests/ec_repair.rs` (at-rest heal for both triggers AND the
+  zero-intervention self-heal loop, multi-block replica heal, and clean failure
+  when >p shards are lost — all fail-without-fix) + `ozone-ec/tests/repair_identity.rs`
+  (decode→re-encode reproduces every shard, so no new EC code). The remaining
+  real-cluster piece is only a production SCM replication manager (FakeScm stands
+  in); the datanode side of the loop is complete.
 - **ETag algorithm** — single PUT = `md5_hex(body)`; multipart =
   `hex(md5(concat(binary part md5s)))-N`, computed AWS-identically
   (`backend.rs` + `fake_om.rs:610-623`). Header ETags quoted; GetObjectAttributes
@@ -260,11 +265,10 @@ single-failure degraded read."*
 - **C4** Degraded read proven end-to-end for only a single failure; max-`p` and
   parity-only-survivor recovery proven only at the pure-EC layer, not through the
   gateway+DN wire path.
-- **EC repair feedback loop** (partial): the datanode can repair on an SCM
-  `ReconstructEC` command and the scrubber detects bit-rot, but no real SCM
-  in-repo turns a scrubber finding into a command (FakeScm is static). The
-  datanode binary's scrubber currently logs findings; closing the loop needs a
-  real SCM (or a FakeScm report→command shim).
+- **EC self-healing loop** — DONE (this branch): the scrubber→SCM→ReconstructEC→
+  heal loop is closed and proven end-to-end (FakeScm shim stands in for SCM's
+  report→command reaction). The only remaining piece is a real production SCM
+  replication manager; the datanode side is complete and tested.
 - **C5** No GC/reclaimer: orphaned blocks accumulate forever (referenced in
   comments as if it exists; it does not). Sources: multipart abort, SCM-deleted
   containers, and now also a partial multi-block write — if AllocateBlock or a
