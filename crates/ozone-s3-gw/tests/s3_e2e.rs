@@ -618,6 +618,123 @@ async fn s3_list_objects_v2_pagination() {
     }
 }
 
+/// Concurrent PUTs to the SAME key must not corrupt, mix, or deadlock: after all
+/// finish, the committed object is exactly one of the written bodies and GET
+/// succeeds. Each PUT writes its own block group (distinct local_id), so the
+/// final key points at one writer's data; last commit wins.
+#[tokio::test]
+async fn s3_concurrent_puts_same_key_are_consistent() {
+    let (base, dns) = spawn_stack().await;
+    let n = 8usize;
+    let bodies: Vec<Vec<u8>> = (0..n).map(|j| vec![j as u8; 3000 + j * 100]).collect();
+
+    let mut handles = Vec::new();
+    for (j, b) in bodies.iter().enumerate() {
+        let url = format!("{base}/bucket1/race.bin");
+        let b = b.clone();
+        handles.push(tokio::spawn(async move {
+            let client: HttpClient = Client::builder(TokioExecutor::new()).build_http();
+            let (st, _, _) = http(&client, Method::PUT, url, Some("t"), Bytes::from(b)).await;
+            assert_eq!(st, StatusCode::OK, "concurrent PUT {j}");
+        }));
+    }
+    for h in handles {
+        h.await.unwrap();
+    }
+
+    let client: HttpClient = Client::builder(TokioExecutor::new()).build_http();
+    let (st, _, got) = http(
+        &client,
+        Method::GET,
+        format!("{base}/bucket1/race.bin"),
+        Some("t"),
+        Bytes::new(),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "GET after concurrent PUTs");
+    assert!(
+        bodies.iter().any(|b| b.as_slice() == got.as_ref()),
+        "GET must return exactly one intact PUT, not a mix or corruption"
+    );
+
+    for d in &dns {
+        d.handle.abort();
+        tokio::fs::remove_dir_all(&d.dir).await.ok();
+    }
+}
+
+/// Concurrent multipart uploads to distinct keys must each complete and reassemble
+/// correctly — exercising the gateway's in-process multipart registry and the OM
+/// lock under contention.
+#[tokio::test]
+async fn s3_concurrent_multipart_uploads() {
+    use aws_sdk_s3::primitives::ByteStream;
+    use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+
+    let (base, dns) = spawn_stack().await;
+    let n = 6usize;
+
+    let mut handles = Vec::new();
+    for j in 0..n {
+        let base = base.clone();
+        handles.push(tokio::spawn(async move {
+            let s3 = s3_client(&base);
+            let key = format!("mpu-{j}.bin");
+            let body = vec![j as u8; 1000 + j * 50];
+            let create = s3
+                .create_multipart_upload()
+                .bucket("bucket1")
+                .key(&key)
+                .send()
+                .await
+                .unwrap_or_else(|e| panic!("create {j}: {e:?}"));
+            let uid = create.upload_id().unwrap().to_string();
+            let up = s3
+                .upload_part()
+                .bucket("bucket1")
+                .key(&key)
+                .upload_id(&uid)
+                .part_number(1)
+                .body(ByteStream::from(body.clone()))
+                .send()
+                .await
+                .unwrap_or_else(|e| panic!("upload {j}: {e:?}"));
+            s3.complete_multipart_upload()
+                .bucket("bucket1")
+                .key(&key)
+                .upload_id(&uid)
+                .multipart_upload(
+                    CompletedMultipartUpload::builder()
+                        .set_parts(Some(vec![CompletedPart::builder()
+                            .part_number(1)
+                            .e_tag(up.e_tag().unwrap_or_default())
+                            .build()]))
+                        .build(),
+                )
+                .send()
+                .await
+                .unwrap_or_else(|e| panic!("complete {j}: {e:?}"));
+            let got = s3
+                .get_object()
+                .bucket("bucket1")
+                .key(&key)
+                .send()
+                .await
+                .unwrap_or_else(|e| panic!("get {j}: {e:?}"));
+            let bytes = got.body.collect().await.unwrap().into_bytes();
+            assert_eq!(bytes.as_ref(), &body[..], "concurrent MPU {j} must reassemble");
+        }));
+    }
+    for h in handles {
+        h.await.unwrap();
+    }
+
+    for d in &dns {
+        d.handle.abort();
+        tokio::fs::remove_dir_all(&d.dir).await.ok();
+    }
+}
+
 /// Build a real AWS S3 SDK client pointed at the gateway. Path-style addressing
 /// (no virtual-host buckets), static creds (the gateway extracts the access key
 /// id from the SigV4 Authorization header as the principal — it does not verify
