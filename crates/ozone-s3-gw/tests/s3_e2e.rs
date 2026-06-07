@@ -2213,3 +2213,163 @@ async fn s3_sdk_large_chunk_signed_put() {
         tokio::fs::remove_dir_all(&d.dir).await.ok();
     }
 }
+
+/// Concurrent UploadPart to a SINGLE upload: parts race on block allocation and the
+/// one upload's part map. With 2 MiB block groups each 5 MiB part also spans three
+/// blocks, so the allocator is hit hard. The completed object must reassemble in
+/// part order regardless of upload interleaving.
+#[tokio::test]
+async fn s3_multipart_concurrent_parts_one_upload() {
+    use aws_sdk_s3::primitives::ByteStream;
+    use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+
+    let (base, dns) = spawn_stack_with_block_size(Some(2 * 1024 * 1024)).await;
+    let s3 = s3_client(&base);
+    let create = s3
+        .create_multipart_upload()
+        .bucket("bucket1")
+        .key("cc.bin")
+        .send()
+        .await
+        .expect("create");
+    let uid = create.upload_id().unwrap().to_string();
+
+    // Parts 1..=3 are 5 MiB (valid non-last); part 4 is the small tail.
+    let sizes = [5 * 1024 * 1024usize, 5 * 1024 * 1024, 5 * 1024 * 1024, 1000];
+    let bodies: Vec<Vec<u8>> = (0..4).map(|j| vec![(j + 1) as u8; sizes[j]]).collect();
+
+    let mut handles = Vec::new();
+    for (j, body) in bodies.iter().cloned().enumerate() {
+        let base = base.clone();
+        let uid = uid.clone();
+        handles.push(tokio::spawn(async move {
+            let s3 = s3_client(&base);
+            let pn = (j + 1) as i32;
+            let up = s3
+                .upload_part()
+                .bucket("bucket1")
+                .key("cc.bin")
+                .upload_id(&uid)
+                .part_number(pn)
+                .body(ByteStream::from(body))
+                .send()
+                .await
+                .unwrap_or_else(|e| panic!("upload part {pn}: {e:?}"));
+            (pn, up.e_tag().unwrap_or_default().to_string())
+        }));
+    }
+    let mut parts = Vec::new();
+    for h in handles {
+        parts.push(h.await.unwrap());
+    }
+    parts.sort_by_key(|(pn, _)| *pn);
+    let completed: Vec<CompletedPart> = parts
+        .iter()
+        .map(|(pn, et)| CompletedPart::builder().part_number(*pn).e_tag(et).build())
+        .collect();
+
+    s3.complete_multipart_upload()
+        .bucket("bucket1")
+        .key("cc.bin")
+        .upload_id(&uid)
+        .multipart_upload(CompletedMultipartUpload::builder().set_parts(Some(completed)).build())
+        .send()
+        .await
+        .expect("complete");
+
+    let got = s3
+        .get_object()
+        .bucket("bucket1")
+        .key("cc.bin")
+        .send()
+        .await
+        .expect("get");
+    let bytes = got.body.collect().await.unwrap().into_bytes();
+    let expected: Vec<u8> = bodies.concat();
+    assert_eq!(bytes.len(), expected.len(), "reassembled length");
+    assert_eq!(
+        bytes.as_ref(),
+        &expected[..],
+        "concurrently-uploaded parts must reassemble in part order"
+    );
+
+    for d in &dns {
+        d.handle.abort();
+        tokio::fs::remove_dir_all(&d.dir).await.ok();
+    }
+}
+
+/// Many concurrent DEGRADED reads: with one datanode's shards corrupted, every GET
+/// must independently gather survivors and EC-reconstruct the exact bytes. Proves
+/// the read/reconstruct path (and the DN connection pool) is safe under contention.
+#[tokio::test]
+async fn s3_concurrent_degraded_reads() {
+    let (base, dns) = spawn_stack().await;
+    let client: HttpClient = Client::builder(TokioExecutor::new()).build_http();
+    let url = format!("{base}/bucket1/deg.bin");
+    let body = Bytes::from((0..20000u32).map(|i| (i % 251) as u8).collect::<Vec<u8>>());
+    let (st, _, _) = http(&client, Method::PUT, url.clone(), Some("tester"), body.clone()).await;
+    assert_eq!(st, StatusCode::OK, "PUT");
+
+    // Knock out one datanode's shards so every read is degraded.
+    corrupt_all_chunks(&dns[0]);
+
+    let mut handles = Vec::new();
+    for _ in 0..16 {
+        let url = url.clone();
+        let want = body.clone();
+        handles.push(tokio::spawn(async move {
+            let client: HttpClient = Client::builder(TokioExecutor::new()).build_http();
+            let (st, _, got) = http(&client, Method::GET, url, Some("tester"), Bytes::new()).await;
+            assert_eq!(st, StatusCode::OK, "degraded GET status");
+            assert_eq!(got, want, "degraded GET must reconstruct exact bytes");
+        }));
+    }
+    for h in handles {
+        h.await.unwrap();
+    }
+
+    for d in &dns {
+        d.handle.abort();
+        tokio::fs::remove_dir_all(&d.dir).await.ok();
+    }
+}
+
+/// Block-group boundary edges: an object EXACTLY one block, exactly two blocks, and
+/// two blocks + 1 byte must each round-trip byte-exact with the right length and
+/// ETag. Catches off-by-one errors in the gateway's block splitting.
+#[tokio::test]
+async fn s3_multi_block_exact_boundary() {
+    let block = 2 * 1024 * 1024usize;
+    let (base, dns) = spawn_stack_with_block_size(Some(block)).await;
+    let client: HttpClient = Client::builder(TokioExecutor::new()).build_http();
+    for (name, len) in [
+        ("one-block", block),
+        ("two-blocks", 2 * block),
+        ("two-plus-one", 2 * block + 1),
+    ] {
+        let url = format!("{base}/bucket1/{name}.bin");
+        let body = Bytes::from((0..len as u32).map(|i| (i % 251) as u8).collect::<Vec<u8>>());
+        let want_etag = md5_hex(&body);
+        let (st, hdr, _) = http(&client, Method::PUT, url.clone(), Some("tester"), body.clone()).await;
+        assert_eq!(st, StatusCode::OK, "PUT {name}");
+        assert_eq!(
+            hdr.get(header::ETAG).unwrap().to_str().unwrap(),
+            format!("\"{want_etag}\""),
+            "ETag {name}"
+        );
+        let (st, hdr, got) = http(&client, Method::GET, url.clone(), Some("tester"), Bytes::new()).await;
+        assert_eq!(st, StatusCode::OK, "GET {name}");
+        assert_eq!(got, body, "round-trip {name}");
+        assert_eq!(
+            hdr.get(header::CONTENT_LENGTH).unwrap().to_str().unwrap(),
+            len.to_string(),
+            "Content-Length {name}"
+        );
+    }
+
+    for d in &dns {
+        d.handle.abort();
+        tokio::fs::remove_dir_all(&d.dir).await.ok();
+    }
+}
