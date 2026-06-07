@@ -241,9 +241,12 @@ single-failure degraded read."*
 
 - **C1** No real OM and no real SCM in any test; the two control planes are tested
   against *disjoint* fakes and never wired together. No full-topology test.
-- **C2** Multipart state is in-process (`Gateway.mpu` map): lost on gateway
-  restart, broken across replicas (Complete on a different instance → 404). Needs
-  part records persisted in OM.
+- **C2** DONE (this branch): multipart part records now live in the OM (new
+  CommitMultipartPart RPC; Complete/list/abort read OM state). The gateway is
+  stateless for multipart — any replica can complete an upload another initiated,
+  proven by the two-gateway e2e test. (Cross-OM-process durability is still
+  bounded by FakeOm being in-memory; a real persistent OM closes that via the
+  same RPCs.)
 - **C3** Durability/persistence/crash-consistency unproven (FakeOm is in-memory;
   no fsync/flush story validated end-to-end).
 - **C4** Degraded read proven end-to-end for only a single failure; max-`p` and
