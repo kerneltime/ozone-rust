@@ -20,6 +20,10 @@ use ozone_scm_client::{ScmClient, ScmClientError};
 use ozone_storage::{checksum, ChunkStore, MetaStore, StorageError};
 use ozone_types::{BlockId, ContainerId, ContainerState, EcReplicationConfig, LocalId, ReplicaIndex};
 
+use std::panic::AssertUnwindSafe;
+
+use futures::FutureExt;
+
 use crate::repair;
 use crate::scrub::RepairRequest;
 
@@ -154,7 +158,17 @@ impl ScmRegistration {
 
         while let Some(resp) = inbound.message().await? {
             for cmd in resp.commands {
-                self.handle_command(cmd, &uuid).await;
+                let cmd_id = cmd.cmd_id;
+                // Isolate each command: a panic in a handler must NOT unwind and
+                // kill this heartbeat loop, which would silently stop ALL command
+                // processing on this datanode until restart (a per-node control-
+                // plane DoS). Catch, log, and continue. (The known offender — an
+                // out-of-bounds EC slice from a malformed block_group_len — is also
+                // fixed at the root in ozone-ec; this is defense in depth.)
+                let guarded = AssertUnwindSafe(self.handle_command(cmd, &uuid));
+                if guarded.catch_unwind().await.is_err() {
+                    tracing::error!(cmd_id, "SCM command handler panicked; heartbeat loop continues");
+                }
             }
         }
         Ok(())

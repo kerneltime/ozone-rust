@@ -24,8 +24,8 @@ use ozone_grpc_types::dn::v1 as dn;
 use ozone_grpc_types::scm::dn::v1 as scm;
 use ozone_storage::{checksum, ChunkStore, FileChunkStore, MetaStore};
 use ozone_types::{
-    BlockData, BlockId, ChecksumType, ChunkInfo, ContainerId, ContainerInfo, EcReplicationConfig,
-    LocalId, ReplicaIndex,
+    BlockData, BlockId, ChecksumType, ChunkInfo, ContainerId, ContainerInfo, ContainerState,
+    EcReplicationConfig, LocalId, ReplicaIndex,
 };
 use test_fixtures::fake_scm::{FakeScm, PipelineFixture};
 use tokio::net::TcpListener;
@@ -636,6 +636,91 @@ async fn concurrent_repairs_of_same_shard_are_idempotent() {
         .await
         .expect("shard verifies clean after two concurrent repairs");
     assert_eq!(healed.as_ref(), &originals[0][..], "no torn/interleaved write");
+
+    for d in &dns {
+        d.handle.abort();
+        tokio::fs::remove_dir_all(&d.dir).await.ok();
+    }
+}
+
+#[tokio::test]
+async fn poison_reconstruct_command_does_not_kill_the_heartbeat_loop() {
+    let mut dns = Vec::new();
+    for i in 0..5 {
+        dns.push(spawn_dn(i).await);
+    }
+    let payload: Vec<u8> = (0..PAYLOAD_LEN).map(|i| (i * 3 + 1) as u8).collect();
+    seed_block_group(&dns, LOCAL, &payload).await;
+    corrupt_chunk(&dns[0], LOCAL, 1); // so the repair is actually attempted
+
+    // A poison ReconstructEC with an absurd block_group_len (which the decoder
+    // would otherwise OOB-slice and panic on), FOLLOWED by a CloseContainer in the
+    // same batch. If the poison unwinds the heartbeat loop, the close never runs.
+    let sources: Vec<scm::DatanodeId> = (1..5).map(|i| datanode_id(&dns[i])).collect();
+    let source_replica_indexes = (1..5u32)
+        .map(|i| (dns[i as usize].uuid.clone(), i + 1))
+        .collect();
+    let poison = scm::ScmCommand {
+        cmd_id: 1,
+        term: 0,
+        encoded_token: Vec::new(),
+        deadline_ms: 0,
+        payload: Some(scm::scm_command::Payload::ReconstructEcContainers(
+            scm::ReconstructEcContainersCommand {
+                container_id: Some(dn::ContainerId { id: CONTAINER }),
+                sources,
+                targets: vec![datanode_id(&dns[0])],
+                missing_indexes: vec![1],
+                ec_config: Some(ec().into()),
+                source_replica_indexes,
+                blocks: vec![scm::ReconstructBlock {
+                    local_id: LOCAL,
+                    block_group_len: 1u64 << 40, // 1 TiB: wildly larger than the shards
+                }],
+            },
+        )),
+    };
+    let close = scm::ScmCommand {
+        cmd_id: 2,
+        term: 0,
+        encoded_token: Vec::new(),
+        deadline_ms: 0,
+        payload: Some(scm::scm_command::Payload::CloseContainer(
+            scm::CloseContainerCommand {
+                container_id: Some(dn::ContainerId { id: CONTAINER }),
+                force: false,
+            },
+        )),
+    };
+
+    let fake = FakeScm::with_commands(vec![poison, close]);
+    let endpoint = serve_fake_scm(fake).await;
+    let reg = ScmRegistration {
+        datanode_id: datanode_id(&dns[0]),
+        meta: dns[0].meta.clone(),
+        chunks: dns[0].chunks.clone(),
+        heartbeat_interval: Duration::from_millis(50),
+        repairs: None,
+    };
+    tokio::spawn(async move {
+        reg.run(endpoint).await.ok();
+    });
+
+    // The CloseContainer must take effect -> the loop survived the poison command.
+    let mut closed = false;
+    for _ in 0..150 {
+        if let Some(ci) = dns[0].meta.get_container(ContainerId(CONTAINER)).await.unwrap() {
+            if ci.state == ContainerState::Closed {
+                closed = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        closed,
+        "the heartbeat loop must survive a poison ReconstructEC and still process CloseContainer"
+    );
 
     for d in &dns {
         d.handle.abort();

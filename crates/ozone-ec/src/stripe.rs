@@ -56,6 +56,30 @@ fn cell_len(profile: Profile, len: usize, i: usize, s: usize) -> usize {
     }
 }
 
+/// The exact stored byte length of shard `idx` for an object of `len` bytes — the
+/// length [`encode_object`] produces. A data shard holds `full_stripes * C` plus
+/// its slice of the trailing partial stripe; a parity shard holds
+/// `num_stripes * C`. Used by the decoder to reject a shard whose length is
+/// inconsistent with `len` before slicing it.
+///
+/// Computed in O(1) (NOT by summing per-stripe cell lengths): `len` comes from an
+/// untrusted `block_group_len`, so an O(num_stripes) form would let a huge `len`
+/// burn billions of iterations — a CPU DoS. Saturating arithmetic keeps a huge
+/// `len` from overflowing; it just yields a large value that no real shard matches,
+/// so the shard is dropped.
+#[inline]
+fn expected_shard_len(profile: Profile, len: usize, idx: usize) -> usize {
+    let c = profile.chunk_size;
+    if idx < profile.data {
+        let stripe = profile.stripe_size();
+        let full = (len / stripe).saturating_mul(c);
+        let rem = len % stripe; // bytes in the trailing partial stripe
+        full + rem.saturating_sub(idx * c).min(c)
+    } else {
+        num_stripes(profile, len).saturating_mul(c)
+    }
+}
+
 /// Extract cell `(idx, s)` from a surviving shard, zero-padded to `chunk_size`.
 /// `idx < k` is a data shard (cells stored truncated, contiguous); `idx >= k`
 /// is a parity shard (cells stored at full `chunk_size`, offset `s*C`).
@@ -160,6 +184,22 @@ pub fn decode_object(
             got: shards.len(),
         });
     }
+    // Defense against an inconsistent `len` (e.g. a malformed `block_group_len`
+    // from an external SCM repair command) or a truncated shard: the cell slicing
+    // below derives offsets purely from `len`, so a shard shorter or longer than
+    // `len` implies would slice out of bounds and PANIC. Drop any shard whose byte
+    // length disagrees with `len`; reconstruction then proceeds from the consistent
+    // survivors, and falls through to `NotEnoughShards` if too few remain. This
+    // turns a panic (and a silent-truncation read) into a graceful error.
+    let mut shards: Vec<Option<&[u8]>> = shards.to_vec();
+    for (idx, slot) in shards.iter_mut().enumerate() {
+        if let Some(b) = slot {
+            if b.len() != expected_shard_len(profile, len, idx) {
+                *slot = None;
+            }
+        }
+    }
+    let shards = shards.as_slice();
     let stripes = num_stripes(profile, len);
 
     // Start with whatever data shards we already have.
@@ -248,6 +288,36 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    /// A `len` far larger than the shards actually hold must NOT panic via an
+    /// out-of-bounds cell slice (reachable from an external SCM repair command's
+    /// `block_group_len`); it must degrade to a graceful error.
+    #[test]
+    fn decode_with_oversized_len_errors_not_panics() {
+        let p = tiny();
+        let shards = encode_object(p, &sample(10)).unwrap();
+        let v = views(&shards, &[]);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode_object(p, 100, &v)));
+        match r {
+            Ok(Err(_)) => {} // graceful error: correct
+            Ok(Ok(_)) => panic!("oversized len silently returned (truncated) bytes"),
+            Err(_) => panic!("oversized len PANICKED instead of returning an error"),
+        }
+    }
+
+    /// A single shard whose byte length is inconsistent with `len` is dropped and
+    /// reconstructed from the consistent survivors — no panic, no corruption.
+    #[test]
+    fn decode_drops_length_inconsistent_shard_and_recovers() {
+        let p = tiny();
+        let obj = sample(50); // 3 stripes
+        let shards = encode_object(p, &obj).unwrap();
+        let mut v = views(&shards, &[]);
+        let short = &shards.data[0][..shards.data[0].len() - 1]; // truncated shard 0
+        v[0] = Some(short);
+        let got = decode_object(p, 50, &v).expect("recoverable from the other 4 shards");
+        assert_eq!(got, obj, "inconsistent shard dropped and reconstructed exactly");
     }
 
     #[test]
