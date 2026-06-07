@@ -27,7 +27,7 @@ use ozone_types::{
     BlockData, BlockId, ChecksumType, ChunkInfo, ContainerId, ContainerInfo, EcReplicationConfig,
     LocalId, ReplicaIndex,
 };
-use test_fixtures::fake_scm::FakeScm;
+use test_fixtures::fake_scm::{FakeScm, PipelineFixture};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -90,9 +90,10 @@ fn shard_bytes(shards: &EncodedShards, slot: u8) -> Vec<u8> {
     }
 }
 
-/// Write shard `slot` into datanode `dn`'s stores (mirrors the gateway's
-/// write_block_group: create container, write chunk + checksum, put block).
-async fn seed_shard(dn: &Dn, slot: u8, shard: &[u8]) {
+/// Write shard `slot` of block group `local` into datanode `dn`'s stores (mirrors
+/// the gateway's write_block_group: create container, write chunk + checksum, put
+/// block).
+async fn seed_shard_at(dn: &Dn, local: u64, slot: u8, shard: &[u8]) {
     let _ = dn
         .meta
         .create_container(ContainerInfo::new_open(ContainerId(CONTAINER), ec()))
@@ -105,7 +106,7 @@ async fn seed_shard(dn: &Dn, slot: u8, shard: &[u8]) {
         checksum_data: Some(cd),
         stripe_checksum: None,
     };
-    let bslot = BlockId::ec(ContainerId(CONTAINER), LocalId(LOCAL), ReplicaIndex::new(slot));
+    let bslot = BlockId::ec(ContainerId(CONTAINER), LocalId(local), ReplicaIndex::new(slot));
     dn.chunks
         .write_chunk(&bslot, &chunk, Bytes::copy_from_slice(shard))
         .await
@@ -116,11 +117,39 @@ async fn seed_shard(dn: &Dn, slot: u8, shard: &[u8]) {
     dn.meta.put_block(&bd).await.unwrap();
 }
 
-/// A read-chunk request for `slot` with no caller checksum, so the datanode
-/// verifies against its OWN stored checksum (verify=true).
-fn verify_read(slot: u8) -> (BlockId, ChunkInfo) {
+async fn seed_shard(dn: &Dn, slot: u8, shard: &[u8]) {
+    seed_shard_at(dn, LOCAL, slot, shard).await
+}
+
+/// Encode `payload` and seed each of the 5 shards (one per datanode) for block
+/// group `local`. Returns the original shard bytes indexed by slot-1.
+async fn seed_block_group(dns: &[Dn], local: u64, payload: &[u8]) -> Vec<Vec<u8>> {
+    let shards = encode_object(profile(), payload).unwrap();
+    for slot in 1..=5u8 {
+        seed_shard_at(&dns[(slot - 1) as usize], local, slot, &shard_bytes(&shards, slot)).await;
+    }
+    (1..=5u8).map(|s| shard_bytes(&shards, s)).collect()
+}
+
+/// Corrupt one byte of (block group `local`, slot) on `dn`'s disk, leaving the
+/// stored checksum intact so a verified read detects the rot.
+fn corrupt_chunk(dn: &Dn, local: u64, slot: u8) {
+    let p = dn
+        .dir
+        .join("data")
+        .join(CONTAINER.to_string())
+        .join("chunks")
+        .join(format!("{local}_{slot}_0"));
+    let mut bytes = std::fs::read(&p).unwrap();
+    bytes[0] ^= 0xFF;
+    std::fs::write(&p, &bytes).unwrap();
+}
+
+/// A read-chunk request for (block group `local`, slot) with no caller checksum,
+/// so the datanode verifies against its OWN stored checksum (verify=true).
+fn verify_read_at(local: u64, slot: u8) -> (BlockId, ChunkInfo) {
     (
-        BlockId::ec(ContainerId(CONTAINER), LocalId(LOCAL), ReplicaIndex::new(slot)),
+        BlockId::ec(ContainerId(CONTAINER), LocalId(local), ReplicaIndex::new(slot)),
         ChunkInfo {
             chunk_name: "0".to_string(),
             offset: 0,
@@ -129,6 +158,10 @@ fn verify_read(slot: u8) -> (BlockId, ChunkInfo) {
             stripe_checksum: None,
         },
     )
+}
+
+fn verify_read(slot: u8) -> (BlockId, ChunkInfo) {
+    verify_read_at(LOCAL, slot)
 }
 
 fn datanode_id(dn: &Dn) -> scm::DatanodeId {
@@ -222,6 +255,7 @@ async fn reconstruct_ec_repairs_corrupt_shard_at_rest() {
         meta: dns[0].meta.clone(),
         chunks: dns[0].chunks.clone(),
         heartbeat_interval: Duration::from_millis(50),
+        repairs: None,
     };
     tokio::spawn(async move {
         reg.run(format!("http://{scm_addr}")).await.ok();
@@ -334,6 +368,187 @@ async fn scrub_then_repair_heals_shard_at_rest() {
         .await
         .expect("healed shard must read clean from disk alone, with all peers down");
     assert_eq!(healed.as_ref(), &original_slot1[..], "repaired shard is byte-identical");
+
+    for d in &dns {
+        d.handle.abort();
+        tokio::fs::remove_dir_all(&d.dir).await.ok();
+    }
+}
+
+// ---- self-heal loop (scrubber -> SCM report -> ReconstructEC -> repair) ----
+
+/// The survivor pipeline for the 5-DN topology when slot 1 is the rebuild target:
+/// peers are slots 2..5 on dns[1..5].
+fn pipeline_fixture(dns: &[Dn]) -> PipelineFixture {
+    PipelineFixture {
+        sources: (1..5).map(|i| datanode_id(&dns[i])).collect(),
+        source_replica_indexes: (1..5u32)
+            .map(|i| (dns[i as usize].uuid.clone(), i + 1))
+            .collect(),
+        ec_config: ec().into(),
+    }
+}
+
+/// Serve `fake` as the SCM, and run a scrubber (short interval) + SCM loop on the
+/// TARGET (dns[0]) wired together via the repair channel. NO ScmCommand is built
+/// by any caller — repair is driven entirely by the closed loop.
+async fn spawn_self_heal(dns: &[Dn], fake: FakeScm) {
+    let scm_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let scm_addr = scm_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(fake.into_server())
+            .serve_with_incoming(TcpListenerStream::new(scm_listener))
+            .await
+            .ok();
+    });
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+    let scrubber = Scrubber::new(dns[0].meta.clone(), dns[0].chunks.clone());
+    tokio::spawn(async move {
+        scrubber.run(Duration::from_millis(25), tx).await;
+    });
+    let reg = ScmRegistration {
+        datanode_id: datanode_id(&dns[0]),
+        meta: dns[0].meta.clone(),
+        chunks: dns[0].chunks.clone(),
+        heartbeat_interval: Duration::from_millis(50),
+        repairs: Some(rx),
+    };
+    tokio::spawn(async move {
+        reg.run(format!("http://{scm_addr}")).await.ok();
+    });
+}
+
+async fn poll_verified_read(target: &mut DnClient, local: u64, slot: u8, tries: usize) -> Option<Vec<u8>> {
+    for _ in 0..tries {
+        let (b, c) = verify_read_at(local, slot);
+        if let Ok(bytes) = target.read_chunk(&b, &c, true).await {
+            return Some(bytes.to_vec());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    None
+}
+
+#[tokio::test]
+async fn scrub_to_self_heal_closes_the_loop() {
+    let mut dns = Vec::new();
+    for i in 0..5 {
+        dns.push(spawn_dn(i).await);
+    }
+    let payload: Vec<u8> = (0..PAYLOAD_LEN).map(|i| (i * 3 + 1) as u8).collect();
+    let originals = seed_block_group(&dns, LOCAL, &payload).await;
+    let original_slot1 = originals[0].clone();
+    corrupt_chunk(&dns[0], LOCAL, 1);
+
+    let mut target = DnClient::connect(format!("http://{}", dns[0].addr)).await.unwrap();
+    let (b, c) = verify_read(1);
+    assert!(
+        target.read_chunk(&b, &c, true).await.is_err(),
+        "shard must be corrupt before the loop runs"
+    );
+
+    let fake = FakeScm::with_pipeline(pipeline_fixture(&dns));
+    let reports = fake.received_reports();
+    spawn_self_heal(&dns, fake).await;
+
+    // PROOF: the shard self-heals with NO externally-injected command.
+    let healed = poll_verified_read(&mut target, LOCAL, 1, 150)
+        .await
+        .expect("shard must self-heal via scrubber -> SCM -> reconstruct");
+    assert_eq!(healed, original_slot1, "self-healed bytes are the original");
+
+    // The DN's signal was an INCREMENTAL UNHEALTHY report naming slot 1.
+    let snap = reports.lock().clone();
+    assert!(
+        snap.iter().any(|r| {
+            r.kind == scm::container_report_request::Kind::Incremental as i32
+                && r.reports.iter().any(|cr| {
+                    cr.state == dn::container_state::State::Unhealthy as i32 && cr.replica_index == 1
+                })
+        }),
+        "expected an INCREMENTAL UNHEALTHY report for slot 1"
+    );
+
+    for d in &dns {
+        d.handle.abort();
+        tokio::fs::remove_dir_all(&d.dir).await.ok();
+    }
+}
+
+#[tokio::test]
+async fn self_heal_covers_all_block_groups_in_replica() {
+    let mut dns = Vec::new();
+    for i in 0..5 {
+        dns.push(spawn_dn(i).await);
+    }
+    let o1 = seed_block_group(&dns, 1, &(0..PAYLOAD_LEN).map(|i| (i * 3 + 1) as u8).collect::<Vec<_>>()).await;
+    let o2 = seed_block_group(&dns, 2, &(0..PAYLOAD_LEN).map(|i| (i * 5 + 2) as u8).collect::<Vec<_>>()).await;
+    // Corrupt slot 1 in BOTH of this DN's block groups.
+    corrupt_chunk(&dns[0], 1, 1);
+    corrupt_chunk(&dns[0], 2, 1);
+
+    let fake = FakeScm::with_pipeline(pipeline_fixture(&dns));
+    let reports = fake.received_reports();
+    spawn_self_heal(&dns, fake).await;
+
+    let mut target = DnClient::connect(format!("http://{}", dns[0].addr)).await.unwrap();
+    // ONE UNHEALTHY report (latch) + empty-blocks command heals BOTH block groups.
+    let h1 = poll_verified_read(&mut target, 1, 1, 200).await.expect("block 1 heals");
+    let h2 = poll_verified_read(&mut target, 2, 1, 200).await.expect("block 2 heals");
+    assert_eq!(h1, o1[0]);
+    assert_eq!(h2, o2[0]);
+
+    let snap = reports.lock().clone();
+    let unhealthy = snap
+        .iter()
+        .flat_map(|r| r.reports.iter())
+        .filter(|cr| cr.state == dn::container_state::State::Unhealthy as i32 && cr.replica_index == 1)
+        .count();
+    assert_eq!(
+        unhealthy, 1,
+        "the rising-edge latch must collapse both findings into a single report"
+    );
+
+    for d in &dns {
+        d.handle.abort();
+        tokio::fs::remove_dir_all(&d.dir).await.ok();
+    }
+}
+
+#[tokio::test]
+async fn self_heal_gives_up_cleanly_when_unrecoverable() {
+    let mut dns = Vec::new();
+    for i in 0..5 {
+        dns.push(spawn_dn(i).await);
+    }
+    // Block group 1: corrupt slot 1 (target) AND the two parity peers (slots 4,5),
+    // leaving only slots 2,3 valid = 2 < k=3 -> unrecoverable.
+    let _o1 = seed_block_group(&dns, 1, &(0..PAYLOAD_LEN).map(|i| (i * 3 + 1) as u8).collect::<Vec<_>>()).await;
+    corrupt_chunk(&dns[0], 1, 1);
+    corrupt_chunk(&dns[3], 1, 4);
+    corrupt_chunk(&dns[4], 1, 5);
+    // Block group 2: fully intact -- the liveness control.
+    let o2 = seed_block_group(&dns, 2, &(0..PAYLOAD_LEN).map(|i| (i * 7 + 9) as u8).collect::<Vec<_>>()).await;
+
+    let fake = FakeScm::with_pipeline(pipeline_fixture(&dns));
+    spawn_self_heal(&dns, fake).await;
+    let mut target = DnClient::connect(format!("http://{}", dns[0].addr)).await.unwrap();
+
+    // Give the loop ample time to attempt + fail the repair.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    // The unrecoverable shard stays corrupt (no panic, no garbage written).
+    let (b, c) = verify_read_at(1, 1);
+    assert!(
+        target.read_chunk(&b, &c, true).await.is_err(),
+        "an unrecoverable shard must remain corrupt, not be half-written"
+    );
+    // The datanode stays live: the intact block group still serves.
+    let live = poll_verified_read(&mut target, 2, 1, 50)
+        .await
+        .expect("intact block group must still be served after a failed repair");
+    assert_eq!(live, o2[0]);
 
     for d in &dns {
         d.handle.abort();

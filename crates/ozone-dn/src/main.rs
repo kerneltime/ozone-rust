@@ -45,6 +45,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // SCM registration + heartbeat loop in the background; if SCM is down the
     // loop logs and exits, but the datanode keeps serving the gateway.
+    // The scrubber feeds bit-rot findings to the SCM loop, which reports them
+    // UNHEALTHY so SCM issues a ReconstructEC the datanode then heals — the closed
+    // self-heal loop.
+    let (repair_tx, repair_rx) = tokio::sync::mpsc::channel(64);
     let reg = ScmRegistration {
         datanode_id: scm::DatanodeId {
             uuid: uuid.to_string(),
@@ -58,6 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         meta: meta.clone(),
         chunks: chunks.clone(),
         heartbeat_interval: cfg.heartbeat_interval,
+        repairs: Some(repair_rx),
     };
     let scm_endpoint = format!("http://{}", cfg.scm_address);
     tokio::spawn(async move {
@@ -67,23 +72,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // Background bit-rot scrubber: periodically verify stored chunks against their
-    // recorded checksums and surface corruption. A real SCM turns these findings
-    // into a ReconstructEC command (handled by the SCM loop above); wiring that
-    // report->command feedback is the remaining production step.
+    // recorded checksums and emit each corrupt/missing shard to the SCM loop above.
     let scrubber = Scrubber::new(meta, chunks);
-    let (repair_tx, mut repair_rx) = tokio::sync::mpsc::channel(64);
     tokio::spawn(async move {
         scrubber.run(Duration::from_secs(24 * 3600), repair_tx).await;
-    });
-    tokio::spawn(async move {
-        while let Some(req) = repair_rx.recv().await {
-            tracing::warn!(
-                container = %req.container,
-                local = req.local.0,
-                slot = req.slot,
-                "bit-rot detected on a stored shard; needs EC reconstruction",
-            );
-        }
     });
 
     tracing::info!(listen = %cfg.listen_addr, uuid = %uuid, "ozone-dn datanode serving");

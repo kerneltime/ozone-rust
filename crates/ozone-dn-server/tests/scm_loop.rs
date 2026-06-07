@@ -81,6 +81,7 @@ async fn datanode_registers_heartbeats_and_closes_container() {
         meta: meta.clone(),
         chunks,
         heartbeat_interval: Duration::from_millis(50),
+        repairs: None,
     };
     let endpoint = format!("http://{addr}");
     tokio::spawn(async move {
@@ -148,6 +149,7 @@ async fn datanode_sends_full_container_report_on_registration() {
         meta: meta.clone(),
         chunks,
         heartbeat_interval: Duration::from_millis(50),
+        repairs: None,
     };
     let endpoint = format!("http://{addr}");
     tokio::spawn(async move {
@@ -239,6 +241,7 @@ async fn datanode_reclaims_chunks_on_delete_container_command() {
         meta: meta.clone(),
         chunks: chunks.clone(),
         heartbeat_interval: Duration::from_millis(50),
+        repairs: None,
     };
     let endpoint = format!("http://{addr}");
     tokio::spawn(async move {
