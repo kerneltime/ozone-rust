@@ -263,6 +263,7 @@ message InitiateMultipartUploadRequest {
 
 message InitiateMultipartUploadResponse {
   string upload_id = 1;
+  uint64 initiated_ms = 2;  // OM-stamped; surfaced by ListMultipartUploads
 }
 
 message AbortMultipartUploadRequest {
@@ -273,17 +274,37 @@ message AbortMultipartUploadRequest {
 
 message AbortMultipartUploadResponse {}
 
+// Persist one uploaded part's record in the OM. The gateway calls this after it
+// has EC-written the part's data to the datanodes, so any gateway replica can
+// later complete or list the upload (the gateway holds no in-flight part state).
+// Re-uploading a part number overwrites the prior record (last writer wins).
+message CommitMultipartPartRequest {
+  VolumeBucketKey vbk = 1;
+  string upload_id = 2;
+  uint32 part_number = 3;
+  bytes etag_binary = 4;               // raw 16-byte MD5 of the part bytes (feeds the final multipart ETag)
+  string etag_hex = 5;                 // lowercase hex of etag_binary (the S3 part ETag for ListParts)
+  uint64 size = 6;
+  repeated KeyLocation locations = 7;  // the part's block group(s); >1 for a multi-block part
+  AuthContext auth = 8;
+}
+
+message CommitMultipartPartResponse {}
+
 message Part {
   uint32 part_number = 1;
-  bytes etag = 2;
+  bytes etag = 2;          // raw 16-byte binary digest
   uint64 size = 3;
   repeated KeyLocation locations = 4;
+  string etag_hex = 5;     // lowercase-hex per-part ETag for ListParts
 }
 
 message CompleteMultipartUploadRequest {
   VolumeBucketKey vbk = 1;
   string upload_id = 2;
-  repeated Part parts = 3;
+  // The client's part order. The OM looks up each part's stored record, validates
+  // (ascending, all present, every non-last part >= 5 MiB), then stitches the key.
+  repeated uint32 ordered_part_numbers = 3;
   AuthContext auth = 4;
 }
 
@@ -350,6 +371,7 @@ service OmRustGatewayService {
   rpc PutObjectTagging(PutObjectTaggingRequest) returns (PutObjectTaggingResponse);
 
   rpc InitiateMultipartUpload(InitiateMultipartUploadRequest) returns (InitiateMultipartUploadResponse);
+  rpc CommitMultipartPart(CommitMultipartPartRequest) returns (CommitMultipartPartResponse);
   rpc AbortMultipartUpload(AbortMultipartUploadRequest) returns (AbortMultipartUploadResponse);
   rpc CompleteMultipartUpload(CompleteMultipartUploadRequest) returns (CompleteMultipartUploadResponse);
   rpc ListParts(ListPartsRequest) returns (ListPartsResponse);

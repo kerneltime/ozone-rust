@@ -37,7 +37,8 @@
 use ozone_grpc_types::om::gw::v1::om_rust_gateway_service_client::OmRustGatewayServiceClient;
 use ozone_grpc_types::om::gw::v1::{
     AbortMultipartUploadRequest, AbortMultipartUploadResponse, AllocateBlockRequest,
-    AllocateBlockResponse, CommitKeyRequest, CommitKeyResponse, CompleteMultipartUploadRequest,
+    AllocateBlockResponse, CommitKeyRequest, CommitKeyResponse, CommitMultipartPartRequest,
+    CommitMultipartPartResponse, CompleteMultipartUploadRequest,
     CompleteMultipartUploadResponse, CopyKeyRequest, CopyKeyResponse, CreateBucketRequest,
     CreateBucketResponse, CreateKeyRequest, CreateKeyResponse, DeleteBucketRequest,
     DeleteBucketResponse, DeleteKeyRequest, DeleteKeyResponse, HeadBucketRequest, HeadBucketResponse,
@@ -258,6 +259,14 @@ impl OmClient {
             .complete_multipart_upload(req)
             .await?
             .into_inner())
+    }
+
+    /// `CommitMultipartPart` — persist one uploaded part's record in the OM.
+    pub async fn commit_multipart_part(
+        &mut self,
+        req: CommitMultipartPartRequest,
+    ) -> Result<CommitMultipartPartResponse, OmClientError> {
+        Ok(self.inner.commit_multipart_part(req).await?.into_inner())
     }
 
     /// `ListParts` — page through the parts already uploaded for an upload id.

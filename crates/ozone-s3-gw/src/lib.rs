@@ -252,7 +252,7 @@ async fn route(
                     .await?;
                 return Ok(status_only(StatusCode::NO_CONTENT));
             } else if method == Method::GET {
-                let parts = gw.list_parts(&upload_id).await?;
+                let parts = gw.list_parts(&bucket, &key, &principal, &upload_id).await?;
                 return Ok(xml_ok(list_parts_xml(&bucket, &key, &upload_id, &parts)));
             }
             return Err(GatewayError::BadRequest("unsupported multipart operation".into()));
@@ -283,7 +283,7 @@ async fn route(
             return Ok(xml_ok(bucket_location_xml(&gw.region)));
         }
         if method == Method::GET && query_param(q, "uploads").is_some() {
-            let uploads = gw.list_multipart_uploads(&bucket).await;
+            let uploads = gw.list_multipart_uploads(&bucket, &principal).await?;
             return Ok(xml_ok(list_mpu_xml(&bucket, &uploads)));
         }
     }

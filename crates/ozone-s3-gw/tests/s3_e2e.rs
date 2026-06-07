@@ -252,6 +252,37 @@ async fn s3_object_lifecycle_with_degraded_read() {
     }
 }
 
+/// Stand up 5 datanodes + one FakeOm, then TWO independent gateways over that
+/// same OM. Returns `(base_a, base_b, dns)`. Used to prove multipart state lives
+/// in the OM, not in a gateway process.
+async fn spawn_two_gateways_over_one_om() -> (String, String, Vec<Datanode>) {
+    let mut dns = Vec::new();
+    for i in 0..5 {
+        dns.push(spawn_datanode(i).await);
+    }
+    let ec_wire: ozone_grpc_types::dn::v1::EcReplicationConfig =
+        ozone_types::EcReplicationConfig::rs(3, 2, 1024).into();
+    let details: Vec<_> = dns
+        .iter()
+        .map(|d| datanode_details(&d.uuid, "127.0.0.1", d.addr.port() as u32))
+        .collect();
+    let (om_endpoint, _om) = spawn_om(PipelineConfig::new(details, ec_wire)).await;
+    let mut bases = Vec::new();
+    for _ in 0..2 {
+        let gw = Arc::new(
+            Gateway::connect(om_endpoint.clone(), "us-east-1")
+                .await
+                .unwrap(),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        bases.push(format!("http://{}", listener.local_addr().unwrap()));
+        tokio::spawn(async move {
+            serve(gw, listener).await.ok();
+        });
+    }
+    (bases[0].clone(), bases[1].clone(), dns)
+}
+
 #[tokio::test]
 async fn s3_corrupted_shard_is_detected_and_reconstructed() {
     let (base, dns) = spawn_stack().await;
@@ -728,6 +759,157 @@ async fn s3_concurrent_multipart_uploads() {
     for h in handles {
         h.await.unwrap();
     }
+
+    for d in &dns {
+        d.handle.abort();
+        tokio::fs::remove_dir_all(&d.dir).await.ok();
+    }
+}
+
+/// THE C2 acceptance test: a multipart upload initiated + uploaded on one gateway
+/// instance can be completed and read on a DIFFERENT instance over the same OM.
+/// Under the old in-process design, gateway B's Complete returns NoSuchUpload
+/// (its local map never saw the upload); with OM-persisted parts it succeeds.
+#[tokio::test]
+async fn s3_multipart_completes_across_gateway_instances() {
+    use aws_sdk_s3::primitives::ByteStream;
+    use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+
+    let (base_a, base_b, dns) = spawn_two_gateways_over_one_om().await;
+    let s3a = s3_client(&base_a);
+    let s3b = s3_client(&base_b);
+
+    // initiate + both uploads on gateway A (part1 >= 5 MiB so it is a valid
+    // non-last part).
+    let create = s3a
+        .create_multipart_upload()
+        .bucket("bucket1")
+        .key("x.bin")
+        .send()
+        .await
+        .expect("create on A");
+    let uid = create.upload_id().unwrap().to_string();
+    let part1: Vec<u8> = (0..5 * 1024 * 1024u32).map(|i| (i % 256) as u8).collect();
+    let part2: Vec<u8> = (0..2000u32).map(|i| ((i + 9) % 256) as u8).collect();
+    let mut completed = Vec::new();
+    for (n, b) in [(1i32, &part1), (2i32, &part2)] {
+        let up = s3a
+            .upload_part()
+            .bucket("bucket1")
+            .key("x.bin")
+            .upload_id(&uid)
+            .part_number(n)
+            .body(ByteStream::from(b.clone()))
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("upload {n} on A: {e:?}"));
+        completed.push(
+            CompletedPart::builder()
+                .part_number(n)
+                .e_tag(up.e_tag().unwrap_or_default())
+                .build(),
+        );
+    }
+
+    // Complete on gateway B, which never saw the uploads.
+    let comp = s3b
+        .complete_multipart_upload()
+        .bucket("bucket1")
+        .key("x.bin")
+        .upload_id(&uid)
+        .multipart_upload(CompletedMultipartUpload::builder().set_parts(Some(completed)).build())
+        .send()
+        .await
+        .expect("complete on the OTHER gateway instance");
+    assert!(
+        comp.e_tag().unwrap_or_default().contains("-2"),
+        "multipart ETag carries the part count"
+    );
+
+    // GET on gateway B returns the reassembled object.
+    let got = s3b
+        .get_object()
+        .bucket("bucket1")
+        .key("x.bin")
+        .send()
+        .await
+        .expect("get on B");
+    let bytes = got.body.collect().await.unwrap().into_bytes();
+    let mut expected = part1.clone();
+    expected.extend_from_slice(&part2);
+    assert_eq!(bytes.as_ref(), &expected[..], "cross-instance multipart reassembles");
+
+    for d in &dns {
+        d.handle.abort();
+        tokio::fs::remove_dir_all(&d.dir).await.ok();
+    }
+}
+
+/// The OM-authoritative validations (EntityTooSmall, unknown upload) still produce
+/// the right S3 status across the instance boundary — now that the checks live in
+/// the OM rather than a single gateway's local state.
+#[tokio::test]
+async fn s3_multipart_om_authoritative_checks_across_instances() {
+    use aws_sdk_s3::error::ProvideErrorMetadata;
+    use aws_sdk_s3::primitives::ByteStream;
+    use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+
+    let (base_a, base_b, dns) = spawn_two_gateways_over_one_om().await;
+    let s3a = s3_client(&base_a);
+    let s3b = s3_client(&base_b);
+
+    // Two small parts uploaded on A; completing on B must hit EntityTooSmall (the
+    // non-last part is < 5 MiB), enforced by the OM where the sizes live -> 400.
+    let create = s3a
+        .create_multipart_upload()
+        .bucket("bucket1")
+        .key("small.bin")
+        .send()
+        .await
+        .expect("create");
+    let uid = create.upload_id().unwrap().to_string();
+    let mut completed = Vec::new();
+    for n in [1i32, 2] {
+        let up = s3a
+            .upload_part()
+            .bucket("bucket1")
+            .key("small.bin")
+            .upload_id(&uid)
+            .part_number(n)
+            .body(ByteStream::from(vec![3u8; 1000]))
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("upload {n}: {e:?}"));
+        completed.push(
+            CompletedPart::builder()
+                .part_number(n)
+                .e_tag(up.e_tag().unwrap_or_default())
+                .build(),
+        );
+    }
+    let err = s3b
+        .complete_multipart_upload()
+        .bucket("bucket1")
+        .key("small.bin")
+        .upload_id(&uid)
+        .multipart_upload(CompletedMultipartUpload::builder().set_parts(Some(completed)).build())
+        .send()
+        .await
+        .expect_err("non-last part below 5 MiB must fail on the other instance");
+    assert_eq!(err.code(), Some("InvalidRequest"), "{err:?}");
+
+    // An unknown upload id on B -> NoSuchUpload (404), not a 500.
+    let err = s3b
+        .upload_part()
+        .bucket("bucket1")
+        .key("ghost.bin")
+        .upload_id("upload-999")
+        .part_number(1)
+        .body(ByteStream::from(vec![1u8; 10]))
+        .send()
+        .await
+        .expect_err("unknown upload must fail");
+    assert_eq!(err.code(), Some("NoSuchUpload"), "{err:?}");
 
     for d in &dns {
         d.handle.abort();

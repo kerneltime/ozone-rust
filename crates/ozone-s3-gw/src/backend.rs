@@ -16,7 +16,7 @@
 //!   caller (the secure proxy), and `proxy_attested` is set true. The gateway
 //!   does NOT verify SigV4.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 use bytes::Bytes;
 use md5::{Digest, Md5};
@@ -41,9 +41,8 @@ const ETAG_META_KEY: &str = "ETAG";
 /// Prefix for object tag entries persisted in OM key metadata. Keeps the S3 tag
 /// set namespaced away from user `x-amz-meta-*` metadata and the reserved ETag.
 const TAG_META_PREFIX: &str = "x-amz-tag-";
-/// Minimum size of every multipart part except the last (S3 `EntityTooSmall`).
-const MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
-/// Inclusive upper bound on multipart part numbers (S3 allows 1..=10000).
+/// Inclusive upper bound on multipart part numbers (S3 allows 1..=10000). The
+/// gateway front-doors this before any datanode write; the OM enforces it too.
 const MAX_PART_NUMBER: u32 = 10_000;
 /// Default maximum user bytes per EC block group. An object (or multipart part)
 /// larger than this is split across several block groups, each independently
@@ -145,26 +144,6 @@ pub struct Listing {
     pub common_prefixes: Vec<String>,
 }
 
-/// One uploaded part of an in-flight multipart upload.
-struct MpuPart {
-    /// AWS part ETag (MD5 hex, unquoted).
-    etag_hex: String,
-    /// Raw 16-byte MD5 digest, fed to the final multipart-ETag computation.
-    etag_binary: Vec<u8>,
-    /// Part size in bytes.
-    size: u64,
-    /// The part's stored block group(s) — more than one if the part exceeded the
-    /// block-group size.
-    locations: Vec<om::KeyLocation>,
-}
-
-/// In-flight multipart upload: its target key plus the parts uploaded so far.
-struct MpuUpload {
-    bucket: String,
-    key: String,
-    parts: BTreeMap<u32, MpuPart>,
-}
-
 /// A part summary for `ListParts`: `(part_number, etag_hex, size)`.
 pub type PartSummary = (u32, String, u64);
 
@@ -188,18 +167,16 @@ pub struct CopyDirectives {
     pub tags: Vec<(String, String)>,
 }
 
-/// The gateway backend. Holds the OM channel, a per-datanode channel cache, and
-/// the in-flight multipart registry; per-call clients are built from the
-/// cloneable channels.
+/// The gateway backend. Holds the OM channel and a per-datanode channel cache;
+/// per-call clients are built from the cloneable channels.
 ///
-/// The multipart registry tracks parts in-process (the OM only finalizes at
-/// completion), so the gateway is stateful across the UploadPart/Complete
-/// requests of a single upload — acceptable for a single instance; a production
-/// deployment would persist part records in OM so any replica can complete.
+/// The gateway is STATELESS for multipart: in-flight part records live in the
+/// OM (persisted at UploadPart via `CommitMultipartPart`), so any gateway replica
+/// can upload, complete, list, or abort an upload, and a gateway restart loses
+/// nothing.
 pub struct Gateway {
     om_channel: Channel,
     dn_channels: Mutex<HashMap<String, Channel>>,
-    mpu: Mutex<HashMap<String, MpuUpload>>,
     /// S3 region reported in responses (informational for OBS).
     pub region: String,
     /// Max user bytes per EC block group; larger writes span multiple groups.
@@ -220,7 +197,6 @@ impl Gateway {
         Ok(Self {
             om_channel,
             dn_channels: Mutex::new(HashMap::new()),
-            mpu: Mutex::new(HashMap::new()),
             region: region.into(),
             block_group_size: DEFAULT_BLOCK_GROUP_SIZE,
         })
@@ -834,8 +810,8 @@ impl Gateway {
         results
     }
 
-    /// Initiate a multipart upload: validate the bucket, get an upload id from
-    /// OM, and register in-flight state. Returns the upload id.
+    /// Initiate a multipart upload: validate the bucket and get an upload id from
+    /// OM (which persists the upload). The gateway keeps no local state.
     pub async fn initiate_multipart(
         &self,
         bucket: &str,
@@ -852,20 +828,13 @@ impl Gateway {
                 auth: Some(auth(principal)),
             })
             .await?;
-        let upload_id = resp.upload_id;
-        self.mpu.lock().await.insert(
-            upload_id.clone(),
-            MpuUpload {
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-                parts: BTreeMap::new(),
-            },
-        );
-        Ok(upload_id)
+        Ok(resp.upload_id)
     }
 
-    /// Upload one part: EC-encode + store its block group, record it under the
-    /// upload, and return the part ETag (MD5 hex, unquoted).
+    /// Upload one part: EC-encode + store its block group(s), record the part in
+    /// OM, and return the part ETag (MD5 hex, unquoted). The part-number front-door
+    /// check short-circuits a bad request before any datanode write; the OM also
+    /// enforces it authoritatively.
     pub async fn upload_part(
         &self,
         bucket: &str,
@@ -880,32 +849,32 @@ impl Gateway {
                 "part number {part_number} out of range (1..={MAX_PART_NUMBER})"
             )));
         }
-        if !self.mpu.lock().await.contains_key(upload_id) {
-            return Err(GatewayError::NoSuchUpload);
-        }
         let (ec, ec_wire) = self.bucket_ec(bucket, principal).await?;
         let (locations, _, _) = self
             .allocate_and_write(bucket, key, principal, ec, &ec_wire, &body)
             .await?;
         let etag_binary = md5_binary(&body);
         let etag_hex = hex(&etag_binary);
-        let mut reg = self.mpu.lock().await;
-        let up = reg.get_mut(upload_id).ok_or(GatewayError::NoSuchUpload)?;
-        up.parts.insert(
-            part_number,
-            MpuPart {
-                etag_hex: etag_hex.clone(),
+        self.om()
+            .commit_multipart_part(om::CommitMultipartPartRequest {
+                vbk: Some(vbk(bucket, key)),
+                upload_id: upload_id.to_string(),
+                part_number,
                 etag_binary,
+                etag_hex: etag_hex.clone(),
                 size: body.len() as u64,
                 locations,
-            },
-        );
+                auth: Some(auth(principal)),
+            })
+            .await
+            .map_err(map_mpu_om_err)?;
         Ok(etag_hex)
     }
 
-    /// Complete a multipart upload: assemble the named parts in order, hand them
-    /// to OM (which finalizes the key and computes the multipart ETag), and
-    /// return the final ETag (`<hash>-N`, unquoted).
+    /// Complete a multipart upload: forward the client's ordered part numbers to
+    /// OM, which validates them against its stored parts (all present, every
+    /// non-last part >= 5 MiB), stitches the key, and computes the multipart ETag.
+    /// Returns the final ETag (`<hash>-N`, unquoted).
     pub async fn complete_multipart(
         &self,
         bucket: &str,
@@ -917,56 +886,30 @@ impl Gateway {
         if ordered_part_numbers.is_empty() {
             return Err(GatewayError::BadRequest("complete with no parts".into()));
         }
-        // Parts must be strictly ascending with no duplicates (S3 InvalidPartOrder).
-        // The OM trusts this order verbatim, so the gateway must enforce it here
-        // rather than silently re-sorting a malformed request.
+        // A2 (InvalidPartOrder): strictly ascending, no duplicates. Only the
+        // gateway sees the client's XML part order, so this front-door check is
+        // authoritative; the OM re-asserts it as defense-in-depth.
         if ordered_part_numbers.windows(2).any(|w| w[0] >= w[1]) {
             return Err(GatewayError::BadRequest(
                 "parts must be in ascending order with no duplicates".into(),
             ));
         }
-        let parts: Vec<om::Part> = {
-            let reg = self.mpu.lock().await;
-            let stored = reg.get(upload_id).ok_or(GatewayError::NoSuchUpload)?;
-            let mut v = Vec::with_capacity(ordered_part_numbers.len());
-            let last_idx = ordered_part_numbers.len() - 1;
-            for (idx, &pn) in ordered_part_numbers.iter().enumerate() {
-                let part = stored.parts.get(&pn).ok_or_else(|| {
-                    GatewayError::BadRequest(format!("part {pn} was not uploaded"))
-                })?;
-                // Every part except the last must meet the 5 MiB minimum
-                // (S3 EntityTooSmall).
-                if idx != last_idx && part.size < MIN_PART_SIZE {
-                    return Err(GatewayError::BadRequest(format!(
-                        "part {pn} ({} bytes) is smaller than the {MIN_PART_SIZE}-byte minimum",
-                        part.size
-                    )));
-                }
-                v.push(om::Part {
-                    part_number: pn,
-                    etag: part.etag_binary.clone(),
-                    size: part.size,
-                    locations: part.locations.clone(),
-                });
-            }
-            v
-        };
         let resp = self
             .om()
             .complete_multipart_upload(om::CompleteMultipartUploadRequest {
                 vbk: Some(vbk(bucket, key)),
                 upload_id: upload_id.to_string(),
-                parts,
+                ordered_part_numbers: ordered_part_numbers.to_vec(),
                 auth: Some(auth(principal)),
             })
-            .await?;
-        self.mpu.lock().await.remove(upload_id);
+            .await
+            .map_err(map_mpu_om_err)?;
         Ok(String::from_utf8_lossy(&resp.etag).into_owned())
     }
 
-    /// Abort a multipart upload: drop in-flight state and tell OM. Already-
-    /// written part blocks become garbage reclaimed by container GC (a
-    /// background reclaimer is out of scope for this slice).
+    /// Abort a multipart upload: tell OM to drop the upload. Already-written part
+    /// blocks become garbage reclaimed by container GC (a background reclaimer is
+    /// out of scope). Idempotent at the OM (unknown ids succeed).
     pub async fn abort_multipart(
         &self,
         bucket: &str,
@@ -974,39 +917,72 @@ impl Gateway {
         principal: &str,
         upload_id: &str,
     ) -> Result<(), GatewayError> {
-        self.mpu.lock().await.remove(upload_id);
         self.om()
             .abort_multipart_upload(om::AbortMultipartUploadRequest {
                 vbk: Some(vbk(bucket, key)),
                 upload_id: upload_id.to_string(),
                 auth: Some(auth(principal)),
             })
-            .await?;
+            .await
+            .map_err(map_mpu_om_err)?;
         Ok(())
     }
 
-    /// List the parts uploaded so far for an in-flight upload.
-    pub async fn list_parts(&self, upload_id: &str) -> Result<Vec<PartSummary>, GatewayError> {
-        let reg = self.mpu.lock().await;
-        let up = reg.get(upload_id).ok_or(GatewayError::NoSuchUpload)?;
-        Ok(up
+    /// List the parts uploaded so far for an upload, from OM, as
+    /// `(part_number, etag_hex, size)`. A missing upload maps to `NoSuchUpload`.
+    pub async fn list_parts(
+        &self,
+        bucket: &str,
+        key: &str,
+        principal: &str,
+        upload_id: &str,
+    ) -> Result<Vec<PartSummary>, GatewayError> {
+        let resp = self
+            .om()
+            .list_parts(om::ListPartsRequest {
+                vbk: Some(vbk(bucket, key)),
+                upload_id: upload_id.to_string(),
+                part_number_marker: 0,
+                max_parts: 0,
+                auth: Some(auth(principal)),
+            })
+            .await
+            .map_err(map_mpu_om_err)?;
+        Ok(resp
             .parts
-            .iter()
-            .map(|(pn, p)| (*pn, p.etag_hex.clone(), p.size))
+            .into_iter()
+            .map(|p| (p.part_number, p.etag_hex, p.size))
             .collect())
     }
 
-    /// List in-flight multipart uploads for a bucket as `(upload_id, key)`,
-    /// sorted by key then upload id for stable output.
-    pub async fn list_multipart_uploads(&self, bucket: &str) -> Vec<UploadSummary> {
-        let reg = self.mpu.lock().await;
-        let mut out: Vec<UploadSummary> = reg
-            .iter()
-            .filter(|(_, up)| up.bucket == bucket)
-            .map(|(id, up)| (id.clone(), up.key.clone()))
-            .collect();
-        out.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
-        out
+    /// List in-flight multipart uploads for a bucket, from OM, as
+    /// `(upload_id, key)` (OM returns them sorted by key then upload id).
+    pub async fn list_multipart_uploads(
+        &self,
+        bucket: &str,
+        principal: &str,
+    ) -> Result<Vec<UploadSummary>, GatewayError> {
+        let resp = self
+            .om()
+            .list_multipart_uploads(om::ListMultipartUploadsRequest {
+                volume_name: S3_VOLUME.to_string(),
+                bucket_name: bucket.to_string(),
+                prefix: String::new(),
+                key_marker: String::new(),
+                upload_id_marker: String::new(),
+                max_uploads: 0,
+                auth: Some(auth(principal)),
+            })
+            .await
+            .map_err(map_mpu_om_err)?;
+        Ok(resp
+            .uploads
+            .into_iter()
+            .map(|u| {
+                let key = u.vbk.map(|v| v.key_name).unwrap_or_default();
+                (u.upload_id, key)
+            })
+            .collect())
     }
 
     /// Shared OM lookup that maps `NotFound` -> [`GatewayError::NoSuchKey`].
@@ -1045,6 +1021,21 @@ fn auth(principal: &str) -> om::AuthContext {
         principal: principal.to_string(),
         proxy_attested: true,
         request_id: String::new(),
+    }
+}
+
+/// Map an OM error from a multipart RPC onto the right S3 error. A missing upload
+/// (`NotFound`) is `NoSuchUpload` (404); a validation failure (`InvalidArgument`:
+/// part not uploaded, non-last part too small, empty/duplicate parts, bad part
+/// number) is `BadRequest` (400) — NOT 404. Anything else (transport/internal)
+/// stays a 500 via the generic `Om` conversion.
+fn map_mpu_om_err(e: OmClientError) -> GatewayError {
+    match e {
+        OmClientError::Rpc(s) if s.code() == tonic::Code::NotFound => GatewayError::NoSuchUpload,
+        OmClientError::Rpc(s) if s.code() == tonic::Code::InvalidArgument => {
+            GatewayError::BadRequest(s.message().to_string())
+        }
+        other => other.into(),
     }
 }
 

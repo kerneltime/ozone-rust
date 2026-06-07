@@ -5,25 +5,27 @@
 //! upload (initiate/complete/abort/list-parts/list-uploads) without a real Java
 //! OM. See the per-RPC docs below for the exact contract.
 //!
-//! # Multipart model: the gateway tracks parts, the OM only finalizes
-//! This fake intentionally does NOT persist per-part state. In the real system
-//! the gateway is the authority for in-flight multipart uploads: it allocates
-//! blocks per part, writes part data to datanodes, and remembers each part's
-//! `(part_number, etag, size, locations)`. The OM's role is narrow:
-//! - `initiate` mints a unique `upload_id` (and nothing else; the request's
-//!   `vbk` is not persisted at initiate time).
-//! - `complete` receives the full, authoritative part list from the gateway and
-//!   stitches it into one committed key (concatenated locations, summed size,
-//!   AWS-style multipart ETag). This is the only multipart RPC that mutates
-//!   `keys`.
-//! - `abort` is a no-op: the gateway (not the OM) owns part cleanup on the
-//!   datanodes, so there is nothing for the OM to undo here.
-//! - `list_parts` / `list_multipart_uploads` return empty: the gateway serves
-//!   these from its own in-flight registry; this OM fixture has no part state to
-//!   enumerate. They exist only so the trait is fully implemented.
+//! # Multipart model: the OM is the authority for in-flight uploads
+//! The OM persists part records (in [`State::uploads`]) so the gateway holds NO
+//! in-flight multipart state and any gateway replica can drive the upload:
+//! - `initiate` mints a unique `upload_id` and persists a [`StoredUpload`]
+//!   (capturing the `vbk` + an initiated timestamp).
+//! - `commit_multipart_part` upserts one part's `(etag, size, locations)` under
+//!   its part number (last writer wins on a re-upload). The gateway calls this
+//!   after it has EC-written the part's data to the datanodes.
+//! - `complete` looks up the upload's stored parts in the client's order,
+//!   validates them (ascending/no-dup, all present, every non-last part
+//!   `>= 5 MiB`), stitches one committed key (concatenated locations, summed
+//!   size, AWS-style multipart ETag), and removes the upload. This is the only
+//!   multipart RPC that mutates `keys`.
+//! - `abort` removes the upload (idempotent; unknown ids succeed). The
+//!   already-written part blocks are reclaimed by container GC, out of scope.
+//! - `list_parts` / `list_multipart_uploads` read the stored state.
 //!
-//! Because of this split there is no `uploads`/`parts` map in [`State`]; the
-//! only multipart state is the `next_upload_id` counter.
+//! The single coarse `State` mutex serializes every part upsert/complete/abort,
+//! which is stronger than required: a real OM needs only per-`upload_id`
+//! linearizability (a single-writer Raft group), not a global lock, so neither
+//! the proto nor the tests bake in a global-lock assumption.
 //!
 //! # Topology
 //! A `FakeOm` is parameterized by exactly ONE static EC pipeline
@@ -64,7 +66,7 @@
 //! and we also merge any request-supplied metadata. `copy_key` reads the ETag
 //! back out of that metadata entry and returns it as bytes.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::pin::Pin;
 
 use md5::{Digest, Md5};
@@ -94,6 +96,29 @@ const PIPELINE_ID: &str = "pipeline-1";
 /// deterministic and actually exercisable (a zero time would make every object
 /// look epoch-old).
 const FAKE_OBJECT_TIME_MS: u64 = 1_609_459_200_000;
+
+/// Minimum size of every multipart part except the last (S3 `EntityTooSmall`).
+/// The OM is the authority for this check now that it holds the part sizes.
+const MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
+/// Inclusive upper bound on multipart part numbers (S3 allows 1..=10000).
+const MAX_PART_NUMBER: u32 = 10_000;
+
+/// One uploaded part's record, persisted in the OM (see [`StoredUpload`]).
+struct StoredPart {
+    etag_binary: Vec<u8>,
+    etag_hex: String,
+    size: u64,
+    locations: Vec<pb::KeyLocation>,
+}
+
+/// An in-flight multipart upload, persisted in the OM so any gateway replica can
+/// commit parts, complete, abort, or list. Parts are keyed by part number in a
+/// `BTreeMap`, so `list_parts`/`complete` see them in ascending order for free.
+struct StoredUpload {
+    vbk: pb::VolumeBucketKey,
+    initiated_ms: u64,
+    parts: BTreeMap<u32, StoredPart>,
+}
 
 /// The static EC pipeline a [`FakeOm`] allocates from.
 ///
@@ -143,10 +168,12 @@ struct State {
     /// Next `client_id` to hand out from `create_key`; first call returns 1.
     next_client_id: u64,
     /// Next multipart `upload_id` ordinal to hand out from
-    /// `initiate_multipart_upload`; first call returns `upload-1`. There is no
-    /// per-part state to track here on purpose (see module docs: the gateway is
-    /// the authority for in-flight parts; the OM only finalizes on `complete`).
+    /// `initiate_multipart_upload`; first call returns `upload-1`.
     next_upload_id: u64,
+    /// In-flight multipart uploads, keyed by `upload_id`. The OM is the authority
+    /// for part records (see module docs): `initiate` inserts, `commit_multipart_part`
+    /// upserts a part, `complete`/`abort` remove the entry.
+    uploads: HashMap<String, StoredUpload>,
     /// Buckets that exist, keyed by `(volume, bucket)`, value = creation time ms
     /// (always 0; no clock). Backs CreateBucket/DeleteBucket/ListBuckets.
     /// HeadBucket stays permissive (always reports exists) so callers that
@@ -173,6 +200,7 @@ impl FakeOm {
                 next_local_id: 1,
                 next_client_id: 1,
                 next_upload_id: 1,
+                uploads: HashMap::new(),
                 buckets: HashMap::new(),
             }),
             pipeline,
@@ -606,81 +634,129 @@ impl OmRustGatewayService for FakeOm {
     /// module docs).
     async fn initiate_multipart_upload(
         &self,
-        _req: Request<pb::InitiateMultipartUploadRequest>,
+        req: Request<pb::InitiateMultipartUploadRequest>,
     ) -> Result<Response<pb::InitiateMultipartUploadResponse>, Status> {
-        let n = {
-            let mut st = self.state.lock();
-            let n = st.next_upload_id;
-            st.next_upload_id += 1;
-            n
-        };
+        let req = req.into_inner();
+        let vbk = req
+            .vbk
+            .ok_or_else(|| Status::invalid_argument("missing vbk"))?;
+        let mut st = self.state.lock();
+        let n = st.next_upload_id;
+        st.next_upload_id += 1;
+        let upload_id = format!("upload-{n}");
+        st.uploads.insert(
+            upload_id.clone(),
+            StoredUpload {
+                vbk,
+                initiated_ms: FAKE_OBJECT_TIME_MS,
+                parts: BTreeMap::new(),
+            },
+        );
         Ok(Response::new(pb::InitiateMultipartUploadResponse {
-            upload_id: format!("upload-{n}"),
+            upload_id,
+            initiated_ms: FAKE_OBJECT_TIME_MS,
         }))
     }
 
-    /// Abort a multipart upload: no-op success.
-    ///
-    /// Part data lives on the datanodes and the part registry lives in the
-    /// gateway; the OM holds no per-part state to discard. Cleaning up the
-    /// orphaned part blocks is the gateway's responsibility, so the OM simply
-    /// acknowledges the abort. Always succeeds, even for an unknown `upload_id`.
+    /// Persist one uploaded part under its upload. Upsert: a re-uploaded part
+    /// number overwrites the prior record (last writer wins). `NotFound` if the
+    /// upload is unknown; `InvalidArgument` if the part number is out of range
+    /// (the OM is the writer of record, so it enforces the bound authoritatively).
+    async fn commit_multipart_part(
+        &self,
+        req: Request<pb::CommitMultipartPartRequest>,
+    ) -> Result<Response<pb::CommitMultipartPartResponse>, Status> {
+        let req = req.into_inner();
+        if !(1..=MAX_PART_NUMBER).contains(&req.part_number) {
+            return Err(Status::invalid_argument(format!(
+                "part number {} out of range (1..={MAX_PART_NUMBER})",
+                req.part_number
+            )));
+        }
+        let mut st = self.state.lock();
+        let upload = st
+            .uploads
+            .get_mut(&req.upload_id)
+            .ok_or_else(|| Status::not_found(format!("no such upload: {}", req.upload_id)))?;
+        upload.parts.insert(
+            req.part_number,
+            StoredPart {
+                etag_binary: req.etag_binary,
+                etag_hex: req.etag_hex,
+                size: req.size,
+                locations: req.locations,
+            },
+        );
+        Ok(Response::new(pb::CommitMultipartPartResponse {}))
+    }
+
+    /// Abort a multipart upload: remove its stored record. Idempotent — aborting
+    /// an unknown `upload_id` is a no-op success (S3 abort is lenient). The
+    /// already-written part blocks are reclaimed by container GC (out of scope).
     async fn abort_multipart_upload(
         &self,
-        _req: Request<pb::AbortMultipartUploadRequest>,
+        req: Request<pb::AbortMultipartUploadRequest>,
     ) -> Result<Response<pb::AbortMultipartUploadResponse>, Status> {
+        self.state.lock().uploads.remove(&req.into_inner().upload_id);
         Ok(Response::new(pb::AbortMultipartUploadResponse {}))
     }
 
-    /// Complete a multipart upload: stitch the gateway-supplied parts into one
-    /// committed key.
+    /// Complete a multipart upload from the OM's own stored parts, in the
+    /// client-supplied order, then remove the upload.
     ///
-    /// The gateway sends the authoritative part list, each [`pb::Part`] carrying
-    /// its `part_number`, the 16-byte BINARY MD5 of that part's bytes in `etag`
-    /// (NOT hex), the part's byte `size`, and the part's block-group
-    /// `locations`. From these we build the final key:
-    /// - `final_locations` = every part's `locations` concatenated in the order
-    ///   the gateway sent them. The gateway validates the parts are strictly
-    ///   ascending with no duplicates, so the OM does NOT re-sort (re-sorting
-    ///   here would mask a gateway that failed to enforce ordering).
-    /// - `final_size` = the sum of the part `size`s.
-    /// - The object ETag is the AWS-compliant multipart form:
-    ///   `hex(md5(concat(part.etag for each part))) + "-" + N`, where the
-    ///   concatenation is over the raw 16-byte binary part digests, the outer
-    ///   MD5 is lowercase-hex-encoded, and `N` is the part count. This string is
-    ///   stored under `metadata["ETAG"]` (mirroring `commit_key`) and returned
-    ///   as bytes.
-    ///
-    /// Returns `InvalidArgument("no parts")` if `parts` is empty (a complete
-    /// with zero parts is an S3-level client error). All timestamps are 0.
+    /// Validation (all `InvalidArgument` except an unknown upload, which is
+    /// `NotFound`): non-empty; strictly ascending with no duplicates (defense in
+    /// depth — the gateway also checks the inbound XML order); every named part
+    /// must have been uploaded; every non-last part must be `>= 5 MiB`
+    /// (`EntityTooSmall`, authoritative here since the OM owns the sizes). The
+    /// final key concatenates each part's `locations` in order, sums the sizes,
+    /// and its ETag is the AWS multipart form `hex(md5(concat of the raw 16-byte
+    /// per-part digests)) + "-N"`, stored under `metadata["ETAG"]`.
     async fn complete_multipart_upload(
         &self,
         req: Request<pb::CompleteMultipartUploadRequest>,
     ) -> Result<Response<pb::CompleteMultipartUploadResponse>, Status> {
         let req = req.into_inner();
         let tuple = key_tuple(&req.vbk)?;
-
-        let parts = req.parts;
-        if parts.is_empty() {
+        let order = req.ordered_part_numbers;
+        if order.is_empty() {
             return Err(Status::invalid_argument("no parts"));
         }
-
-        let final_size: u64 = parts.iter().map(|p| p.size).sum();
-        let final_locations: Vec<pb::KeyLocation> =
-            parts.iter().flat_map(|p| p.locations.clone()).collect();
-
-        // AWS-compliant multipart ETag: MD5 over the concatenated raw 16-byte
-        // per-part binary digests, hex-encoded lowercase, suffixed with "-N".
-        let mut hasher = Md5::new();
-        for p in &parts {
-            hasher.update(&p.etag);
+        if order.windows(2).any(|w| w[0] >= w[1]) {
+            return Err(Status::invalid_argument(
+                "parts must be ascending with no duplicates",
+            ));
         }
-        let digest = hasher.finalize();
-        let etag = format!("{:x}-{}", digest, parts.len());
+
+        let mut st = self.state.lock();
+        let upload = st
+            .uploads
+            .get(&req.upload_id)
+            .ok_or_else(|| Status::not_found(format!("no such upload: {}", req.upload_id)))?;
+
+        let last_idx = order.len() - 1;
+        let mut final_size = 0u64;
+        let mut final_locations: Vec<pb::KeyLocation> = Vec::new();
+        let mut hasher = Md5::new();
+        for (idx, pn) in order.iter().enumerate() {
+            let part = upload
+                .parts
+                .get(pn)
+                .ok_or_else(|| Status::invalid_argument(format!("part {pn} was not uploaded")))?;
+            if idx != last_idx && part.size < MIN_PART_SIZE {
+                return Err(Status::invalid_argument(format!(
+                    "part {pn} ({} bytes) is smaller than the {MIN_PART_SIZE}-byte minimum",
+                    part.size
+                )));
+            }
+            final_size += part.size;
+            final_locations.extend(part.locations.iter().cloned());
+            hasher.update(&part.etag_binary);
+        }
+        let etag = format!("{:x}-{}", hasher.finalize(), order.len());
 
         let mut metadata: HashMap<String, String> = HashMap::new();
         metadata.insert(ETAG_METADATA_KEY.to_string(), etag.clone());
-
         let info = pb::OmKeyInfoLite {
             vbk: req.vbk,
             data_size: final_size,
@@ -690,7 +766,9 @@ impl OmRustGatewayService for FakeOm {
             metadata,
             ec_config: Some(self.ec()),
         };
-        self.state.lock().keys.insert(tuple, info);
+        // The `upload` borrow ended above; now mutate the map.
+        st.uploads.remove(&req.upload_id);
+        st.keys.insert(tuple, info);
 
         Ok(Response::new(pb::CompleteMultipartUploadResponse {
             etag: etag.into_bytes(),
@@ -698,33 +776,69 @@ impl OmRustGatewayService for FakeOm {
         }))
     }
 
-    /// List parts of an in-flight upload: always empty.
-    ///
-    /// The gateway serves ListParts from its own in-flight registry; this OM
-    /// fixture keeps no per-part state (see module docs), so there is nothing to
-    /// enumerate. Returns an empty, untruncated page.
+    /// List the stored parts of an in-flight upload in ascending part order.
+    /// `NotFound` if the upload is unknown (matching the gateway's NoSuchUpload).
+    /// `part_number_marker` excludes parts at or below it; `max_parts` is ignored
+    /// (the gateway never paginates), so a single untruncated page is returned.
     async fn list_parts(
         &self,
-        _req: Request<pb::ListPartsRequest>,
+        req: Request<pb::ListPartsRequest>,
     ) -> Result<Response<pb::ListPartsResponse>, Status> {
+        let req = req.into_inner();
+        let st = self.state.lock();
+        let upload = st
+            .uploads
+            .get(&req.upload_id)
+            .ok_or_else(|| Status::not_found(format!("no such upload: {}", req.upload_id)))?;
+        let parts: Vec<pb::Part> = upload
+            .parts
+            .iter()
+            .filter(|(pn, _)| **pn > req.part_number_marker)
+            .map(|(pn, p)| pb::Part {
+                part_number: *pn,
+                etag: p.etag_binary.clone(),
+                size: p.size,
+                locations: p.locations.clone(),
+                etag_hex: p.etag_hex.clone(),
+            })
+            .collect();
         Ok(Response::new(pb::ListPartsResponse {
-            parts: vec![],
+            parts,
             next_part_number_marker: 0,
             is_truncated: false,
         }))
     }
 
-    /// List in-flight multipart uploads: always empty.
-    ///
-    /// The OM does not register initiated uploads in this fixture (initiate only
-    /// mints an id), so there is nothing to list. Returns an empty, untruncated
-    /// page.
+    /// List in-flight uploads for a `(volume, bucket)` (filtered by `prefix` on
+    /// the key), sorted by key then upload id. `max_uploads` is ignored (single
+    /// untruncated page).
     async fn list_multipart_uploads(
         &self,
-        _req: Request<pb::ListMultipartUploadsRequest>,
+        req: Request<pb::ListMultipartUploadsRequest>,
     ) -> Result<Response<pb::ListMultipartUploadsResponse>, Status> {
+        let req = req.into_inner();
+        let st = self.state.lock();
+        let mut uploads: Vec<pb::list_multipart_uploads_response::Upload> = st
+            .uploads
+            .iter()
+            .filter(|(_, u)| {
+                u.vbk.volume_name == req.volume_name
+                    && u.vbk.bucket_name == req.bucket_name
+                    && u.vbk.key_name.starts_with(&req.prefix)
+            })
+            .map(|(id, u)| pb::list_multipart_uploads_response::Upload {
+                vbk: Some(u.vbk.clone()),
+                upload_id: id.clone(),
+                initiated_ms: u.initiated_ms,
+            })
+            .collect();
+        uploads.sort_by(|a, b| {
+            let ak = a.vbk.as_ref().map(|v| v.key_name.as_str()).unwrap_or("");
+            let bk = b.vbk.as_ref().map(|v| v.key_name.as_str()).unwrap_or("");
+            ak.cmp(bk).then_with(|| a.upload_id.cmp(&b.upload_id))
+        });
         Ok(Response::new(pb::ListMultipartUploadsResponse {
-            uploads: vec![],
+            uploads,
             next_key_marker: String::new(),
             next_upload_id_marker: String::new(),
             is_truncated: false,
@@ -950,24 +1064,28 @@ mod tests {
             .into_inner()
             .upload_id;
 
-        // Two fabricated parts. Binary 16-byte etags (chosen, not real MD5s),
-        // distinct sizes, and one location each so concatenation is observable.
-        let parts = vec![
-            pb::Part {
-                part_number: 1,
-                etag: vec![0xAA; 16],
-                size: 5_000,
-                locations: vec![part_location(10)],
-            },
-            pb::Part {
-                part_number: 2,
-                etag: vec![0xBB; 16],
-                size: 1_234,
-                locations: vec![part_location(20)],
-            },
-        ];
-        let total_size: u64 = parts.iter().map(|p| p.size).sum();
-        let total_locations: usize = parts.iter().map(|p| p.locations.len()).sum();
+        // Two parts, committed to the OM first. Part 1 (non-last) must meet the
+        // 5 MiB minimum the OM now enforces; part 2 (last) may be small. Binary
+        // 16-byte etags chosen (not real MD5s), one location each so concatenation
+        // is observable.
+        let part1_size: u64 = 5 * 1024 * 1024;
+        let part2_size: u64 = 1_234;
+        let total_size = part1_size + part2_size;
+        let total_locations = 2usize;
+        for (pn, byte, size, loc) in [(1u32, 0xAAu8, part1_size, 10u64), (2, 0xBB, part2_size, 20)] {
+            om.commit_multipart_part(Request::new(pb::CommitMultipartPartRequest {
+                vbk: Some(vbk("obj")),
+                upload_id: upload_id.clone(),
+                part_number: pn,
+                etag_binary: vec![byte; 16],
+                etag_hex: String::new(),
+                size,
+                locations: vec![part_location(loc)],
+                auth: None,
+            }))
+            .await
+            .unwrap();
+        }
 
         // Independently recompute the AWS multipart ETag the impl should return.
         let mut hasher = Md5::new();
@@ -979,7 +1097,7 @@ mod tests {
             .complete_multipart_upload(Request::new(pb::CompleteMultipartUploadRequest {
                 vbk: Some(vbk("obj")),
                 upload_id,
-                parts,
+                ordered_part_numbers: vec![1, 2],
                 auth: None,
             }))
             .await
@@ -1018,7 +1136,7 @@ mod tests {
             .complete_multipart_upload(Request::new(pb::CompleteMultipartUploadRequest {
                 vbk: Some(vbk("obj")),
                 upload_id: "upload-1".to_string(),
-                parts: vec![],
+                ordered_part_numbers: vec![],
                 auth: None,
             }))
             .await
