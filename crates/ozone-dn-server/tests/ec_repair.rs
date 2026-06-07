@@ -727,3 +727,88 @@ async fn poison_reconstruct_command_does_not_kill_the_heartbeat_loop() {
         tokio::fs::remove_dir_all(&d.dir).await.ok();
     }
 }
+
+#[tokio::test]
+async fn repair_does_not_resurrect_a_deleted_container() {
+    let mut dns = Vec::new();
+    for i in 0..5 {
+        dns.push(spawn_dn(i).await);
+    }
+    let payload: Vec<u8> = (0..PAYLOAD_LEN).map(|i| (i * 3 + 1) as u8).collect();
+    seed_block_group(&dns, LOCAL, &payload).await;
+    corrupt_chunk(&dns[0], LOCAL, 1);
+    // Delete the container on dns[0] (meta + chunks), as a DeleteContainer would.
+    dns[0].meta.delete_container(ContainerId(CONTAINER)).await.unwrap();
+    dns[0].chunks.delete_container(ContainerId(CONTAINER)).await.ok();
+
+    let sources: Vec<(u8, String)> = (1..5)
+        .map(|i| ((i + 1) as u8, format!("http://{}", dns[i].addr)))
+        .collect();
+    let input = repair::RepairInput {
+        container: ContainerId(CONTAINER),
+        local: LocalId(LOCAL),
+        ec: ec(),
+        block_group_len: PAYLOAD_LEN as u64,
+        missing_slots: vec![1],
+        sources,
+    };
+    let r = repair::reconstruct_and_persist(&dns[0].meta, &dns[0].chunks, input).await;
+    assert!(r.is_err(), "repair must refuse a deleted container, got {r:?}");
+    assert!(
+        dns[0].meta.get_container(ContainerId(CONTAINER)).await.unwrap().is_none(),
+        "repair must NOT recreate a deleted container"
+    );
+    let bslot = BlockId::ec(ContainerId(CONTAINER), LocalId(LOCAL), ReplicaIndex::new(1));
+    assert!(
+        dns[0].meta.get_block(&bslot).await.unwrap().is_none(),
+        "repair must write no block metadata into a deleted container"
+    );
+
+    for d in &dns {
+        d.handle.abort();
+        tokio::fs::remove_dir_all(&d.dir).await.ok();
+    }
+}
+
+#[tokio::test]
+async fn repair_refuses_a_non_open_container_without_orphan_write() {
+    let mut dns = Vec::new();
+    for i in 0..5 {
+        dns.push(spawn_dn(i).await);
+    }
+    let payload: Vec<u8> = (0..PAYLOAD_LEN).map(|i| (i * 3 + 1) as u8).collect();
+    seed_block_group(&dns, LOCAL, &payload).await;
+    corrupt_chunk(&dns[0], LOCAL, 1);
+    // Close the container: it must no longer accept writes (incl. repair writes).
+    dns[0]
+        .meta
+        .set_container_state(ContainerId(CONTAINER), ContainerState::Closed)
+        .await
+        .unwrap();
+
+    let sources: Vec<(u8, String)> = (1..5)
+        .map(|i| ((i + 1) as u8, format!("http://{}", dns[i].addr)))
+        .collect();
+    let input = repair::RepairInput {
+        container: ContainerId(CONTAINER),
+        local: LocalId(LOCAL),
+        ec: ec(),
+        block_group_len: PAYLOAD_LEN as u64,
+        missing_slots: vec![1],
+        sources,
+    };
+    let r = repair::reconstruct_and_persist(&dns[0].meta, &dns[0].chunks, input).await;
+    assert!(r.is_err(), "repair must refuse a closed container, got {r:?}");
+    // Repair wrote nothing -> the slot stays corrupt (no orphan/partial write).
+    let mut target = DnClient::connect(format!("http://{}", dns[0].addr)).await.unwrap();
+    let (b, c) = verify_read(1);
+    assert!(
+        target.read_chunk(&b, &c, true).await.is_err(),
+        "a closed container must not be written by repair; slot stays corrupt"
+    );
+
+    for d in &dns {
+        d.handle.abort();
+        tokio::fs::remove_dir_all(&d.dir).await.ok();
+    }
+}

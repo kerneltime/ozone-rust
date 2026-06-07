@@ -17,7 +17,7 @@ use thiserror::Error;
 use ozone_dn_client::DnClient;
 use ozone_storage::{checksum, ChunkStore, MetaStore, StorageError};
 use ozone_types::{
-    BlockData, BlockId, ChecksumType, ChunkInfo, ContainerId, ContainerInfo, EcReplicationConfig,
+    BlockData, BlockId, ChecksumType, ChunkInfo, ContainerId, ContainerState, EcReplicationConfig,
     LocalId, ReplicaIndex,
 };
 
@@ -47,6 +47,15 @@ pub enum RepairError {
     /// Fewer than `k` shards could be read, so reconstruction is impossible.
     #[error("not enough surviving shards to reconstruct (have {have}, need {need})")]
     NotEnoughShards { have: usize, need: usize },
+    /// The container does not exist locally. Repair refuses rather than create it:
+    /// a stale command must not resurrect a just-deleted container.
+    #[error("container {0} is absent locally; refusing to create it for repair")]
+    ContainerAbsent(ContainerId),
+    /// The container exists but is not writable (e.g. Closed). Repair refuses
+    /// rather than write chunk bytes that `put_block` would then reject, orphaning
+    /// them with no metadata pointer.
+    #[error("container {0} is not writable ({1:?}); refusing repair")]
+    ContainerNotWritable(ContainerId, ContainerState),
     /// The erasure decoder/encoder failed.
     #[error(transparent)]
     Ec(#[from] ozone_ec::EcError),
@@ -74,15 +83,16 @@ pub async fn reconstruct_and_persist(
     let total = profile.data + profile.parity;
     let k = profile.data;
 
-    // Ensure the container exists locally so write_chunk/put_block land (a target
-    // that lost its whole replica may not have it). Idempotent.
-    match meta
-        .create_container(ContainerInfo::new_open(input.container, input.ec))
-        .await
-    {
-        Ok(()) => {}
-        Err(StorageError::ContainerExists(_)) => {}
-        Err(e) => return Err(e.into()),
+    // The container must already exist locally AND be writable. We do NOT create
+    // it: blindly creating would resurrect a concurrently-deleted container, and
+    // writing a shard whose put_block then fails (non-Open) would orphan the chunk
+    // bytes with no metadata pointer. A real SCM only reconstructs into a live,
+    // provisioned replica; a brand-new whole-replica target is provisioned
+    // separately, not here.
+    match meta.get_container(input.container).await? {
+        Some(ci) if ci.state.is_writable() => {}
+        Some(ci) => return Err(RepairError::ContainerNotWritable(input.container, ci.state)),
+        None => return Err(RepairError::ContainerAbsent(input.container)),
     }
 
     // Gather surviving shards from peers; never read a slot we are rebuilding.
