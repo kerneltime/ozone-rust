@@ -18,7 +18,9 @@ use ozone_grpc_types::dn::v1 as dn;
 use ozone_grpc_types::scm::dn::v1 as pb;
 use ozone_scm_client::{ScmClient, ScmClientError};
 use ozone_storage::{ChunkStore, MetaStore, StorageError};
-use ozone_types::{ContainerId, ContainerState};
+use ozone_types::{ContainerId, ContainerState, EcReplicationConfig, LocalId};
+
+use crate::repair;
 
 /// Failure of the registration/heartbeat loop.
 #[derive(Debug, Error)]
@@ -107,13 +109,13 @@ impl ScmRegistration {
 
         while let Some(resp) = inbound.message().await? {
             for cmd in resp.commands {
-                self.handle_command(cmd).await;
+                self.handle_command(cmd, &uuid).await;
             }
         }
         Ok(())
     }
 
-    async fn handle_command(&self, cmd: pb::ScmCommand) {
+    async fn handle_command(&self, cmd: pb::ScmCommand, self_uuid: &str) {
         use pb::scm_command::Payload;
         match cmd.payload {
             Some(Payload::CloseContainer(c)) => {
@@ -140,7 +142,63 @@ impl ScmRegistration {
                     }
                 }
             }
+            Some(Payload::ReconstructEcContainers(c)) => {
+                self.handle_reconstruct(c, self_uuid).await
+            }
             _ => tracing::debug!(cmd_id = cmd.cmd_id, "ignoring unhandled SCM command"),
+        }
+    }
+
+    /// Execute an EC reconstruction command: for each named block group, rebuild
+    /// the missing shard(s) from the surviving peers and persist them locally.
+    /// Acts only if this datanode is one of the command's targets.
+    async fn handle_reconstruct(&self, cmd: pb::ReconstructEcContainersCommand, self_uuid: &str) {
+        if !cmd.targets.iter().any(|t| t.uuid == self_uuid) {
+            return; // not addressed to this datanode
+        }
+        let Some(cid) = cmd.container_id.as_ref() else {
+            return;
+        };
+        let container = ContainerId(cid.id);
+        let ec: EcReplicationConfig = match cmd.ec_config.and_then(|c| c.try_into().ok()) {
+            Some(ec) => ec,
+            None => {
+                tracing::warn!(%container, "reconstruct command has no/invalid ec_config");
+                return;
+            }
+        };
+        let missing_slots: Vec<u8> = cmd.missing_indexes.iter().map(|i| *i as u8).collect();
+        // Join each source peer (uuid -> ip+port) with the slot it holds, dropping
+        // any peer whose slot we are rebuilding.
+        let sources: Vec<(u8, String)> = cmd
+            .sources
+            .iter()
+            .filter_map(|s| {
+                let slot = *cmd.source_replica_indexes.get(&s.uuid)? as u8;
+                if missing_slots.contains(&slot) {
+                    return None;
+                }
+                Some((slot, format!("http://{}:{}", s.ip_address, s.gateway_port)))
+            })
+            .collect();
+
+        for block in &cmd.blocks {
+            let input = repair::RepairInput {
+                container,
+                local: LocalId(block.local_id),
+                ec,
+                block_group_len: block.block_group_len,
+                missing_slots: missing_slots.clone(),
+                sources: sources.clone(),
+            };
+            match repair::reconstruct_and_persist(&self.meta, &self.chunks, input).await {
+                Ok(slots) => {
+                    tracing::info!(%container, local = block.local_id, ?slots, "repaired EC shards")
+                }
+                Err(e) => {
+                    tracing::warn!(%container, local = block.local_id, "EC repair failed: {e}")
+                }
+            }
         }
     }
 

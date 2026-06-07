@@ -17,7 +17,9 @@
 
 #![forbid(unsafe_code)]
 
+pub mod repair;
 pub mod scm;
+pub mod scrub;
 pub use scm::{ScmLoopError, ScmRegistration};
 
 use std::pin::Pin;

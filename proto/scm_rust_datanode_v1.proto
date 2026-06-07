@@ -19,6 +19,10 @@ message DatanodeID {
   string host_name = 3;
   string version = 4;
   uint64 setup_time_ms = 5;
+  // gRPC port of this DN's DatanodeGatewayService. A peer DN dials
+  // `http://{ip_address}:{gateway_port}` to read surviving shards during EC
+  // repair (mirrors org.apache.ozone.dn.v1.DatanodeDetails.gateway_port).
+  uint32 gateway_port = 6;
 }
 
 message VolumeReport {
@@ -160,10 +164,22 @@ message ReplicateContainerCommand {
 
 message ReconstructECContainersCommand {
   org.apache.ozone.dn.v1.ContainerID container_id = 1;
-  repeated DatanodeID sources = 2;
-  repeated DatanodeID targets = 3;
-  repeated uint32 missing_indexes = 4;
+  repeated DatanodeID sources = 2;        // survivors to read shards from (need gateway_port)
+  repeated DatanodeID targets = 3;        // receiving DN matches itself by uuid
+  repeated uint32 missing_indexes = 4;    // EC slots (1..=k+p) to rebuild on the target
   org.apache.ozone.dn.v1.ECReplicationConfig ec_config = 5;
+  // Peer uuid -> the EC slot (1..=k+p) it holds, so the target knows which
+  // survivor is which (mirrors om Pipeline.member_replica_indexes).
+  map<string, uint32> source_replica_indexes = 6;
+  // The specific block groups within the container to rebuild. Each carries its
+  // own block-group length (authoritative from SCM/OM), so the target needs no
+  // metadata round-trip and partial-stripe sizing is exact.
+  repeated ReconstructBlock blocks = 7;
+}
+
+message ReconstructBlock {
+  uint64 local_id = 1;
+  uint64 block_group_len = 2;  // user bytes; feeds the EC decoder's length
 }
 
 message DeleteBlocksCommand {

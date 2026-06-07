@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ozone_config::DatanodeConfig;
+use ozone_dn_server::scrub::Scrubber;
 use ozone_dn_server::{DatanodeService, ScmRegistration};
 use ozone_fjall_store::FjallMetaStore;
 use ozone_grpc_types::scm::dn::v1 as scm;
@@ -51,6 +52,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             host_name: hostname(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             setup_time_ms: 0,
+            // The data-plane gRPC port, so SCM can route EC-repair reads to this DN.
+            gateway_port: cfg.listen_addr.port() as u32,
         },
         meta: meta.clone(),
         chunks: chunks.clone(),
@@ -60,6 +63,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(async move {
         if let Err(e) = reg.run(scm_endpoint).await {
             tracing::error!("SCM registration loop ended: {e}");
+        }
+    });
+
+    // Background bit-rot scrubber: periodically verify stored chunks against their
+    // recorded checksums and surface corruption. A real SCM turns these findings
+    // into a ReconstructEC command (handled by the SCM loop above); wiring that
+    // report->command feedback is the remaining production step.
+    let scrubber = Scrubber::new(meta, chunks);
+    let (repair_tx, mut repair_rx) = tokio::sync::mpsc::channel(64);
+    tokio::spawn(async move {
+        scrubber.run(Duration::from_secs(24 * 3600), repair_tx).await;
+    });
+    tokio::spawn(async move {
+        while let Some(req) = repair_rx.recv().await {
+            tracing::warn!(
+                container = %req.container,
+                local = req.local.0,
+                slot = req.slot,
+                "bit-rot detected on a stored shard; needs EC reconstruction",
+            );
         }
     });
 

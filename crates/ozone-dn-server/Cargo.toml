@@ -12,6 +12,11 @@ ozone-types = { path = "../ozone-types" }
 ozone-storage = { path = "../ozone-storage" }
 ozone-grpc-types = { path = "../ozone-grpc-types" }
 ozone-scm-client = { path = "../ozone-scm-client" }
+# EC repair reads surviving shards from peer datanodes (client) and reconstructs
+# them (ozone-ec). ozone-dn-client depends on ozone-dn-server only as a
+# dev-dependency, so this normal dep forms no cycle.
+ozone-dn-client = { path = "../ozone-dn-client" }
+ozone-ec = { path = "../ozone-ec" }
 tonic = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
