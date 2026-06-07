@@ -287,6 +287,56 @@ async fn s3_corrupted_shard_is_detected_and_reconstructed() {
     }
 }
 
+// Corrupt every stored shard file under a datanode, so each fails its checksum
+// on read and is deterministically treated as missing. (Aborting the datanode
+// task is racy: the gateway's already-pooled connection can keep serving.)
+fn corrupt_all_chunks(dn: &Datanode) {
+    let mut files = Vec::new();
+    collect_chunk_files(&dn.dir, &mut files);
+    assert!(!files.is_empty(), "expected stored chunks to corrupt");
+    for f in &files {
+        let mut bytes = std::fs::read(f).unwrap();
+        if !bytes.is_empty() {
+            bytes[0] ^= 0xFF;
+            std::fs::write(f, &bytes).unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn s3_degraded_read_max_parity_loss_and_unrecoverable() {
+    let (base, dns) = spawn_stack().await;
+    let client: HttpClient = Client::builder(TokioExecutor::new()).build_http();
+    let url = format!("{base}/bucket1/ec.bin");
+
+    // Object spanning several stripes (RS-3-2, 1 KiB cells).
+    let body = Bytes::from((0..8000u32).map(|i| (i % 256) as u8).collect::<Vec<u8>>());
+    let (st, _, _) = http(&client, Method::PUT, url.clone(), Some("t"), body.clone()).await;
+    assert_eq!(st, StatusCode::OK, "PUT");
+
+    // Lose the maximum recoverable number of shards (p=2): corrupt data shards 1
+    // & 2 (dns[0]=slot1, dns[1]=slot2). Survivors = data shard 3 + both parity =
+    // exactly k=3, so the two missing data shards reconstruct from 1 data + 2
+    // parity. Exercises parity-heavy reconstruction end-to-end.
+    corrupt_all_chunks(&dns[0]);
+    corrupt_all_chunks(&dns[1]);
+    let (st, _, got) = http(&client, Method::GET, url.clone(), Some("t"), Bytes::new()).await;
+    assert_eq!(st, StatusCode::OK, "max-parity-loss degraded GET");
+    assert_eq!(got, body, "two missing data shards must reconstruct from parity");
+
+    // Lose a third shard (data shard 3, dns[2]): now only the 2 parity shards are
+    // intact (2 < k=3) -> unrecoverable. The read must fail cleanly with a 5xx,
+    // never returning corrupt bytes or panicking.
+    corrupt_all_chunks(&dns[2]);
+    let (st, _, _) = http(&client, Method::GET, url.clone(), Some("t"), Bytes::new()).await;
+    assert!(st.is_server_error(), "unrecoverable read must 5xx, got {st}");
+
+    for d in &dns {
+        d.handle.abort();
+        tokio::fs::remove_dir_all(&d.dir).await.ok();
+    }
+}
+
 #[tokio::test]
 async fn s3_empty_object_round_trip() {
     let (base, dns) = spawn_stack().await;
