@@ -19,8 +19,10 @@
 
 pub mod repair;
 pub mod scm;
+pub mod scm_compliant;
 pub mod scrub;
 pub use scm::{ScmLoopError, ScmRegistration};
+pub use scm_compliant::{CompliantScmError, CompliantScmRegistration};
 
 use std::pin::Pin;
 use std::sync::Arc;
