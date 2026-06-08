@@ -22,13 +22,24 @@ pub mod om {
     }
 }
 
-/// Real Apache Ozone SCM <-> Datanode protocol, vendored VERBATIM from
-/// apache/ozone master (`StorageContainerDatanodeProtocolProtos` + `hdds.proto`,
-/// package `hadoop.hdds`). This is the compliant wire contract the Rust datanode
-/// speaks so the real SCM needs only a thin gRPC transport adapter.
+/// Real Apache Ozone protocols, vendored VERBATIM from apache/ozone master. The
+/// submodules mirror the proto packages so the generated cross-package references
+/// (`super::hdds::…`, `super::common::…`) resolve:
+/// - [`hadoop::hdds`] — `hdds.proto` (`StorageContainerDatanodeProtocolProtos` shares
+///   it); the datanode<->SCM wire contract.
+/// - [`hadoop::ozone`] — `OmClientProtocol.proto` (`OzoneManagerProtocolProtos`); the
+///   OM client wire contract (`OzoneManagerService.submitRequest(OMRequest)`) the Rust
+///   S3 gateway speaks so a real OM needs only its existing gRPC transport.
+/// - [`hadoop::common`] — `Security.proto` (`SecurityProtos`), imported by the OM proto.
 pub mod hadoop {
     pub mod hdds {
         tonic::include_proto!("hadoop.hdds");
+    }
+    pub mod ozone {
+        tonic::include_proto!("hadoop.ozone");
+    }
+    pub mod common {
+        tonic::include_proto!("hadoop.common");
     }
 }
 
