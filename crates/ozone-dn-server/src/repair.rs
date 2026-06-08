@@ -295,26 +295,45 @@ pub async fn reconstruct_from_survivors(
         Ok(rebuilt) => rebuilt,
         Err(e) => {
             if we_created {
-                if let Err(re) = meta.delete_container(input.container).await {
-                    tracing::error!(container = %input.container.0, "EC rollback (metadata) failed: {re}");
-                }
-                if let Err(re) = chunks.delete_container(input.container).await {
-                    tracing::error!(container = %input.container.0, "EC rollback (chunks) failed: {re}");
-                }
+                rollback_created(meta, chunks, input.container).await;
             }
             return Err(e);
         }
     };
 
-    // Complete a freshly-provisioned whole replica by CLOSING it: it becomes a valid
-    // future EC source and is reported CLOSED, mirroring real Ozone's RECOVERING ->
-    // CLOSED. Close failure is NOT rolled back -- the data is correct on disk; a
-    // re-delivery finds the container still Open and retries the close.
     if we_created {
+        if rebuilt.is_empty() {
+            // We provisioned a fresh container but rebuilt nothing -- every block
+            // group was unrecoverable (< k verified survivors). Roll back rather than
+            // leave (and later announce to SCM) an empty replica that SCM would treat
+            // as a healthy one. The reconstruction simply did not succeed.
+            rollback_created(meta, chunks, input.container).await;
+            return Ok(Vec::new());
+        }
+        // Complete the freshly-provisioned whole replica by CLOSING it: it becomes a
+        // valid future EC source and is reported CLOSED, mirroring real Ozone's
+        // RECOVERING -> CLOSED. Close failure is NOT rolled back -- the data is correct
+        // on disk; a re-delivery finds the container still Open and retries the close.
         meta.set_container_state(input.container, ContainerState::Closed)
             .await?;
     }
     Ok(rebuilt)
+}
+
+/// Best-effort rollback of a container WE created during a reconstruction (metadata
+/// then bytes). Logs but never surfaces a cleanup failure -- the caller is already
+/// returning the real outcome (an error, or a no-op for an unrecoverable rebuild).
+async fn rollback_created(
+    meta: &Arc<dyn MetaStore>,
+    chunks: &Arc<dyn ChunkStore>,
+    container: ContainerId,
+) {
+    if let Err(e) = meta.delete_container(container).await {
+        tracing::error!(container = %container.0, "EC rollback (metadata) failed: {e}");
+    }
+    if let Err(e) = chunks.delete_container(container).await {
+        tracing::error!(container = %container.0, "EC rollback (chunks) failed: {e}");
+    }
 }
 
 /// Rebuild every enumerated block group's missing slot(s) and persist them locally

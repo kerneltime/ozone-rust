@@ -127,7 +127,7 @@ impl CompliantScmRegistration {
             // Remove-on-read: dispatch every command before the next heartbeat. A
             // handler panic is caught so it cannot kill the loop (control-plane DoS).
             for cmd in resp.commands {
-                let guarded = AssertUnwindSafe(self.handle_command(cmd));
+                let guarded = AssertUnwindSafe(self.handle_command(cmd, &pending));
                 if guarded.catch_unwind().await.is_err() {
                     tracing::error!("SCM command handler panicked; heartbeat loop continues");
                 }
@@ -207,14 +207,23 @@ impl CompliantScmRegistration {
         Ok(out)
     }
 
-    async fn handle_command(&self, cmd: oz::ScmCommandProto) {
+    async fn handle_command(
+        &self,
+        cmd: oz::ScmCommandProto,
+        pending: &Mutex<Vec<oz::ContainerReplicaProto>>,
+    ) {
         use oz::scm_command_proto::Type;
         match Type::try_from(cmd.command_type) {
             Ok(Type::CloseContainerCommand) => {
                 if let Some(c) = cmd.close_container_command_proto {
                     let id = ContainerId(c.container_id as u64);
                     match self.meta.set_container_state(id, ContainerState::Closed).await {
-                        Ok(()) => tracing::info!(%id, "closed container per SCM command"),
+                        Ok(()) => {
+                            tracing::info!(%id, "closed container per SCM command");
+                            // Announce the new CLOSED state so SCM converges its replica
+                            // view (real Ozone's sendICR-on-close).
+                            self.report_state(pending, id).await;
+                        }
                         Err(e) => tracing::warn!(%id, "close-container failed: {e}"),
                     }
                 }
@@ -235,7 +244,7 @@ impl CompliantScmRegistration {
             }
             Ok(Type::ReconstructEcContainersCommand) => {
                 if let Some(c) = cmd.reconstruct_ec_containers_command_proto {
-                    self.handle_reconstruct(c).await;
+                    self.handle_reconstruct(c, pending).await;
                 }
             }
             _ => tracing::debug!(cmd = cmd.command_type, "ignoring unhandled SCM command"),
@@ -248,7 +257,11 @@ impl CompliantScmRegistration {
     /// [`repair::reconstruct_from_survivors`]). `targets[i]` is paired with
     /// `missingContainerIndexes[i]`; `sources` carry their slot inline + a
     /// REPLICATION port.
-    async fn handle_reconstruct(&self, cmd: oz::ReconstructEcContainersCommandProto) {
+    async fn handle_reconstruct(
+        &self,
+        cmd: oz::ReconstructEcContainersCommandProto,
+        pending: &Mutex<Vec<oz::ContainerReplicaProto>>,
+    ) {
         let my_slots: Vec<u8> = cmd
             .targets
             .iter()
@@ -293,10 +306,49 @@ impl CompliantScmRegistration {
         };
         match repair::reconstruct_from_survivors(&self.meta, &self.chunks, input).await {
             Ok(locals) => {
-                tracing::info!(%container, groups = locals.len(), "reconstructed EC block groups from survivors")
+                tracing::info!(%container, groups = locals.len(), "reconstructed EC block groups from survivors");
+                // Announce the rebuilt replica's new state (CLOSED for a fresh whole
+                // replica) so SCM's view converges and any prior UNHEALTHY entry is
+                // overwritten. Only when something was actually rebuilt -- a no-op or a
+                // rolled-back unrecoverable rebuild reports nothing.
+                if !locals.is_empty() {
+                    self.report_state(pending, container).await;
+                }
             }
             Err(e) => tracing::warn!(%container, "EC reconstruction failed: {e}"),
         }
+    }
+
+    /// Push an INCREMENTAL container replica announcing `container`'s CURRENT state to
+    /// SCM (the convergence signal after a local state change). SCM keys replicas by
+    /// (containerID, datanodeID) ignoring state, so this OVERWRITES any prior entry --
+    /// e.g. reporting a rebuilt replica CLOSED clears the UNHEALTHY one SCM held. The
+    /// EC slot is the replica index of the container's first block (a DN holds one EC
+    /// slot per container); a container with no blocks (unknown slot) is skipped.
+    async fn report_state(
+        &self,
+        pending: &Mutex<Vec<oz::ContainerReplicaProto>>,
+        container: ContainerId,
+    ) {
+        let Ok(Some(ci)) = self.meta.get_container(container).await else {
+            return;
+        };
+        let Ok(page) = self.meta.list_blocks(container, 0, 1).await else {
+            return;
+        };
+        let Some(first) = page.blocks.first() else {
+            return;
+        };
+        let slot = first.block_id.replica_index.get();
+        pending.lock().push(oz::ContainerReplicaProto {
+            container_id: container.0 as i64,
+            state: container_state_to_real(ci.state) as i32,
+            replica_index: Some(slot as i32),
+            origin_node_id: Some(self.uuid.clone()),
+            key_count: Some(ci.block_count as i64),
+            used: Some(ci.used_bytes as i64),
+            ..Default::default()
+        });
     }
 }
 

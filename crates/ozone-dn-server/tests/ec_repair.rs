@@ -1211,3 +1211,155 @@ async fn reconstruct_keeps_preexisting_container_on_failure() {
     }
     tokio::fs::remove_dir_all(&tdir).await.ok();
 }
+
+#[tokio::test]
+async fn reconstruct_rolls_back_empty_rebuild_no_spurious_replica() {
+    // Fresh target, but only 2 survivors offered (slots 2,3) -- below k=3, so every
+    // block group is unrecoverable and NOTHING is rebuilt. The provisioned container
+    // must be rolled back, not left/closed as an empty "healthy" replica (which the
+    // post-rebuild ICR would otherwise announce to SCM).
+    let mut dns = Vec::new();
+    for i in 0..6 {
+        dns.push(spawn_dn(i).await);
+    }
+    let payload: Vec<u8> = (0..PAYLOAD_LEN).map(|i| (i * 3 + 1) as u8).collect();
+    seed_block_group(&dns, LOCAL, &payload).await;
+
+    let sources: Vec<(u8, String)> = vec![
+        (2, format!("http://{}", dns[1].addr)),
+        (3, format!("http://{}", dns[2].addr)),
+    ];
+    let input = repair::ReconstructInput {
+        container: ContainerId(CONTAINER),
+        ec: ec(),
+        missing_slots: vec![1],
+        sources,
+    };
+    let rebuilt = repair::reconstruct_from_survivors(&dns[5].meta, &dns[5].chunks, input)
+        .await
+        .expect("an unrecoverable rebuild is a clean no-op, not an error");
+    assert!(rebuilt.is_empty(), "nothing is rebuilt when survivors < k");
+    assert!(
+        dns[5]
+            .meta
+            .get_container(ContainerId(CONTAINER))
+            .await
+            .unwrap()
+            .is_none(),
+        "a fresh container that rebuilt nothing must be rolled back -- no empty replica"
+    );
+
+    for d in &dns {
+        d.handle.abort();
+        tokio::fs::remove_dir_all(&d.dir).await.ok();
+    }
+}
+
+/// After a compliant ReconstructEC rebuilds a fresh whole replica, the datanode must
+/// ANNOUNCE the new replica to SCM via an incremental container report marking it
+/// CLOSED (real Ozone's sendICR-on-close) -- the convergence signal that overwrites
+/// SCM's prior UNHEALTHY entry. Without it SCM never learns the replica was restored.
+#[tokio::test]
+async fn reconstruct_announces_closed_replica_to_scm() {
+    use ozone_dn_server::CompliantScmRegistration;
+    use ozone_grpc_types::hadoop::hdds as oz;
+    use test_fixtures::compliant_scm::CompliantScm;
+
+    let mut dns = Vec::new();
+    for i in 0..6 {
+        dns.push(spawn_dn(i).await);
+    }
+    let payload: Vec<u8> = (0..PAYLOAD_LEN).map(|i| (i * 3 + 1) as u8).collect();
+    seed_block_group(&dns, LOCAL, &payload).await; // slots 1..5 on dns[0..4]
+
+    fn oz_dd(uuid: &str, port: u16) -> oz::DatanodeDetailsProto {
+        oz::DatanodeDetailsProto {
+            uuid: Some(uuid.to_string()),
+            ip_address: "127.0.0.1".to_string(),
+            host_name: "h".to_string(),
+            ports: vec![oz::Port {
+                name: "REPLICATION".to_string(),
+                value: port as u32,
+            }],
+            ..Default::default()
+        }
+    }
+    let sources: Vec<oz::DatanodeDetailsAndReplicaIndexProto> = (1..5)
+        .map(|i| oz::DatanodeDetailsAndReplicaIndexProto {
+            datanode_details: oz_dd(&format!("dn-{i}"), dns[i].addr.port()),
+            replica_index: (i + 1) as i32,
+        })
+        .collect();
+    let cmd = oz::ScmCommandProto {
+        command_type: oz::scm_command_proto::Type::ReconstructEcContainersCommand as i32,
+        reconstruct_ec_containers_command_proto: Some(oz::ReconstructEcContainersCommandProto {
+            container_id: CONTAINER as i64,
+            sources,
+            targets: vec![oz_dd("dn-5", dns[5].addr.port())],
+            missing_container_indexes: vec![1u8],
+            ec_replication_config: oz::EcReplicationConfig {
+                data: 3,
+                parity: 2,
+                codec: "rs".to_string(),
+                ec_chunk_size: 8,
+            },
+            cmd_id: 1,
+        }),
+        ..Default::default()
+    };
+
+    let scm = CompliantScm::with_commands(vec![cmd]);
+    let record = scm.record();
+    let scm_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let scm_addr = scm_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(scm.into_server())
+            .serve_with_incoming(TcpListenerStream::new(scm_listener))
+            .await
+            .ok();
+    });
+    let reg = CompliantScmRegistration {
+        uuid: "dn-5".to_string(),
+        ip_address: "127.0.0.1".to_string(),
+        host_name: "h".to_string(),
+        data_port: dns[5].addr.port() as u32,
+        meta: dns[5].meta.clone(),
+        chunks: dns[5].chunks.clone(),
+        heartbeat_interval: Duration::from_millis(50),
+        repairs: None,
+    };
+    tokio::spawn(async move {
+        reg.run(format!("http://{scm_addr}")).await.ok();
+    });
+
+    // PROOF: poll the recorded heartbeats until one carries an INCREMENTAL report
+    // marking container CONTAINER, slot 1, CLOSED. The ICR rides the heartbeat AFTER
+    // the one that delivered the command, so a few ticks may pass first.
+    let mut announced = false;
+    for _ in 0..200 {
+        let found = record.lock().heartbeats.iter().any(|hb| {
+            hb.incremental_container_report.iter().any(|icr| {
+                icr.report.iter().any(|r| {
+                    r.container_id == CONTAINER as i64
+                        && r.state == oz::container_replica_proto::State::Closed as i32
+                        && r.replica_index == Some(1)
+                })
+            })
+        });
+        if found {
+            announced = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        announced,
+        "the datanode must announce the rebuilt replica to SCM as CLOSED (incremental report)"
+    );
+
+    for d in &dns {
+        d.handle.abort();
+        tokio::fs::remove_dir_all(&d.dir).await.ok();
+    }
+}

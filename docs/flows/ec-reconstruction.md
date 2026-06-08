@@ -104,6 +104,14 @@ not change the per-shard correctness (survivor-enum + min-length + decode).
    (a pre-existing container survives a rebuild failure — never deleted). All three were
    confirmed load-bearing by mutating the close / rollback / `we_created` guard and
    watching exactly the matching test fail.
+7. Convergence ICR (DONE): `reconstruct_announces_closed_replica_to_scm` — a compliant
+   ReconstructEC drives the loop, and a later heartbeat carries an INCREMENTAL report
+   marking the rebuilt replica `CLOSED` (slot 1). Load-bearing (disabling `report_state`
+   fails it).
+8. Empty-rebuild rollback (DONE): `reconstruct_rolls_back_empty_rebuild_no_spurious_replica`
+   — a fresh target offered `< k` survivors rebuilds nothing and the provisioned
+   container is rolled back (no empty replica is announced). Load-bearing (disabling the
+   `rebuilt.is_empty()` guard fails it).
 
 ## 6. B5 status (data-plane additions, Rust-native, all-Rust fleet)
 
@@ -120,9 +128,27 @@ not change the per-shard correctness (survivor-enum + min-length + decode).
   `ChunkStore::delete_container`, invoked only when `we_created`.
 - **[DONE]** `DnClient::list_blocks` survivor enumeration — exercised by every B4/B5
   test (the fresh target enumerates slots from the survivor peers).
-- **[DEFERRED]** Reporting the restored replica back to SCM (incremental container
-  report of the CLOSED/healed replica + clearing the scrubber latch) so SCM's replica
-  view converges — the self-heal loop's HA-completion signal. Tracked as the next step
-  after B5-lite; without it SCM keeps its last (UNHEALTHY / under-replicated) view.
+- **[DONE]** Reporting the restored replica back to SCM. After a successful rebuild
+  (and after a CloseContainer), the compliant loop emits an INCREMENTAL container
+  report (`report_state`) carrying the replica's CURRENT state — `CLOSED` for a fresh
+  whole replica — exactly mirroring real Ozone's `sendICR`-on-close. This is the
+  convergence signal: SCM keys replicas by `(containerID, datanodeID)` IGNORING state
+  ([V-source]: `ContainerReplica.equals` + `ContainerStateMap.put`), so a `CLOSED`
+  report OVERWRITES the prior `UNHEALTHY` entry. Verified against
+  `AbstractContainerReportHandler.processContainerReplica` (full and ICR share the
+  per-replica update path). Test: `reconstruct_announces_closed_replica_to_scm`. The
+  guard `if !locals.is_empty()` plus the empty-rebuild rollback ensures we never
+  announce a replica that holds no rebuilt data.
+- **[DEFERRED, low-risk]** Clearing the scrubber's rising-edge latch after an in-place
+  heal so a future re-rot of the same slot can be re-reported. Only matters for the
+  same-DN in-place model (FakeScm / bespoke loop); with a REAL SCM the reconstruction
+  target is a FRESH DN, the rotted replica is deleted by SCM, and its latch entry is
+  moot. Revisit when the bespoke loop is retired (B7).
+- **[DEFERRED]** Periodic FULL container report (real default 60m,
+  `hdds.container.report.interval`). Its unique value is RECONCILIATION — pruning
+  replicas SCM thinks exist on this DN but no longer do ([V-source]:
+  `ContainerReportHandler.processMissingReplicas`). Convergence-after-heal does NOT
+  need it (the ICR above suffices); we still want it for full compliance. We currently
+  send a full report only at registration.
 - **[N/A for self-rebuild]** `CreateContainerRequest.replica_index` — the target stamps
   its slot via the per-block `ReplicaIndex` on `put_block`, not a container field.
