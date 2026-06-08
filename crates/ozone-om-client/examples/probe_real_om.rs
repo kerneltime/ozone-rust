@@ -32,7 +32,8 @@ async fn main() {
     // Key lifecycle. EC needs 5 datanodes; a tiny single-DN cluster may only form a
     // RATIS pipeline, so try EC then fall back to the bucket default (None).
     println!("--- key lifecycle (EC-3-2, then bucket default) ---");
-    let ec = EcReplicationConfig::rs(3, 2, 1024);
+    // 1024 KiB cells: a chunk size in Ozone's allowed EC set (512|1024|2048|4096 k).
+    let ec = EcReplicationConfig::rs(3, 2, 1024 * 1024);
     let open = match om.create_key(&vol, bkt, "k1", Some(ec), 5).await {
         Ok(o) => {
             println!("[ok] create_key(EC): client_id={} blocks={}", o.client_id, o.blocks.len());
