@@ -1,4 +1,4 @@
-//! Generates Rust code from the three .proto files via tonic-build.
+//! Generates Rust code from the workspace .proto files via tonic-build.
 
 use std::path::PathBuf;
 
@@ -18,7 +18,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ozone_root = proto_root.join("ozone");
     let compile_inputs = [
         proto_root.join("datanode_gateway_v1.proto"),
-        proto_root.join("om_rust_gateway_v1.proto"),
         ozone_root.join("ScmServerDatanodeHeartbeatProtocol.proto"),
         ozone_root.join("OmClientProtocol.proto"),
     ];

@@ -3,12 +3,12 @@
 //! (vendored `ozone_grpc_types::hadoop::ozone`), the OM-side COMPLIANCE harness
 //! for the Rust S3 gateway's `OzoneOmClient`.
 //!
-//! This mirrors the bespoke [`crate::fake_om::FakeOm`] in-memory semantics — a
-//! bucket set, a key map keyed by `(volume, bucket, key)`, monotonic
+//! It models the in-memory object-store semantics directly against the real OM
+//! proto — a bucket set, a key map keyed by `(volume, bucket, key)`, monotonic
 //! `local_id`/`client_id` counters, and exactly ONE statically configured EC
-//! pipeline where `datanodes[i]` holds EC slot `i + 1` — but emits the ACTUAL OM
+//! pipeline where `datanodes[i]` holds EC slot `i + 1` — emitting the ACTUAL OM
 //! wire shapes (`OmRequest`/`OmResponse` multiplexed by `cmdType`, `KeyInfo`,
-//! `KeyLocation`, `hdds::Pipeline`) instead of the bespoke `om::gw::v1` ones.
+//! `KeyLocation`, `hdds::Pipeline`).
 //!
 //! # What this fixture is and is NOT
 //! - It is enough OM to drive the gateway's CORE path: bucket head/create/delete/
@@ -23,7 +23,7 @@
 //! - It performs NO placement, exclusion-list handling, or failover: every block
 //!   lands on the one configured pipeline.
 //!
-//! # Invariants (mirrors of `FakeOm`'s, restated for the real proto)
+//! # Invariants
 //! - W3 EC slot fidelity: the emitted [`hdds::Pipeline`] carries
 //!   `member_replica_indexes` PARALLEL to `members`, with
 //!   `member_replica_indexes[i] == i + 1`, because `datanodes[i]` holds EC slot
@@ -611,8 +611,8 @@ impl OzoneManagerService for CompliantOm {
             }
             Ok(oz::Type::CompleteMultiPartUpload) => {
                 // Stitch the upload's stored parts in the client-supplied order
-                // into the final key, then drop the upload. Validation order
-                // matches `FakeOm`: non-empty parts; strictly ascending part
+                // into the final key, then drop the upload. Validation order:
+                // non-empty parts; strictly ascending part
                 // numbers, no dups (INVALID_PART_ORDER); every named part present
                 // (INVALID_PART); every NON-LAST part >= 5 MiB (ENTITY_TOO_SMALL).
                 // The AWS multipart ETag is hex(md5(concat of the raw 16-byte

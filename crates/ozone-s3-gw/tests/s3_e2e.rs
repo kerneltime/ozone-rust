@@ -149,7 +149,7 @@ fn collect_chunk_files(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
 }
 
 /// Stand up 5 datanodes (RS-3-2, small 1 KiB cells so objects span several
-/// stripes) + a FakeOm pipeline + the gateway. Returns the gateway base URL and
+/// stripes) + the compliant OM fixture + the gateway. Returns the gateway base URL and
 /// the datanode handles (for fault injection + cleanup).
 async fn spawn_stack() -> (String, Vec<Datanode>) {
     spawn_stack_with_block_size(None).await
@@ -280,7 +280,7 @@ async fn s3_object_lifecycle_with_degraded_read() {
     }
 }
 
-/// Stand up 5 datanodes + one FakeOm, then TWO independent gateways over that
+/// Stand up 5 datanodes + one compliant OM fixture, then TWO independent gateways over that
 /// same OM. Returns `(base_a, base_b, dns)`. Used to prove multipart state lives
 /// in the OM, not in a gateway process.
 async fn spawn_two_gateways_over_one_om() -> (String, String, Vec<Datanode>) {
@@ -2089,7 +2089,7 @@ async fn s3_sdk_get_object_attributes() {
 
 /// Date-based conditional GETs (If-Modified-Since / If-Unmodified-Since) and the
 /// Last-Modified response header. Raw HTTP so exact statuses are observable; the
-/// object's mtime is FakeOm's fixed 2021-01-01.
+/// object's mtime is the OM fixture's fixed 2021-01-01.
 #[tokio::test]
 async fn s3_date_conditional_requests() {
     use aws_sdk_s3::primitives::ByteStream;

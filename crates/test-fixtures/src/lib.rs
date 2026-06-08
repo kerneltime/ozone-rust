@@ -7,4 +7,3 @@
 
 pub mod compliant_om;
 pub mod compliant_scm;
-pub mod fake_om;

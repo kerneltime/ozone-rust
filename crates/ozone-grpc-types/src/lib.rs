@@ -1,4 +1,4 @@
-//! Generated gRPC types for the three Ozone Rust services.
+//! Generated gRPC types for the Ozone Rust services.
 //!
 //! `tonic-build` runs in `build.rs` and emits one module per proto package.
 //! See `proto/` for the source `.proto` files and the Phase 3 Wire Protocol
@@ -10,15 +10,6 @@
 pub mod dn {
     pub mod v1 {
         tonic::include_proto!("org.apache.ozone.dn.v1");
-    }
-}
-
-/// OM <-> Rust Gateway protocol (package `org.apache.ozone.om.gw.v1`).
-pub mod om {
-    pub mod gw {
-        pub mod v1 {
-            tonic::include_proto!("org.apache.ozone.om.gw.v1");
-        }
     }
 }
 

@@ -36,7 +36,7 @@
 // a small Ok type (a `BlockLocation`, an EC config) trips `result_large_err`.
 // Boxing the error would just add an unbox at every call site for no real win;
 // the error type is intentionally `Status`-shaped (see the sibling
-// `ozone-scm-client` and `fake_om` precedents). Allow it module-wide.
+// `ozone-scm-client` precedent). Allow it module-wide.
 #![allow(clippy::result_large_err)]
 
 use std::str::FromStr;

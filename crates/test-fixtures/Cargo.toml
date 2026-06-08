@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Shared test fixtures: in-memory FakeOm + compliant SCM servers"
+description = "Shared test fixtures: in-memory compliant OM + compliant SCM servers"
 
 [dependencies]
 ozone-grpc-types = { path = "../ozone-grpc-types" }
