@@ -31,4 +31,14 @@ pub mod scm {
     }
 }
 
+/// Real Apache Ozone SCM <-> Datanode protocol, vendored VERBATIM from
+/// apache/ozone master (`StorageContainerDatanodeProtocolProtos` + `hdds.proto`,
+/// package `hadoop.hdds`). This is the compliant wire contract the Rust datanode
+/// speaks so the real SCM needs only a thin gRPC transport adapter.
+pub mod hadoop {
+    pub mod hdds {
+        tonic::include_proto!("hadoop.hdds");
+    }
+}
+
 pub mod conv;
