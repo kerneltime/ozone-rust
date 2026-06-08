@@ -10,7 +10,11 @@ description = "gRPC client for OmRustGatewayService"
 [dependencies]
 tonic = { workspace = true }
 ozone-grpc-types = { path = "../ozone-grpc-types" }
+ozone-types = { path = "../ozone-types" }
 thiserror = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+tokio-stream = { workspace = true }
+parking_lot = { workspace = true }
+test-fixtures = { path = "../test-fixtures" }

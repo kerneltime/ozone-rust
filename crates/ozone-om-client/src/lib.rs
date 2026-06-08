@@ -34,6 +34,8 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod compliant;
+
 use ozone_grpc_types::om::gw::v1::om_rust_gateway_service_client::OmRustGatewayServiceClient;
 use ozone_grpc_types::om::gw::v1::{
     AbortMultipartUploadRequest, AbortMultipartUploadResponse, AllocateBlockRequest,
