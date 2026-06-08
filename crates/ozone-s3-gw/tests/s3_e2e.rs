@@ -2373,3 +2373,140 @@ async fn s3_multi_block_exact_boundary() {
         tokio::fs::remove_dir_all(&d.dir).await.ok();
     }
 }
+
+/// Re-uploading the SAME part number must keep the latest body (S3 clients retry
+/// UploadPart on timeout, so this last-writer-wins path is load-bearing).
+#[tokio::test]
+async fn s3_multipart_reupload_same_part_keeps_latest() {
+    use aws_sdk_s3::primitives::ByteStream;
+    use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+
+    let (base, dns) = spawn_stack().await;
+    let s3 = s3_client(&base);
+    let create = s3.create_multipart_upload().bucket("bucket1").key("re.bin").send().await.expect("create");
+    let uid = create.upload_id().unwrap().to_string();
+
+    let aa = vec![0xAAu8; 5 * 1024 * 1024];
+    let bb = vec![0xBBu8; 5 * 1024 * 1024];
+    let tail = vec![0xCCu8; 1000];
+    // Upload part 1 as AA, then RE-upload part 1 as BB (must win).
+    let _ = s3.upload_part().bucket("bucket1").key("re.bin").upload_id(&uid).part_number(1)
+        .body(ByteStream::from(aa)).send().await.expect("upload AA");
+    let up_b = s3.upload_part().bucket("bucket1").key("re.bin").upload_id(&uid).part_number(1)
+        .body(ByteStream::from(bb.clone())).send().await.expect("re-upload BB");
+    let up_t = s3.upload_part().bucket("bucket1").key("re.bin").upload_id(&uid).part_number(2)
+        .body(ByteStream::from(tail.clone())).send().await.expect("upload tail");
+
+    s3.complete_multipart_upload().bucket("bucket1").key("re.bin").upload_id(&uid)
+        .multipart_upload(CompletedMultipartUpload::builder().set_parts(Some(vec![
+            CompletedPart::builder().part_number(1).e_tag(up_b.e_tag().unwrap_or_default()).build(),
+            CompletedPart::builder().part_number(2).e_tag(up_t.e_tag().unwrap_or_default()).build(),
+        ])).build())
+        .send().await.expect("complete");
+
+    let got = s3.get_object().bucket("bucket1").key("re.bin").send().await.expect("get");
+    let bytes = got.body.collect().await.unwrap().into_bytes();
+    let mut expected = bb.clone();
+    expected.extend_from_slice(&tail);
+    assert_eq!(bytes.len(), expected.len(), "re-upload length");
+    assert_eq!(bytes.as_ref(), &expected[..], "re-uploaded part 1 must be BB (latest), never AA");
+
+    for d in &dns {
+        d.handle.abort();
+        tokio::fs::remove_dir_all(&d.dir).await.ok();
+    }
+}
+
+/// EntityTooSmall boundary: a non-last part of EXACTLY 5 MiB must be accepted; one
+/// byte under must be rejected. Guards the `< MIN_PART_SIZE` check from an off-by-one
+/// flip to `<=` (which would reject every well-behaved client).
+#[tokio::test]
+async fn s3_multipart_entity_too_small_boundary() {
+    use aws_sdk_s3::primitives::ByteStream;
+    use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+
+    let (base, dns) = spawn_stack().await;
+    let s3 = s3_client(&base);
+    let min = 5 * 1024 * 1024usize;
+
+    // (a) exactly 5 MiB non-last + 1-byte tail -> complete SUCCEEDS.
+    let create = s3.create_multipart_upload().bucket("bucket1").key("eq.bin").send().await.expect("create");
+    let uid = create.upload_id().unwrap().to_string();
+    let u1 = s3.upload_part().bucket("bucket1").key("eq.bin").upload_id(&uid).part_number(1)
+        .body(ByteStream::from(vec![1u8; min])).send().await.expect("p1");
+    let u2 = s3.upload_part().bucket("bucket1").key("eq.bin").upload_id(&uid).part_number(2)
+        .body(ByteStream::from(vec![2u8; 1])).send().await.expect("p2");
+    s3.complete_multipart_upload().bucket("bucket1").key("eq.bin").upload_id(&uid)
+        .multipart_upload(CompletedMultipartUpload::builder().set_parts(Some(vec![
+            CompletedPart::builder().part_number(1).e_tag(u1.e_tag().unwrap_or_default()).build(),
+            CompletedPart::builder().part_number(2).e_tag(u2.e_tag().unwrap_or_default()).build(),
+        ])).build())
+        .send().await.expect("exactly-5-MiB non-last part must be accepted");
+    let got = s3.get_object().bucket("bucket1").key("eq.bin").send().await.expect("get");
+    assert_eq!(got.body.collect().await.unwrap().into_bytes().len(), min + 1);
+
+    // (b) 5 MiB - 1 non-last -> complete FAILS (EntityTooSmall).
+    let create = s3.create_multipart_upload().bucket("bucket1").key("sm.bin").send().await.expect("create");
+    let uid = create.upload_id().unwrap().to_string();
+    let s1 = s3.upload_part().bucket("bucket1").key("sm.bin").upload_id(&uid).part_number(1)
+        .body(ByteStream::from(vec![3u8; min - 1])).send().await.expect("s1");
+    let s2 = s3.upload_part().bucket("bucket1").key("sm.bin").upload_id(&uid).part_number(2)
+        .body(ByteStream::from(vec![4u8; 10])).send().await.expect("s2");
+    let r = s3.complete_multipart_upload().bucket("bucket1").key("sm.bin").upload_id(&uid)
+        .multipart_upload(CompletedMultipartUpload::builder().set_parts(Some(vec![
+            CompletedPart::builder().part_number(1).e_tag(s1.e_tag().unwrap_or_default()).build(),
+            CompletedPart::builder().part_number(2).e_tag(s2.e_tag().unwrap_or_default()).build(),
+        ])).build())
+        .send().await;
+    assert!(r.is_err(), "a non-last part one byte under 5 MiB must be EntityTooSmall");
+
+    for d in &dns {
+        d.handle.abort();
+        tokio::fs::remove_dir_all(&d.dir).await.ok();
+    }
+}
+
+/// ListObjectsV2 with max-keys=0 over a non-empty bucket must report
+/// IsTruncated=false with NO continuation token (a truncated-but-cursorless page
+/// would livelock a paginating client).
+#[tokio::test]
+async fn s3_list_max_keys_zero_is_not_truncated() {
+    let (base, dns) = spawn_stack().await;
+    let client: HttpClient = Client::builder(TokioExecutor::new()).build_http();
+    for k in ["a.bin", "b.bin", "c.bin"] {
+        let (st, _, _) = http(
+            &client,
+            Method::PUT,
+            format!("{base}/bucket1/{k}"),
+            Some("tester"),
+            Bytes::from_static(b"x"),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "PUT {k}");
+    }
+    let (st, _, body) = http(
+        &client,
+        Method::GET,
+        format!("{base}/bucket1?list-type=2&max-keys=0"),
+        Some("tester"),
+        Bytes::new(),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "list status");
+    let xml = String::from_utf8_lossy(&body);
+    assert!(xml.contains("<KeyCount>0</KeyCount>"), "KeyCount must be 0: {xml}");
+    assert!(xml.contains("<MaxKeys>0</MaxKeys>"), "MaxKeys 0: {xml}");
+    assert!(
+        xml.contains("<IsTruncated>false</IsTruncated>"),
+        "max-keys=0 must NOT be truncated: {xml}"
+    );
+    assert!(
+        !xml.contains("<NextContinuationToken>"),
+        "an empty page must carry no continuation token: {xml}"
+    );
+
+    for d in &dns {
+        d.handle.abort();
+        tokio::fs::remove_dir_all(&d.dir).await.ok();
+    }
+}

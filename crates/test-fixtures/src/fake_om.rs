@@ -447,13 +447,15 @@ impl OmRustGatewayService for FakeOm {
             entries.retain(|(name, _)| name.as_str() > token.as_str());
         }
 
-        // Truncate to max_keys; the token is the last returned entry's name.
-        let (is_truncated, next_continuation_token) = if entries.len() > max_keys {
-            let token = if max_keys == 0 {
-                String::new()
-            } else {
-                entries[max_keys - 1].0.clone()
-            };
+        // Truncate to max_keys; the token is the last returned entry's name. A
+        // max_keys of 0 is NOT "truncated": there is no last entry to use as a
+        // cursor, so reporting truncated-with-no-token would livelock a paginating
+        // client (AWS returns KeyCount=0, IsTruncated=false here).
+        let (is_truncated, next_continuation_token) = if max_keys == 0 {
+            entries.clear();
+            (false, String::new())
+        } else if entries.len() > max_keys {
+            let token = entries[max_keys - 1].0.clone();
             entries.truncate(max_keys);
             (true, token)
         } else {

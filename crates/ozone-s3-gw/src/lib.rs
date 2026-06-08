@@ -1361,6 +1361,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn delete_result_xml_reports_partial_failure() {
+        // A batch delete where one key fails must report the OTHERS as deleted and
+        // the failed one under <Error> (never <Deleted>) — so a client is never
+        // told an object was deleted that was not (a lost result on a destructive op).
+        let results = vec![
+            ("ok1".to_string(), None),
+            (
+                "a&b".to_string(), // also exercises xml escaping in the error branch
+                Some(("InternalError".to_string(), "backend exploded".to_string())),
+            ),
+            ("ok2".to_string(), None),
+        ];
+        let xml = delete_result_xml(&results, false);
+        assert!(xml.contains("<Deleted><Key>ok1</Key></Deleted>"), "{xml}");
+        assert!(xml.contains("<Deleted><Key>ok2</Key></Deleted>"), "{xml}");
+        assert!(
+            xml.contains(
+                "<Error><Key>a&amp;b</Key><Code>InternalError</Code><Message>backend exploded</Message></Error>"
+            ),
+            "failed key must render an escaped <Error>: {xml}"
+        );
+        assert!(
+            !xml.contains("<Deleted><Key>a&amp;b</Key>"),
+            "a failed key must NOT be reported deleted: {xml}"
+        );
+
+        // Quiet mode drops the <Deleted> successes but MUST still report errors.
+        let q = delete_result_xml(&results, true);
+        assert!(!q.contains("<Deleted>"), "quiet omits successes: {q}");
+        assert!(q.contains("<Error><Key>a&amp;b</Key>"), "quiet keeps errors: {q}");
+    }
+
+    #[test]
     fn iso8601_epoch_and_known_date() {
         assert_eq!(iso8601_millis(0), "1970-01-01T00:00:00.000Z");
         // 2021-01-01T00:00:00Z = 1609459200 s.
