@@ -332,6 +332,82 @@ mod tests {
         assert_eq!(got, obj, "inconsistent shard dropped and reconstructed exactly");
     }
 
+    /// Advance `combo` (a sorted k-subset of `0..n`) to the next combination in
+    /// lexicographic order; returns false when the last subset is passed.
+    fn next_combination(combo: &mut [usize], n: usize) -> bool {
+        let k = combo.len();
+        let mut i = k;
+        while i > 0 {
+            i -= 1;
+            if combo[i] < n - (k - i) {
+                combo[i] += 1;
+                for j in i + 1..k {
+                    combo[j] = combo[j - 1] + 1;
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    /// EXHAUSTIVE MDS recoverability: for each production EC profile, the object
+    /// must reconstruct from EVERY possible set of exactly `k` surviving shards
+    /// (i.e. every choice of which `p` to lose). This fully closes the
+    /// "any k distinct survivors invert; the Cauchy submatrix is never singular"
+    /// claim for the profiles we ship — by enumeration, not sampling.
+    #[test]
+    fn reconstruct_from_every_k_subset_per_profile() {
+        let profiles = [
+            Profile { data: 3, parity: 2, chunk_size: 16 },
+            Profile { data: 6, parity: 3, chunk_size: 16 },
+            Profile { data: 10, parity: 4, chunk_size: 16 },
+        ];
+        for profile in profiles {
+            let total = profile.total();
+            let k = profile.data;
+            // Several stripes plus a partial trailing stripe.
+            let len = 3 * profile.stripe_size() + profile.chunk_size + 5;
+            let data: Vec<u8> = (0..len).map(|i| (i * 31 + 7) as u8).collect();
+            let shards = encode_object(profile, &data).unwrap();
+
+            let mut combo: Vec<usize> = (0..k).collect();
+            let mut subsets = 0usize;
+            loop {
+                let present: std::collections::HashSet<usize> = combo.iter().copied().collect();
+                let views: Vec<Option<&[u8]>> = (0..total)
+                    .map(|i| {
+                        if !present.contains(&i) {
+                            None
+                        } else if i < k {
+                            Some(shards.data[i].as_slice())
+                        } else {
+                            Some(shards.parity[i - k].as_slice())
+                        }
+                    })
+                    .collect();
+                let recovered = decode_object(profile, len, &views)
+                    .unwrap_or_else(|e| panic!("k-subset {combo:?} failed to decode: {e}"));
+                assert_eq!(
+                    recovered, data,
+                    "profile k={} p={} failed for surviving subset {:?}",
+                    profile.data, profile.parity, combo
+                );
+                subsets += 1;
+                if !next_combination(&mut combo, total) {
+                    break;
+                }
+            }
+            // C(total, k) subsets: C(5,3)=10, C(9,6)=84, C(14,10)=1001.
+            let expected = match (k, total) {
+                (3, 5) => 10,
+                (6, 9) => 84,
+                (10, 14) => 1001,
+                _ => subsets,
+            };
+            assert_eq!(subsets, expected, "must cover every k-subset for k={k}, total={total}");
+        }
+    }
+
     #[test]
     fn happy_path_round_trip_full_and_partial() {
         for len in [0usize, 5, 24, 25, 48, 50, 100] {
