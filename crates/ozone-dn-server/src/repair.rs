@@ -9,6 +9,7 @@
 //! a *client of peers* (it reads survivors via [`DnClient`]). It never makes a
 //! loopback RPC to itself.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -17,8 +18,8 @@ use thiserror::Error;
 use ozone_dn_client::DnClient;
 use ozone_storage::{checksum, ChunkStore, MetaStore, StorageError};
 use ozone_types::{
-    BlockData, BlockId, ChecksumType, ChunkInfo, ContainerId, ContainerState, EcReplicationConfig,
-    LocalId, ReplicaIndex,
+    BlockData, BlockId, ChecksumType, ChunkInfo, ContainerId, ContainerInfo, ContainerState,
+    EcReplicationConfig, LocalId, ReplicaIndex,
 };
 
 /// Everything needed to rebuild one block group's missing shard(s) on this DN.
@@ -167,4 +168,145 @@ pub async fn reconstruct_and_persist(
         repaired.push(slot);
     }
     Ok(repaired)
+}
+
+/// What a real-protocol ReconstructEC command needs to rebuild THIS datanode's
+/// missing slot(s) for a container by enumerating block groups from the SURVIVORS
+/// (the compliant algorithm — see `docs/flows/ec-reconstruction.md`).
+pub struct ReconstructInput {
+    /// The container to reconstruct into.
+    pub container: ContainerId,
+    /// The container's EC config.
+    pub ec: EcReplicationConfig,
+    /// EC slots (1-indexed) this datanode must rebuild.
+    pub missing_slots: Vec<u8>,
+    /// Surviving peers as `(EC slot, "http://ip:port")`.
+    pub sources: Vec<(u8, String)>,
+}
+
+/// Reconstruct `input.missing_slots` for `input.container` the COMPLIANT way:
+/// enumerate every block group from the SURVIVORS (each holds one slot), derive
+/// each block group's length as `min(blockGroupLen)` across survivors (the
+/// partial-stripe correctness guarantee), decode the missing cells, and persist
+/// the rebuilt shard(s) locally (this datanode is the target). Provisions the
+/// container locally if absent — the legitimate whole-replica path, where a fresh
+/// target holds no metadata; refuses a present-but-non-Open container (no orphan).
+/// Returns the local ids rebuilt. Idempotent.
+pub async fn reconstruct_from_survivors(
+    meta: &Arc<dyn MetaStore>,
+    chunks: &Arc<dyn ChunkStore>,
+    input: ReconstructInput,
+) -> Result<Vec<u64>, RepairError> {
+    let profile = ozone_ec::Profile {
+        data: input.ec.data as usize,
+        parity: input.ec.parity as usize,
+        chunk_size: input.ec.ec_chunk_size as usize,
+    };
+    let total = profile.data + profile.parity;
+    let k = profile.data;
+
+    // Enumerate block groups from the survivors. local_id -> (shards[total], min len).
+    let mut shards: BTreeMap<u64, Vec<Option<Vec<u8>>>> = BTreeMap::new();
+    let mut lengths: BTreeMap<u64, u64> = BTreeMap::new();
+    for (slot, endpoint) in &input.sources {
+        let slot = *slot;
+        if slot == 0 || slot as usize > total || input.missing_slots.contains(&slot) {
+            continue;
+        }
+        let mut peer = match DnClient::connect(endpoint.clone()).await {
+            Ok(p) => p,
+            Err(_) => continue, // unreachable survivor: skip
+        };
+        let blocks = match peer.list_blocks(input.container, 0, 256).await {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        for bd in blocks {
+            let local = bd.block_id.local_id.0;
+            let Some(len) = bd.block_group_len() else {
+                continue;
+            };
+            if len == 0 {
+                continue;
+            }
+            // min(blockGroupLen) excludes a torn/garbage trailing write on a survivor.
+            lengths
+                .entry(local)
+                .and_modify(|m| *m = (*m).min(len))
+                .or_insert(len);
+            // verify=true: a survivor whose own shard is corrupt is dropped here.
+            let bslot = BlockId::ec(input.container, LocalId(local), ReplicaIndex::new(slot));
+            let probe = ChunkInfo {
+                chunk_name: "0".to_string(),
+                offset: 0,
+                len: 0,
+                checksum_data: None,
+                stripe_checksum: None,
+            };
+            if let Ok(bytes) = peer.read_chunk(&bslot, &probe, true).await {
+                shards
+                    .entry(local)
+                    .or_insert_with(|| vec![None; total])[slot as usize - 1] = Some(bytes.to_vec());
+            }
+        }
+    }
+
+    if shards.is_empty() {
+        return Ok(Vec::new()); // no survivor blocks -> nothing to rebuild
+    }
+
+    // Provision the target container: create it if absent (whole-replica rebuild),
+    // proceed if Open, refuse if present-but-non-Open (never orphan into it).
+    match meta.get_container(input.container).await? {
+        Some(ci) if ci.state.is_writable() => {}
+        Some(ci) => return Err(RepairError::ContainerNotWritable(input.container, ci.state)),
+        None => {
+            meta.create_container(ContainerInfo::new_open(input.container, input.ec))
+                .await?;
+        }
+    }
+
+    let mut rebuilt = Vec::new();
+    for (local, slot_bufs) in shards {
+        let Some(&len_u64) = lengths.get(&local) else {
+            continue;
+        };
+        let len = len_u64 as usize;
+        if slot_bufs.iter().filter(|o| o.is_some()).count() < k {
+            continue; // unrecoverable block group: skip, never write garbage
+        }
+        let views: Vec<Option<&[u8]>> = slot_bufs.iter().map(|o| o.as_deref()).collect();
+        let object = ozone_ec::stripe::decode_object(profile, len, &views)?;
+        let encoded = ozone_ec::stripe::encode_object(profile, &object)?;
+        for &slot in &input.missing_slots {
+            let s = slot as usize;
+            if s == 0 || s > total {
+                continue;
+            }
+            let shard: &[u8] = if s <= k {
+                &encoded.data[s - 1]
+            } else {
+                &encoded.parity[s - 1 - k]
+            };
+            let cd = checksum::compute(shard, input.ec.ec_chunk_size, ChecksumType::Crc32c)
+                .map_err(|e| RepairError::Checksum(e.to_string()))?;
+            let chunk = ChunkInfo {
+                chunk_name: "0".to_string(),
+                offset: 0,
+                len: shard.len() as u64,
+                checksum_data: Some(cd),
+                stripe_checksum: None,
+            };
+            let bslot = BlockId::ec(input.container, LocalId(local), ReplicaIndex::new(slot));
+            chunks
+                .write_chunk(&bslot, &chunk, Bytes::copy_from_slice(shard))
+                .await?;
+            let mut bd = BlockData::new(bslot);
+            bd.chunks.push(chunk);
+            bd.set_block_group_len(len_u64);
+            meta.put_block(&bd).await?;
+        }
+        rebuilt.push(local);
+    }
+    Ok(rebuilt)
 }

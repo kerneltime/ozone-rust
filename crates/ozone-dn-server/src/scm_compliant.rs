@@ -26,7 +26,7 @@ use thiserror::Error;
 use ozone_grpc_types::hadoop::hdds as oz;
 use ozone_scm_client::compliant::{OzoneScmClient, ScmError};
 use ozone_storage::{ChunkStore, MetaStore, StorageError};
-use ozone_types::{ContainerId, ContainerState, EcCodec, EcReplicationConfig, LocalId};
+use ozone_types::{ContainerId, ContainerState, EcCodec, EcReplicationConfig};
 
 use crate::repair;
 use crate::scrub::RepairRequest;
@@ -242,13 +242,13 @@ impl CompliantScmRegistration {
         }
     }
 
-    /// Execute a (real-shape) ReconstructEC command. B2: parse the compliant
-    /// command (sources carry their slot inline; `targets[i]` is paired with
-    /// `missingContainerIndexes[i]`) and reuse the existing in-place repair for the
-    /// slots assigned to THIS datanode. B4 replaces this with the
-    /// survivor-enumeration + min(blockGroupLen) coordinator algorithm.
+    /// Execute a real-shape ReconstructEC command for the slots assigned to THIS
+    /// datanode. Compliant algorithm: enumerate block groups from the SURVIVORS and
+    /// derive each length as `min(blockGroupLen)` (see
+    /// [`repair::reconstruct_from_survivors`]). `targets[i]` is paired with
+    /// `missingContainerIndexes[i]`; `sources` carry their slot inline + a
+    /// REPLICATION port.
     async fn handle_reconstruct(&self, cmd: oz::ReconstructEcContainersCommandProto) {
-        // Which missing slots am I responsible for? targets[i] <-> missing[i].
         let my_slots: Vec<u8> = cmd
             .targets
             .iter()
@@ -267,7 +267,6 @@ impl CompliantScmRegistration {
                 return;
             }
         };
-        // Survivor peers as (slot, endpoint), excluding any slot we rebuild.
         let sources: Vec<(u8, String)> = cmd
             .sources
             .iter()
@@ -286,74 +285,18 @@ impl CompliantScmRegistration {
             })
             .collect();
 
-        // B2 in-place repair: enumerate THIS DN's local blocks at my slots.
-        let work = match self.local_blocks_for_slots(container, &my_slots).await {
-            Ok(w) => w,
-            Err(e) => {
-                tracing::warn!(%container, "reconstruct: list local blocks failed: {e}");
-                return;
-            }
+        let input = repair::ReconstructInput {
+            container,
+            ec,
+            missing_slots: my_slots,
+            sources,
         };
-        for (local, len) in work {
-            if self.shard_is_intact(container, local, &my_slots).await {
-                continue;
+        match repair::reconstruct_from_survivors(&self.meta, &self.chunks, input).await {
+            Ok(locals) => {
+                tracing::info!(%container, groups = locals.len(), "reconstructed EC block groups from survivors")
             }
-            let input = repair::RepairInput {
-                container,
-                local,
-                ec,
-                block_group_len: len,
-                missing_slots: my_slots.clone(),
-                sources: sources.clone(),
-            };
-            match repair::reconstruct_and_persist(&self.meta, &self.chunks, input).await {
-                Ok(slots) => tracing::info!(%container, local = local.0, ?slots, "repaired EC shards"),
-                Err(e) => tracing::warn!(%container, local = local.0, "EC repair failed: {e}"),
-            }
+            Err(e) => tracing::warn!(%container, "EC reconstruction failed: {e}"),
         }
-    }
-
-    async fn local_blocks_for_slots(
-        &self,
-        container: ContainerId,
-        missing_slots: &[u8],
-    ) -> Result<Vec<(LocalId, u64)>, StorageError> {
-        let mut out = Vec::new();
-        let mut start = 0u64;
-        loop {
-            let page = self.meta.list_blocks(container, start, 256).await?;
-            for bd in &page.blocks {
-                if missing_slots.contains(&bd.block_id.replica_index.get()) {
-                    out.push((bd.block_id.local_id, bd.block_group_len().unwrap_or(0)));
-                }
-            }
-            match page.next_local_id {
-                Some(next) => start = next,
-                None => break,
-            }
-        }
-        Ok(out)
-    }
-
-    async fn shard_is_intact(&self, container: ContainerId, local: LocalId, slots: &[u8]) -> bool {
-        use ozone_storage::checksum;
-        use ozone_types::{BlockId, ReplicaIndex};
-        for &slot in slots {
-            let bslot = BlockId::ec(container, local, ReplicaIndex::new(slot));
-            let Ok(Some(bd)) = self.meta.get_block(&bslot).await else {
-                return false;
-            };
-            for chunk in &bd.chunks {
-                let Some(cd) = chunk.checksum_data.as_ref() else {
-                    continue;
-                };
-                match self.chunks.read_chunk(&bslot, chunk).await {
-                    Ok(bytes) if checksum::verify(&bytes, cd).is_ok() => {}
-                    _ => return false,
-                }
-            }
-        }
-        true
     }
 }
 

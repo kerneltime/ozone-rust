@@ -812,3 +812,99 @@ async fn repair_refuses_a_non_open_container_without_orphan_write() {
         tokio::fs::remove_dir_all(&d.dir).await.ok();
     }
 }
+
+// ---- B4: compliant survivor-enumeration reconstruction ----
+
+#[tokio::test]
+async fn reconstruct_wholly_lost_replica_from_survivors() {
+    // 6 datanodes; dns[0..5] hold EC slots 1..5, dns[5] is a FRESH target with no
+    // local data, rebuilding slot 1 from the survivors (slots 2..5) -- the case the
+    // in-place self-heal code literally cannot do.
+    let mut dns = Vec::new();
+    for i in 0..6 {
+        dns.push(spawn_dn(i).await);
+    }
+    let payload: Vec<u8> = (0..PAYLOAD_LEN).map(|i| (i * 3 + 1) as u8).collect();
+    let originals = seed_block_group(&dns, LOCAL, &payload).await;
+
+    let sources: Vec<(u8, String)> = (1..5)
+        .map(|i| ((i + 1) as u8, format!("http://{}", dns[i].addr)))
+        .collect(); // slots 2..5
+    let input = repair::ReconstructInput {
+        container: ContainerId(CONTAINER),
+        ec: ec(),
+        missing_slots: vec![1],
+        sources,
+    };
+    let rebuilt = repair::reconstruct_from_survivors(&dns[5].meta, &dns[5].chunks, input)
+        .await
+        .expect("reconstruct from survivors");
+    assert_eq!(rebuilt, vec![LOCAL]);
+
+    // The fresh target now holds slot 1, byte-identical, and verifies clean.
+    let mut t = DnClient::connect(format!("http://{}", dns[5].addr)).await.unwrap();
+    let (b, c) = verify_read(1);
+    let got = t
+        .read_chunk(&b, &c, true)
+        .await
+        .expect("rebuilt slot reads clean on the fresh target");
+    assert_eq!(
+        got.as_ref(),
+        &originals[0][..],
+        "wholly-lost replica rebuilt byte-identical from survivors"
+    );
+
+    for d in &dns {
+        d.handle.abort();
+        tokio::fs::remove_dir_all(&d.dir).await.ok();
+    }
+}
+
+#[tokio::test]
+async fn reconstruct_uses_min_block_group_len() {
+    // One survivor over-claims a LARGER block-group length (as if a torn trailing
+    // write recorded a wrong length). Reconstruction MUST use the MIN across
+    // survivors (the correct length), not the inflated value -- else the trailing
+    // partial stripe is silently corrupted.
+    let mut dns = Vec::new();
+    for i in 0..6 {
+        dns.push(spawn_dn(i).await);
+    }
+    let payload: Vec<u8> = (0..PAYLOAD_LEN).map(|i| (i * 5 + 2) as u8).collect();
+    let originals = seed_block_group(&dns, LOCAL, &payload).await;
+
+    // Inflate the recorded length on slot 2's survivor (dns[1]).
+    {
+        let bslot = BlockId::ec(ContainerId(CONTAINER), LocalId(LOCAL), ReplicaIndex::new(2));
+        let mut bd = dns[1].meta.get_block(&bslot).await.unwrap().unwrap();
+        bd.set_block_group_len(PAYLOAD_LEN as u64 + 100);
+        dns[1].meta.put_block(&bd).await.unwrap();
+    }
+
+    let sources: Vec<(u8, String)> = (1..5)
+        .map(|i| ((i + 1) as u8, format!("http://{}", dns[i].addr)))
+        .collect();
+    let input = repair::ReconstructInput {
+        container: ContainerId(CONTAINER),
+        ec: ec(),
+        missing_slots: vec![1],
+        sources,
+    };
+    repair::reconstruct_from_survivors(&dns[5].meta, &dns[5].chunks, input)
+        .await
+        .expect("reconstruct");
+
+    let mut t = DnClient::connect(format!("http://{}", dns[5].addr)).await.unwrap();
+    let (b, c) = verify_read(1);
+    let got = t.read_chunk(&b, &c, true).await.expect("rebuilt at min length reads clean");
+    assert_eq!(
+        got.as_ref(),
+        &originals[0][..],
+        "rebuilt using min(blockGroupLen) is byte-identical to the original slot 1"
+    );
+
+    for d in &dns {
+        d.handle.abort();
+        tokio::fs::remove_dir_all(&d.dir).await.ok();
+    }
+}
