@@ -7,6 +7,12 @@ license.workspace = true
 authors.workspace = true
 description = "tonic-build generated gRPC types for our three protos"
 
+# All code here is tonic/prost-generated. Disable doctests: vendored proto leading
+# comments (e.g. the real Ozone SCM service's ASCII state-diagram) become indented
+# Markdown code blocks that rustdoc otherwise tries to compile as Rust doctests.
+[lib]
+doctest = false
+
 [dependencies]
 tonic.workspace = true
 prost.workspace = true
