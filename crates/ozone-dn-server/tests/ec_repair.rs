@@ -908,3 +908,107 @@ async fn reconstruct_uses_min_block_group_len() {
         tokio::fs::remove_dir_all(&d.dir).await.ok();
     }
 }
+
+/// END-TO-END through the COMPLIANT command path: a real ReconstructECContainers
+/// command (byte-per-index missingContainerIndexes, positional targets, sources
+/// with inline replica_index + REPLICATION port) drives handle_reconstruct ->
+/// reconstruct_from_survivors on a FRESH target. Closes the verification's coverage
+/// gap on the safety-critical command-INTERPRETATION wiring (the algorithm is tested
+/// directly elsewhere; this proves the dispatch decodes the wire correctly).
+#[tokio::test]
+async fn compliant_reconstruct_command_rebuilds_target_slot() {
+    use ozone_dn_server::CompliantScmRegistration;
+    use ozone_grpc_types::hadoop::hdds as oz;
+    use test_fixtures::compliant_scm::CompliantScm;
+
+    let mut dns = Vec::new();
+    for i in 0..6 {
+        dns.push(spawn_dn(i).await);
+    }
+    let payload: Vec<u8> = (0..PAYLOAD_LEN).map(|i| (i * 3 + 1) as u8).collect();
+    let originals = seed_block_group(&dns, LOCAL, &payload).await; // slots 1..5 on dns[0..4]
+
+    fn oz_dd(uuid: &str, port: u16) -> oz::DatanodeDetailsProto {
+        oz::DatanodeDetailsProto {
+            uuid: Some(uuid.to_string()),
+            ip_address: "127.0.0.1".to_string(),
+            host_name: "h".to_string(),
+            ports: vec![oz::Port {
+                name: "REPLICATION".to_string(),
+                value: port as u32,
+            }],
+            ..Default::default()
+        }
+    }
+    // Survivors slots 2..5 on dns[1..4], with their REPLICATION (data) ports.
+    let sources: Vec<oz::DatanodeDetailsAndReplicaIndexProto> = (1..5)
+        .map(|i| oz::DatanodeDetailsAndReplicaIndexProto {
+            datanode_details: oz_dd(&format!("dn-{i}"), dns[i].addr.port()),
+            replica_index: (i + 1) as i32,
+        })
+        .collect();
+    let cmd = oz::ScmCommandProto {
+        command_type: oz::scm_command_proto::Type::ReconstructEcContainersCommand as i32,
+        reconstruct_ec_containers_command_proto: Some(oz::ReconstructEcContainersCommandProto {
+            container_id: CONTAINER as i64,
+            sources,
+            targets: vec![oz_dd("dn-5", dns[5].addr.port())],
+            missing_container_indexes: vec![1u8], // rebuild slot 1 on dns[5]
+            ec_replication_config: oz::EcReplicationConfig {
+                data: 3,
+                parity: 2,
+                codec: "rs".to_string(),
+                ec_chunk_size: 8,
+            },
+            cmd_id: 1,
+        }),
+        ..Default::default()
+    };
+
+    let scm = CompliantScm::with_commands(vec![cmd]);
+    let scm_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let scm_addr = scm_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(scm.into_server())
+            .serve_with_incoming(TcpListenerStream::new(scm_listener))
+            .await
+            .ok();
+    });
+    let reg = CompliantScmRegistration {
+        uuid: "dn-5".to_string(),
+        ip_address: "127.0.0.1".to_string(),
+        host_name: "h".to_string(),
+        data_port: dns[5].addr.port() as u32,
+        meta: dns[5].meta.clone(),
+        chunks: dns[5].chunks.clone(),
+        heartbeat_interval: Duration::from_millis(50),
+        repairs: None,
+    };
+    tokio::spawn(async move {
+        reg.run(format!("http://{scm_addr}")).await.ok();
+    });
+
+    let mut t = DnClient::connect(format!("http://{}", dns[5].addr)).await.unwrap();
+    let mut healed = None;
+    for _ in 0..150 {
+        let (b, c) = verify_read(1);
+        if let Ok(bytes) = t.read_chunk(&b, &c, true).await {
+            healed = Some(bytes);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let healed =
+        healed.expect("a compliant ReconstructEC command must drive handle_reconstruct to rebuild slot 1");
+    assert_eq!(
+        healed.as_ref(),
+        &originals[0][..],
+        "the compliant command path rebuilt slot 1 byte-identical on the fresh target"
+    );
+
+    for d in &dns {
+        d.handle.abort();
+        tokio::fs::remove_dir_all(&d.dir).await.ok();
+    }
+}
