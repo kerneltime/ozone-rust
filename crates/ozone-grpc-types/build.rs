@@ -18,7 +18,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let compile_inputs = [
         proto_root.join("datanode_gateway_v1.proto"),
         proto_root.join("om_rust_gateway_v1.proto"),
-        proto_root.join("scm_rust_datanode_v1.proto"),
         ozone_root.join("ScmServerDatanodeHeartbeatProtocol.proto"),
     ];
 

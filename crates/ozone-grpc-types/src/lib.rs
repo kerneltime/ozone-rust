@@ -22,15 +22,6 @@ pub mod om {
     }
 }
 
-/// SCM <-> Rust Datanode protocol (package `org.apache.ozone.scm.dn.v1`).
-pub mod scm {
-    pub mod dn {
-        pub mod v1 {
-            tonic::include_proto!("org.apache.ozone.scm.dn.v1");
-        }
-    }
-}
-
 /// Real Apache Ozone SCM <-> Datanode protocol, vendored VERBATIM from
 /// apache/ozone master (`StorageContainerDatanodeProtocolProtos` + `hdds.proto`,
 /// package `hadoop.hdds`). This is the compliant wire contract the Rust datanode

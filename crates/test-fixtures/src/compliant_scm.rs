@@ -2,8 +2,7 @@
 //! (vendored `ozone_grpc_types::hadoop::hdds`), used as the COMPLIANCE harness for
 //! the Rust datanode.
 //!
-//! Unlike [`crate::fake_scm`] (the bespoke Rust-native protocol), this validates
-//! the datanode against the ACTUAL Ozone wire contract:
+//! This validates the datanode against the ACTUAL Ozone wire contract:
 //! - ONE unary `submitRequest`, multiplexed by a `Type` discriminator (no streams);
 //! - `Register` carries all four reports inline; the response echoes the DN's own
 //!   uuid + the cluster id (no rename);

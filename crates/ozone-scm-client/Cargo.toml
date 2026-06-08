@@ -5,11 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "gRPC client for ScmRustDatanodeService"
+description = "gRPC client for the Apache Ozone SCM datanode protocol"
 
 [dependencies]
 tonic = { workspace = true }
-futures = { workspace = true }
 thiserror = { workspace = true }
 ozone-grpc-types = { path = "../ozone-grpc-types" }
 
