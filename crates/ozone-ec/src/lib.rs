@@ -100,6 +100,17 @@ pub enum EcError {
         /// Slots provided.
         got: usize,
     },
+    /// The profile is degenerate (`data == 0` or `chunk_size == 0`), so it cannot
+    /// describe a valid stripe layout. Returned rather than dividing by a zero
+    /// stripe size. Validated EC configs never hit this; the guard keeps the codec
+    /// a total function for any caller or fuzzer.
+    #[error("invalid EC profile: data={data}, chunk_size={chunk_size}")]
+    InvalidProfile {
+        /// Data shards `k`.
+        data: usize,
+        /// Per-cell byte size.
+        chunk_size: usize,
+    },
 }
 
 /// Reed-Solomon stripe encoder for a single profile.

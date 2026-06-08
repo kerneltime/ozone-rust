@@ -100,6 +100,12 @@ fn padded_cell(profile: Profile, len: usize, idx: usize, s: usize, shard: &[u8])
 /// Encode an object's bytes into `k` data shards (truncated) and `p` parity
 /// shards (`num_stripes * chunk_size` each).
 pub fn encode_object(profile: Profile, data: &[u8]) -> Result<EncodedShards, EcError> {
+    if profile.data == 0 || profile.chunk_size == 0 {
+        return Err(EcError::InvalidProfile {
+            data: profile.data,
+            chunk_size: profile.chunk_size,
+        });
+    }
     let k = profile.data;
     let p = profile.parity;
     let c = profile.chunk_size;
@@ -176,6 +182,12 @@ pub fn decode_object(
     len: usize,
     shards: &[Option<&[u8]>],
 ) -> Result<Vec<u8>, EcError> {
+    if profile.data == 0 || profile.chunk_size == 0 {
+        return Err(EcError::InvalidProfile {
+            data: profile.data,
+            chunk_size: profile.chunk_size,
+        });
+    }
     let k = profile.data;
     let total = profile.total();
     if shards.len() != total {
@@ -510,24 +522,24 @@ mod tests {
         /// truncation).
         #[test]
         fn decode_never_panics_on_arbitrary_inputs(
-            profile_idx in 0usize..3,
+            data_k in 0usize..11,
+            parity_p in 0usize..5,
+            chunk in 0usize..40,
             len in 0usize..5000,
             raw in proptest::collection::vec(
                 proptest::option::of(
                     proptest::collection::vec(proptest::prelude::any::<u8>(), 0usize..200)
                 ),
-                14,
+                16,
             ),
         ) {
-            let profiles = [
-                Profile { data: 3, parity: 2, chunk_size: 16 },
-                Profile { data: 6, parity: 3, chunk_size: 16 },
-                Profile { data: 10, parity: 4, chunk_size: 16 },
-            ];
-            let profile = profiles[profile_idx];
+            // Fuzz the PROFILE too -- including degenerate (data=0 / chunk_size=0)
+            // ones, which must be a graceful InvalidProfile error, never a
+            // divide-by-zero in num_stripes.
+            let profile = Profile { data: data_k, parity: parity_p, chunk_size: chunk };
             let total = profile.total();
             let views: Vec<Option<&[u8]>> = (0..total).map(|i| raw[i].as_deref()).collect();
-            // A panic (e.g. an out-of-bounds slice) fails the proptest.
+            // A panic (OOB slice or divide-by-zero) fails the proptest.
             if let Ok(obj) = decode_object(profile, len, &views) {
                 proptest::prop_assert_eq!(obj.len(), len, "a successful decode must yield exactly len bytes");
             }
