@@ -466,6 +466,10 @@ impl OzoneOmClient {
         let mut req = self.envelope(oz::Type::ListBuckets);
         req.list_buckets_request = Some(oz::ListBucketsRequest {
             volume_name: volume.to_string(),
+            // The real OM treats a missing/zero `count` as "return nothing" — it is the
+            // per-request result cap. Request a generous page so all S3 buckets in the
+            // volume come back (there is no per-volume bucket pagination at this layer).
+            count: Some(1024),
             ..Default::default()
         });
         let resp = Self::check(self.inner.submit_request(req).await?.into_inner())?;
