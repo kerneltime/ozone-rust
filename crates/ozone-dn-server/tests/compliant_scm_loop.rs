@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use ozone_dn_server::scrub::Scrubber;
 use ozone_dn_server::CompliantScmRegistration;
 use ozone_fjall_store::FjallMetaStore;
 use ozone_grpc_types::hadoop::hdds as oz;
@@ -150,5 +151,127 @@ async fn registers_compliantly_and_executes_close_container() {
     );
 
     drop(rec);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+fn reg_for(
+    uuid: &str,
+    meta: Arc<dyn MetaStore>,
+    chunks: Arc<dyn ChunkStore>,
+    repairs: Option<tokio::sync::mpsc::Receiver<ozone_dn_server::scrub::RepairRequest>>,
+) -> CompliantScmRegistration {
+    CompliantScmRegistration {
+        uuid: uuid.to_string(),
+        ip_address: "127.0.0.1".to_string(),
+        host_name: "host".to_string(),
+        data_port: 19864,
+        meta,
+        chunks,
+        heartbeat_interval: Duration::from_millis(50),
+        repairs,
+    }
+}
+
+/// A scrubber finding must surface as an UNHEALTHY INCREMENTAL container report on
+/// the heartbeat (not a separate RPC), with the corrupt shard's 1-based slot.
+#[tokio::test]
+async fn scrubber_finding_becomes_unhealthy_incremental_report() {
+    let dir = std::env::temp_dir().join(format!("ozone-compliant-icr-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let meta: Arc<dyn MetaStore> = Arc::new(FjallMetaStore::open(dir.join("meta")).unwrap());
+    let chunks: Arc<dyn ChunkStore> = Arc::new(FileChunkStore::new(dir.join("data")));
+    let container = ContainerId(9);
+    seed(&meta, &chunks, container, 2).await; // this DN holds slot 2
+
+    // Corrupt the shard on disk so the scrubber flags it.
+    let path = dir.join("data").join("9").join("chunks").join("1_2_0");
+    let mut b = std::fs::read(&path).unwrap();
+    b[0] ^= 0xFF;
+    std::fs::write(&path, &b).unwrap();
+
+    let scm = CompliantScm::new();
+    let record = scm.record();
+    let endpoint = serve(scm).await;
+
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+    let scrubber = Scrubber::new(meta.clone(), chunks.clone());
+    tokio::spawn(async move {
+        scrubber.run(Duration::from_millis(25), tx).await;
+    });
+    let reg = reg_for("dn-1", meta.clone(), chunks.clone(), Some(rx));
+    tokio::spawn(async move {
+        reg.run(endpoint).await.ok();
+    });
+
+    let mut found = false;
+    for _ in 0..200 {
+        {
+            let rec = record.lock();
+            found = rec.heartbeats.iter().any(|h| {
+                h.incremental_container_report.iter().any(|icr| {
+                    icr.report.iter().any(|r| {
+                        r.container_id == container.0 as i64
+                            && r.state == oz::container_replica_proto::State::Unhealthy as i32
+                            && r.replica_index == Some(2)
+                    })
+                })
+            });
+        }
+        if found {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        found,
+        "the scrubber's bit-rot finding must ride the heartbeat as an UNHEALTHY incremental report for slot 2"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// An unknown command type must be ignored without stalling the loop, and a
+/// DeleteContainer must reclaim the container (metadata + chunks).
+#[tokio::test]
+async fn unknown_command_ignored_then_delete_executes() {
+    let dir = std::env::temp_dir().join(format!("ozone-compliant-del-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let meta: Arc<dyn MetaStore> = Arc::new(FjallMetaStore::open(dir.join("meta")).unwrap());
+    let chunks: Arc<dyn ChunkStore> = Arc::new(FileChunkStore::new(dir.join("data")));
+    let container = ContainerId(11);
+    seed(&meta, &chunks, container, 1).await;
+
+    // An unknown command (type 0) FOLLOWED by a real DeleteContainer in the queue.
+    let unknown = oz::ScmCommandProto {
+        command_type: oz::scm_command_proto::Type::UnknownScmCommand as i32,
+        ..Default::default()
+    };
+    let del = oz::ScmCommandProto {
+        command_type: oz::scm_command_proto::Type::DeleteContainerCommand as i32,
+        delete_container_command_proto: Some(oz::DeleteContainerCommandProto {
+            container_id: container.0 as i64,
+            cmd_id: 2,
+            force: false,
+            replica_index: Some(1),
+        }),
+        ..Default::default()
+    };
+    let endpoint = serve(CompliantScm::with_commands(vec![unknown, del])).await;
+    let reg = reg_for("dn-1", meta.clone(), chunks.clone(), None);
+    tokio::spawn(async move {
+        reg.run(endpoint).await.ok();
+    });
+
+    let mut gone = false;
+    for _ in 0..150 {
+        if meta.get_container(container).await.unwrap().is_none() {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        gone,
+        "the unknown command must not stall the loop; the DeleteContainer must reclaim the container"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }

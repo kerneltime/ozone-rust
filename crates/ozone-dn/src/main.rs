@@ -19,9 +19,8 @@ use std::time::Duration;
 
 use ozone_config::DatanodeConfig;
 use ozone_dn_server::scrub::Scrubber;
-use ozone_dn_server::{DatanodeService, ScmRegistration};
+use ozone_dn_server::{CompliantScmRegistration, DatanodeService};
 use ozone_fjall_store::FjallMetaStore;
-use ozone_grpc_types::scm::dn::v1 as scm;
 use ozone_observability::{init_tracing, TracingOptions};
 use ozone_storage::FileChunkStore;
 use ozone_types::DatanodeUuid;
@@ -49,16 +48,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // UNHEALTHY so SCM issues a ReconstructEC the datanode then heals — the closed
     // self-heal loop.
     let (repair_tx, repair_rx) = tokio::sync::mpsc::channel(64);
-    let reg = ScmRegistration {
-        datanode_id: scm::DatanodeId {
-            uuid: uuid.to_string(),
-            ip_address: cfg.listen_addr.ip().to_string(),
-            host_name: hostname(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            setup_time_ms: 0,
-            // The data-plane gRPC port, so SCM can route EC-repair reads to this DN.
-            gateway_port: cfg.listen_addr.port() as u32,
-        },
+    // The COMPLIANT control loop: speaks the real Ozone StorageContainerDatanode
+    // protocol (unary submitRequest poll), so the real SCM needs only a gRPC
+    // transport adapter. The data-plane port is advertised as a REPLICATION port.
+    let reg = CompliantScmRegistration {
+        uuid: uuid.to_string(),
+        ip_address: cfg.listen_addr.ip().to_string(),
+        host_name: hostname(),
+        data_port: cfg.listen_addr.port() as u32,
         meta: meta.clone(),
         chunks: chunks.clone(),
         heartbeat_interval: cfg.heartbeat_interval,
