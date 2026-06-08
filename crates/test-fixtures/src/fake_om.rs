@@ -63,8 +63,7 @@
 //! `commit_key` receives the gateway-computed ETag as raw bytes. We store it in
 //! the key's `metadata` under the literal key `"ETAG"` as a UTF-8 *lossy*
 //! string (matching how the real OM surfaces it via `OmKeyInfoLite.metadata`),
-//! and we also merge any request-supplied metadata. `copy_key` reads the ETag
-//! back out of that metadata entry and returns it as bytes.
+//! and we also merge any request-supplied metadata.
 
 use std::collections::{BTreeMap, HashMap};
 use std::pin::Pin;
@@ -548,62 +547,6 @@ impl OmRustGatewayService for FakeOm {
         let tuple = key_tuple(&req.into_inner().vbk)?;
         self.state.lock().keys.remove(&tuple);
         Ok(Response::new(pb::DeleteKeyResponse {}))
-    }
-
-    /// Server-side copy: clone the source key's metadata under `dest`.
-    ///
-    /// Returns `NotFound` if the source is absent. The destination inherits the
-    /// source's size, locations, ec_config, and metadata (ETag included); only
-    /// its `vbk` is rewritten to `dest`. The response carries the copied size
-    /// and the source ETag bytes (decoded back from `metadata["ETAG"]`).
-    async fn copy_key(
-        &self,
-        req: Request<pb::CopyKeyRequest>,
-    ) -> Result<Response<pb::CopyKeyResponse>, Status> {
-        let req = req.into_inner();
-        let src_tuple = key_tuple(&req.source)?;
-        let dest = req
-            .dest
-            .ok_or_else(|| Status::invalid_argument("missing dest"))?;
-        let dest_tuple = (
-            dest.volume_name.clone(),
-            dest.bucket_name.clone(),
-            dest.key_name.clone(),
-        );
-
-        let mut st = self.state.lock();
-        let mut info = st
-            .keys
-            .get(&src_tuple)
-            .cloned()
-            .ok_or_else(|| Status::not_found(format!("source key not found: {}", src_tuple.2)))?;
-        let size = info.data_size;
-        let etag = info
-            .metadata
-            .get(ETAG_METADATA_KEY)
-            .map(|s| s.as_bytes().to_vec())
-            .unwrap_or_default();
-        info.vbk = Some(dest);
-        // metadata-directive=REPLACE: drop the source's user metadata (Content-Type
-        // + x-amz-meta-*), keep the ETag and (for now) the tags, then apply the
-        // request's user metadata.
-        if req.replace_metadata {
-            info.metadata
-                .retain(|k, _| k == ETAG_METADATA_KEY || k.starts_with("x-amz-tag-"));
-            for (k, v) in req.metadata {
-                info.metadata.insert(k, v);
-            }
-        }
-        // tagging-directive=REPLACE: drop cloned tags, apply the request's.
-        if req.replace_tags {
-            info.metadata.retain(|k, _| !k.starts_with("x-amz-tag-"));
-            for tag in req.tags {
-                info.metadata.insert(format!("x-amz-tag-{}", tag.key), tag.value);
-            }
-        }
-        st.keys.insert(dest_tuple, info);
-
-        Ok(Response::new(pb::CopyKeyResponse { size, etag }))
     }
 
     /// Replace the object's full tag set. Tags are stored in the key metadata

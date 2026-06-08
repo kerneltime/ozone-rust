@@ -2510,3 +2510,57 @@ async fn s3_list_max_keys_zero_is_not_truncated() {
         tokio::fs::remove_dir_all(&d.dir).await.ok();
     }
 }
+
+/// CODE BUG #2 regression: a server-side CopyObject must be INDEPENDENT of its
+/// source. After copy, deleting the source must leave the copy fully intact.
+/// (Pre-fix the copy shared the source's physical blocks, so deleting the source
+/// destroyed the copy -- deterministic data loss.)
+#[tokio::test]
+async fn s3_copy_then_delete_source_keeps_dest() {
+    use aws_sdk_s3::primitives::ByteStream;
+
+    let (base, dns) = spawn_stack().await;
+    let s3 = s3_client(&base);
+    let body: Vec<u8> = (0..8000u32).map(|i| (i % 251) as u8).collect();
+    s3.put_object()
+        .bucket("bucket1")
+        .key("src.bin")
+        .body(ByteStream::from(body.clone()))
+        .send()
+        .await
+        .expect("put src");
+
+    s3.copy_object()
+        .bucket("bucket1")
+        .key("copy.bin")
+        .copy_source("bucket1/src.bin")
+        .send()
+        .await
+        .expect("copy");
+    let got = s3.get_object().bucket("bucket1").key("copy.bin").send().await.expect("get copy");
+    assert_eq!(
+        got.body.collect().await.unwrap().into_bytes().as_ref(),
+        &body[..],
+        "the copy must equal the source"
+    );
+
+    // Delete the SOURCE; the copy must remain intact (its own blocks).
+    s3.delete_object().bucket("bucket1").key("src.bin").send().await.expect("delete src");
+    let got2 = s3
+        .get_object()
+        .bucket("bucket1")
+        .key("copy.bin")
+        .send()
+        .await
+        .expect("get copy after deleting source");
+    assert_eq!(
+        got2.body.collect().await.unwrap().into_bytes().as_ref(),
+        &body[..],
+        "the copy must survive deletion of its source"
+    );
+
+    for d in &dns {
+        d.handle.abort();
+        tokio::fs::remove_dir_all(&d.dir).await.ok();
+    }
+}

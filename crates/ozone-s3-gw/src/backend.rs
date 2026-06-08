@@ -545,29 +545,44 @@ impl Gateway {
         principal: &str,
         directives: CopyDirectives,
     ) -> Result<(String, u64), GatewayError> {
-        match self
-            .om()
-            .copy_key(om::CopyKeyRequest {
-                source: Some(vbk(src_bucket, src_key)),
-                dest: Some(vbk(dest_bucket, dest_key)),
-                auth: Some(auth(principal)),
-                replace_metadata: directives.replace_metadata,
-                metadata: directives.metadata,
-                replace_tags: directives.replace_tags,
-                tags: directives
-                    .tags
-                    .into_iter()
-                    .map(|(key, value)| om::Tag { key, value })
-                    .collect(),
-            })
-            .await
-        {
-            Ok(resp) => Ok((String::from_utf8_lossy(&resp.etag).into_owned(), resp.size)),
-            Err(OmClientError::Rpc(s)) if s.code() == tonic::Code::NotFound => {
-                Err(GatewayError::NoSuchKey)
+        // Deep copy: read the source object and write FRESH EC blocks for the
+        // destination, so the copy is fully INDEPENDENT of the source (AWS S3
+        // semantics). A metadata-only copy that shared the source's block ids would
+        // let a later DELETE of the source destroy the copy -- silent data loss.
+        // The data duplication happens here at the gateway; the OM stores only
+        // metadata.
+        let (body, _src_etag, src_metadata, _mod_ms) =
+            self.get_object(src_bucket, src_key, principal).await?;
+        let size = body.len() as u64;
+
+        // Split the source's stored metadata into user metadata and tags (tags live
+        // as TAG_META_PREFIX-prefixed entries) so the metadata- and tagging-
+        // directives apply independently, exactly as S3 does.
+        let mut user_meta = HashMap::new();
+        let mut src_tags = Vec::new();
+        for (k, v) in src_metadata {
+            match k.strip_prefix(TAG_META_PREFIX) {
+                Some(tag_key) => src_tags.push((tag_key.to_string(), v)),
+                None => {
+                    user_meta.insert(k, v);
+                }
             }
-            Err(e) => Err(e.into()),
         }
+        let metadata = if directives.replace_metadata {
+            directives.metadata
+        } else {
+            user_meta
+        };
+        let tags = if directives.replace_tags {
+            directives.tags
+        } else {
+            src_tags
+        };
+
+        let etag = self
+            .put_object(dest_bucket, dest_key, principal, body, metadata, tags)
+            .await?;
+        Ok((etag, size))
     }
 
     /// PUT object tagging: replace the object's full tag set. Tags are persisted

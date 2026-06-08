@@ -39,7 +39,7 @@ use ozone_grpc_types::om::gw::v1::{
     AbortMultipartUploadRequest, AbortMultipartUploadResponse, AllocateBlockRequest,
     AllocateBlockResponse, CommitKeyRequest, CommitKeyResponse, CommitMultipartPartRequest,
     CommitMultipartPartResponse, CompleteMultipartUploadRequest,
-    CompleteMultipartUploadResponse, CopyKeyRequest, CopyKeyResponse, CreateBucketRequest,
+    CompleteMultipartUploadResponse, CreateBucketRequest,
     CreateBucketResponse, CreateKeyRequest, CreateKeyResponse, DeleteBucketRequest,
     DeleteBucketResponse, DeleteKeyRequest, DeleteKeyResponse, HeadBucketRequest, HeadBucketResponse,
     ListBucketsRequest, ListBucketsResponse,
@@ -213,13 +213,6 @@ impl OmClient {
         Ok(self.inner.delete_key(req).await?.into_inner())
     }
 
-    /// `CopyKey` — server-side copy from a source key to a destination key.
-    pub async fn copy_key(
-        &mut self,
-        req: CopyKeyRequest,
-    ) -> Result<CopyKeyResponse, OmClientError> {
-        Ok(self.inner.copy_key(req).await?.into_inner())
-    }
 
     /// `PutObjectTagging` — replace an object's full tag set.
     pub async fn put_object_tagging(
