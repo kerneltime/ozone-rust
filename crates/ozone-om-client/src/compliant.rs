@@ -9,10 +9,15 @@
 //! types; do not let those leak past this module.
 //!
 //! # Scope
-//! The CORE path only: bucket head/create/delete/list and the key write/read/
-//! delete cycle (`create_key` -> `allocate_block`* -> `commit_key`, then
-//! `get_key_info` / `delete_key`). Multipart and key listing are out of scope
-//! here (a later increment).
+//! The full S3-object surface the gateway needs:
+//! - The CORE path: bucket head/create/delete/list and the key write/read/delete
+//!   cycle (`create_key` -> `allocate_block`* -> `commit_key`, then
+//!   `get_key_info` / `delete_key`).
+//! - Multipart: `initiate_multipart` -> `create_multipart_part_key` ->
+//!   `commit_part` -> `complete_multipart` (or `abort_multipart`), plus
+//!   `list_parts` and `list_multipart_uploads`.
+//! - Key listing (`list_keys`) and object tagging (`get_object_tagging` /
+//!   `put_object_tagging`).
 //!
 //! # Invariants enforced here
 //! - **W1 status-checked.** [`OzoneOmClient::check`] rejects any non-OK
@@ -102,6 +107,40 @@ pub struct KeyMeta {
     pub blocks: Vec<BlockLocation>,
 }
 
+/// One entry of [`OzoneOmClient::list_keys`]: a committed object's name, size,
+/// and ETag. The gateway shapes this into an S3 `ListObjectsV2` `Contents` item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyListing {
+    /// The object's key name.
+    pub key: String,
+    /// Object size in bytes.
+    pub size: u64,
+    /// The object ETag, from `metadata["ETAG"]` if present.
+    pub etag: Option<String>,
+}
+
+/// One entry of [`OzoneOmClient::list_parts`]: a previously committed multipart
+/// part. The gateway shapes this into an S3 `ListParts` `Part` element.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartListing {
+    /// 1-based part number.
+    pub part_number: u32,
+    /// The part's S3 ETag (per-part MD5 as lowercase hex), if the OM recorded one.
+    pub etag: Option<String>,
+    /// Part size in bytes.
+    pub size: u64,
+}
+
+/// One entry of [`OzoneOmClient::list_multipart_uploads`]: an in-flight upload's
+/// key and id. The gateway shapes this into an S3 `ListMultipartUploads` upload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadListing {
+    /// The key the upload targets.
+    pub key: String,
+    /// The OM's upload id for this in-flight upload.
+    pub upload_id: String,
+}
+
 /// Errors returned by [`OzoneOmClient`].
 #[derive(Debug, thiserror::Error)]
 pub enum OmError {
@@ -122,6 +161,26 @@ pub enum OmError {
     /// The OM reported `BUCKET_NOT_FOUND` (S3 `NoSuchBucket`).
     #[error("bucket not found")]
     BucketNotFound,
+
+    /// The OM reported `NO_SUCH_MULTIPART_UPLOAD_ERROR` (S3 `NoSuchUpload`): a
+    /// commit/complete/list against an upload id the OM does not know.
+    #[error("no such multipart upload")]
+    NoSuchUpload,
+
+    /// The OM reported `INVALID_PART` (S3 `InvalidPart`): a completed part number
+    /// names a part that was never uploaded.
+    #[error("invalid multipart part")]
+    InvalidPart,
+
+    /// The OM reported `INVALID_PART_ORDER` (S3 `InvalidPartOrder`): the completed
+    /// part numbers are not strictly ascending / contain duplicates.
+    #[error("invalid multipart part order")]
+    InvalidPartOrder,
+
+    /// The OM reported `ENTITY_TOO_SMALL` (S3 `EntityTooSmall`): a non-last
+    /// multipart part is below the 5 MiB minimum.
+    #[error("multipart part too small")]
+    EntityTooSmall,
 
     /// The OM reported some other non-OK application status. Carries the 1-based
     /// `Status` code and the OM's message for the caller to classify.
@@ -332,6 +391,18 @@ impl OzoneOmClient {
         }
         if resp.status == oz::Status::BucketNotFound as i32 {
             return Err(OmError::BucketNotFound);
+        }
+        if resp.status == oz::Status::NoSuchMultipartUploadError as i32 {
+            return Err(OmError::NoSuchUpload);
+        }
+        if resp.status == oz::Status::InvalidPart as i32 {
+            return Err(OmError::InvalidPart);
+        }
+        if resp.status == oz::Status::InvalidPartOrder as i32 {
+            return Err(OmError::InvalidPartOrder);
+        }
+        if resp.status == oz::Status::EntityTooSmall as i32 {
+            return Err(OmError::EntityTooSmall);
         }
         Err(OmError::Om {
             status: resp.status,
@@ -578,6 +649,378 @@ impl OzoneOmClient {
                 ..Default::default()
             },
         });
+        let resp = self.inner.submit_request(req).await?.into_inner();
+        Self::check(resp)?;
+        Ok(())
+    }
+
+    /// `InitiateMultiPartUpload` — begin a multipart upload, returning the OM's
+    /// `multipart_upload_id`. The OM owns the in-flight upload from here until
+    /// [`Self::complete_multipart`] or [`Self::abort_multipart`].
+    pub async fn initiate_multipart(
+        &mut self,
+        volume: &str,
+        bucket: &str,
+        key: &str,
+    ) -> Result<String, OmError> {
+        let mut req = self.envelope(oz::Type::InitiateMultiPartUpload);
+        req.initiate_multi_part_upload_request = Some(oz::MultipartInfoInitiateRequest {
+            key_args: oz::KeyArgs {
+                volume_name: volume.to_string(),
+                bucket_name: bucket.to_string(),
+                key_name: key.to_string(),
+                ..Default::default()
+            },
+        });
+        let resp = Self::check(self.inner.submit_request(req).await?.into_inner())?;
+        let mp = resp
+            .initiate_multi_part_upload_response
+            .ok_or(OmError::Missing("initiate_multi_part_upload_response"))?;
+        Ok(mp.multipart_upload_id)
+    }
+
+    /// `CreateKey` for one multipart part — open a per-part write session under
+    /// `upload_id`/`part_number`, returning the open-session id and pre-allocated
+    /// block(s). This is the normal `CreateKey` with the multipart flags set
+    /// (`is_multipart_key`, `multipart_upload_id`, `multipart_number`); the OM
+    /// pre-allocates a block exactly as for a plain key.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_multipart_part_key(
+        &mut self,
+        volume: &str,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        part_number: u32,
+        ec: Option<EcReplicationConfig>,
+        size: u64,
+    ) -> Result<OpenKey, OmError> {
+        let mut key_args = oz::KeyArgs {
+            volume_name: volume.to_string(),
+            bucket_name: bucket.to_string(),
+            key_name: key.to_string(),
+            data_size: Some(size),
+            is_multipart_key: Some(true),
+            multipart_upload_id: Some(upload_id.to_string()),
+            multipart_number: Some(part_number),
+            ..Default::default()
+        };
+        if let Some(ec) = ec {
+            key_args.r#type = Some(hdds::ReplicationType::Ec as i32);
+            key_args.ec_replication_config = Some(hdds::EcReplicationConfig {
+                data: ec.data as i32,
+                parity: ec.parity as i32,
+                codec: ec.codec.to_string(),
+                ec_chunk_size: ec.ec_chunk_size as i32,
+            });
+        }
+        let mut req = self.envelope(oz::Type::CreateKey);
+        req.create_key_request = Some(oz::CreateKeyRequest {
+            key_args,
+            ..Default::default()
+        });
+        let resp = Self::check(self.inner.submit_request(req).await?.into_inner())?;
+        let ck = resp
+            .create_key_response
+            .ok_or(OmError::Missing("create_key_response"))?;
+        let client_id = ck.id.ok_or(OmError::Missing("create_key_response.id"))?;
+        let ki = ck
+            .key_info
+            .ok_or(OmError::Missing("create_key_response.key_info"))?;
+        Ok(OpenKey {
+            client_id,
+            blocks: blocks_of_key_info(&ki)?,
+        })
+    }
+
+    /// `CommitMultiPartUpload` — record one written part under `upload_id`.
+    ///
+    /// Carries the ACTUAL written `blocks` (W2: block_id/offset/length verbatim),
+    /// the part `size`, and the part's S3 ETag (`etag_hex`, the per-part MD5 as
+    /// lowercase hex) under `metadata["ETAG"]`. Returns the OM's `part_name`.
+    /// Maps `NO_SUCH_MULTIPART_UPLOAD_ERROR` -> [`OmError::NoSuchUpload`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn commit_part(
+        &mut self,
+        volume: &str,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        part_number: u32,
+        client_id: u64,
+        blocks: &[BlockLocation],
+        size: u64,
+        etag_hex: &str,
+    ) -> Result<String, OmError> {
+        let key_args = oz::KeyArgs {
+            volume_name: volume.to_string(),
+            bucket_name: bucket.to_string(),
+            key_name: key.to_string(),
+            data_size: Some(size),
+            r#type: Some(hdds::ReplicationType::Ec as i32),
+            key_locations: blocks.iter().map(block_to_key_location).collect(),
+            is_multipart_key: Some(true),
+            multipart_upload_id: Some(upload_id.to_string()),
+            multipart_number: Some(part_number),
+            metadata: vec![hdds::KeyValue {
+                key: "ETAG".to_string(),
+                value: Some(etag_hex.to_string()),
+            }],
+            ..Default::default()
+        };
+        let mut req = self.envelope(oz::Type::CommitMultiPartUpload);
+        req.commit_multi_part_upload_request = Some(oz::MultipartCommitUploadPartRequest {
+            key_args,
+            client_id,
+        });
+        let resp = Self::check(self.inner.submit_request(req).await?.into_inner())?;
+        let cp = resp
+            .commit_multi_part_upload_response
+            .ok_or(OmError::Missing("commit_multi_part_upload_response"))?;
+        cp.part_name
+            .ok_or(OmError::Missing("commit_multi_part_upload_response.part_name"))
+    }
+
+    /// `CompleteMultiPartUpload` — assemble the listed parts into the final key.
+    ///
+    /// `parts` is `(part_number, part_name, etag_hex)` in the client's intended
+    /// order. The OM validates the order/sizes authoritatively (strictly
+    /// ascending no-dups -> [`OmError::InvalidPartOrder`], every part present ->
+    /// [`OmError::InvalidPart`], every non-last part >= 5 MiB ->
+    /// [`OmError::EntityTooSmall`], unknown upload -> [`OmError::NoSuchUpload`]),
+    /// stitches the parts' blocks, and returns the AWS multipart ETag. Returns
+    /// `(etag, total_size)`.
+    pub async fn complete_multipart(
+        &mut self,
+        volume: &str,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        parts: &[(u32, String, String)],
+    ) -> Result<(String, u64), OmError> {
+        let parts_list: Vec<oz::Part> = parts
+            .iter()
+            .map(|(pn, name, etag)| oz::Part {
+                part_number: *pn,
+                part_name: name.clone(),
+                e_tag: Some(etag.clone()),
+            })
+            .collect();
+        let key_args = oz::KeyArgs {
+            volume_name: volume.to_string(),
+            bucket_name: bucket.to_string(),
+            key_name: key.to_string(),
+            is_multipart_key: Some(true),
+            multipart_upload_id: Some(upload_id.to_string()),
+            ..Default::default()
+        };
+        let mut req = self.envelope(oz::Type::CompleteMultiPartUpload);
+        req.complete_multi_part_upload_request = Some(oz::MultipartUploadCompleteRequest {
+            key_args,
+            parts_list,
+        });
+        let resp = Self::check(self.inner.submit_request(req).await?.into_inner())?;
+        let cm = resp
+            .complete_multi_part_upload_response
+            .ok_or(OmError::Missing("complete_multi_part_upload_response"))?;
+        let etag = cm
+            .hash
+            .ok_or(OmError::Missing("complete_multi_part_upload_response.hash"))?;
+        // Resolve the final size from the now-committed key (the complete
+        // response carries the ETag but not the size).
+        let size = self.get_key_info(volume, bucket, key).await?.size;
+        Ok((etag, size))
+    }
+
+    /// `AbortMultiPartUpload` — discard an in-progress multipart upload. Lenient
+    /// at the OM (aborting an unknown upload succeeds), matching S3.
+    pub async fn abort_multipart(
+        &mut self,
+        volume: &str,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+    ) -> Result<(), OmError> {
+        let mut req = self.envelope(oz::Type::AbortMultiPartUpload);
+        req.abort_multi_part_upload_request = Some(oz::MultipartUploadAbortRequest {
+            key_args: oz::KeyArgs {
+                volume_name: volume.to_string(),
+                bucket_name: bucket.to_string(),
+                key_name: key.to_string(),
+                multipart_upload_id: Some(upload_id.to_string()),
+                ..Default::default()
+            },
+        });
+        let resp = self.inner.submit_request(req).await?.into_inner();
+        Self::check(resp)?;
+        Ok(())
+    }
+
+    /// `ListMultiPartUploadParts` — the parts uploaded so far for `upload_id`,
+    /// ascending, filtered to part numbers strictly above `part_number_marker`
+    /// (pass 0 for the first page). Unknown upload -> [`OmError::NoSuchUpload`].
+    pub async fn list_parts(
+        &mut self,
+        volume: &str,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        part_number_marker: u32,
+    ) -> Result<Vec<PartListing>, OmError> {
+        let mut req = self.envelope(oz::Type::ListMultiPartUploadParts);
+        req.list_multipart_upload_parts_request = Some(oz::MultipartUploadListPartsRequest {
+            volume: volume.to_string(),
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            upload_id: upload_id.to_string(),
+            part_numbermarker: Some(part_number_marker),
+            max_parts: None,
+        });
+        let resp = Self::check(self.inner.submit_request(req).await?.into_inner())?;
+        let lp = resp
+            .list_multipart_upload_parts_response
+            .ok_or(OmError::Missing("list_multipart_upload_parts_response"))?;
+        Ok(lp
+            .parts_list
+            .into_iter()
+            .map(|p| PartListing {
+                part_number: p.part_number,
+                etag: p.e_tag,
+                size: p.size,
+            })
+            .collect())
+    }
+
+    /// `ListMultipartUploads` — in-flight uploads in `(volume, bucket)` whose key
+    /// starts with `prefix`, sorted by `(key, upload_id)`.
+    pub async fn list_multipart_uploads(
+        &mut self,
+        volume: &str,
+        bucket: &str,
+        prefix: &str,
+    ) -> Result<Vec<UploadListing>, OmError> {
+        let mut req = self.envelope(oz::Type::ListMultipartUploads);
+        req.list_multipart_uploads_request = Some(oz::ListMultipartUploadsRequest {
+            volume: volume.to_string(),
+            bucket: bucket.to_string(),
+            prefix: prefix.to_string(),
+            ..Default::default()
+        });
+        let resp = Self::check(self.inner.submit_request(req).await?.into_inner())?;
+        let lu = resp
+            .list_multipart_uploads_response
+            .ok_or(OmError::Missing("list_multipart_uploads_response"))?;
+        Ok(lu
+            .uploads_list
+            .into_iter()
+            .map(|u| UploadListing {
+                key: u.key_name,
+                upload_id: u.upload_id,
+            })
+            .collect())
+    }
+
+    /// `ListKeys` — committed objects in `(volume, bucket)` whose name starts
+    /// with `prefix` and sorts strictly after `start_after`, ascending, capped at
+    /// `limit` (a non-positive `limit` lets the OM apply its default page size).
+    /// Each entry's ETag comes from the key's `metadata["ETAG"]` if present.
+    pub async fn list_keys(
+        &mut self,
+        volume: &str,
+        bucket: &str,
+        prefix: &str,
+        start_after: &str,
+        limit: i32,
+    ) -> Result<Vec<KeyListing>, OmError> {
+        let mut req = self.envelope(oz::Type::ListKeys);
+        req.list_keys_request = Some(oz::ListKeysRequest {
+            volume_name: volume.to_string(),
+            bucket_name: bucket.to_string(),
+            start_key: Some(start_after.to_string()),
+            prefix: Some(prefix.to_string()),
+            count: Some(limit),
+        });
+        let resp = Self::check(self.inner.submit_request(req).await?.into_inner())?;
+        let lk = resp
+            .list_keys_response
+            .ok_or(OmError::Missing("list_keys_response"))?;
+        Ok(lk
+            .key_info
+            .into_iter()
+            .map(|ki| {
+                let etag = ki
+                    .metadata
+                    .iter()
+                    .find(|kv| kv.key == "ETAG")
+                    .and_then(|kv| kv.value.clone());
+                KeyListing {
+                    key: ki.key_name,
+                    size: ki.data_size,
+                    etag,
+                }
+            })
+            .collect())
+    }
+
+    /// `GetObjectTagging` — the object's S3 tag set as `(key, value)` pairs.
+    /// `KEY_NOT_FOUND` maps to [`OmError::NotFound`].
+    pub async fn get_object_tagging(
+        &mut self,
+        volume: &str,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Vec<(String, String)>, OmError> {
+        let mut req = self.envelope(oz::Type::GetObjectTagging);
+        req.get_object_tagging_request = Some(oz::GetObjectTaggingRequest {
+            key_args: oz::KeyArgs {
+                volume_name: volume.to_string(),
+                bucket_name: bucket.to_string(),
+                key_name: key.to_string(),
+                ..Default::default()
+            },
+        });
+        let resp = Self::check(self.inner.submit_request(req).await?.into_inner())?;
+        let gt = resp
+            .get_object_tagging_response
+            .ok_or(OmError::Missing("get_object_tagging_response"))?;
+        Ok(gt
+            .tags
+            .into_iter()
+            .map(|kv| (kv.key, kv.value.unwrap_or_default()))
+            .collect())
+    }
+
+    /// `PutObjectTagging` — replace the object's S3 tag set with `tags`. An empty
+    /// `tags` clears all tags (the gateway serves `DeleteObjectTagging` this way).
+    /// `KEY_NOT_FOUND` maps to [`OmError::NotFound`].
+    ///
+    /// DESIGN: tags are carried on `KeyArgs.tags` and the OM persists them in the
+    /// key metadata under the `x-amz-tag-` prefix (the same place the gateway's
+    /// metadata-based tagging reads/writes), so the S3 PUT/GET/DELETE tagging
+    /// behavior round-trips whether the gateway reads back via `GetObjectTagging`
+    /// or via `GetKeyInfo`.
+    pub async fn put_object_tagging(
+        &mut self,
+        volume: &str,
+        bucket: &str,
+        key: &str,
+        tags: &[(String, String)],
+    ) -> Result<(), OmError> {
+        let key_args = oz::KeyArgs {
+            volume_name: volume.to_string(),
+            bucket_name: bucket.to_string(),
+            key_name: key.to_string(),
+            tags: tags
+                .iter()
+                .map(|(k, v)| hdds::KeyValue {
+                    key: k.clone(),
+                    value: Some(v.clone()),
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let mut req = self.envelope(oz::Type::PutObjectTagging);
+        req.put_object_tagging_request = Some(oz::PutObjectTaggingRequest { key_args });
         let resp = self.inner.submit_request(req).await?.into_inner();
         Self::check(resp)?;
         Ok(())
@@ -842,5 +1285,384 @@ mod tests {
             key_location_to_block(&loc),
             Err(OmError::Missing("REPLICATION port"))
         ));
+    }
+
+    /// Lowercase-hex encode, mirroring the `{:x}` MD5 formatting the OM/gateway
+    /// use for a part's S3 ETag. The tests build part ETags from chosen raw
+    /// digests so the multipart-ETag rollup is independently checkable.
+    fn hex_encode(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Drive a full multipart write through `CompliantOm`: open the upload,
+    /// open+commit two parts (the gateway would EC-write between), complete, and
+    /// confirm `get_key_info` returns the stitched size and the AWS multipart
+    /// ETag. The ETag is INDEPENDENTLY recomputed here as `md5(raw1 ++ raw2)-2`
+    /// from the chosen per-part raw digests; this fails if the OM rolls up the
+    /// HEX text instead of the raw bytes, or stitches the parts out of order.
+    #[tokio::test]
+    async fn multipart_happy_path_stitches_size_and_aws_etag() {
+        use md5::{Digest, Md5};
+
+        let pipeline = CompliantOmPipeline {
+            datanodes: datanodes(5),
+            ec: ec_3_2(),
+        };
+        let (mut client, _record) = client_for(pipeline).await;
+
+        let upload_id = client.initiate_multipart(VOL, BKT, "obj").await.unwrap();
+        assert_eq!(upload_id, "upload-1");
+
+        // Two parts; part 1 (non-last) must clear the 5 MiB floor, part 2 (last)
+        // may be small. Distinct raw 16-byte digests so the rollup order matters.
+        let part1_size: u64 = 5 * 1024 * 1024;
+        let part2_size: u64 = 1234;
+        let raw1 = [0xAAu8; 16];
+        let raw2 = [0xBBu8; 16];
+        let etag1 = hex_encode(&raw1);
+        let etag2 = hex_encode(&raw2);
+
+        // Part 1.
+        let open1 = client
+            .create_multipart_part_key(VOL, BKT, "obj", &upload_id, 1, None, part1_size)
+            .await
+            .unwrap();
+        let mut blocks1 = open1.blocks.clone();
+        blocks1[0].length = part1_size;
+        let name1 = client
+            .commit_part(VOL, BKT, "obj", &upload_id, 1, open1.client_id, &blocks1, part1_size, &etag1)
+            .await
+            .unwrap();
+        assert_eq!(name1, format!("obj-{upload_id}-1"));
+
+        // Part 2.
+        let open2 = client
+            .create_multipart_part_key(VOL, BKT, "obj", &upload_id, 2, None, part2_size)
+            .await
+            .unwrap();
+        let mut blocks2 = open2.blocks.clone();
+        blocks2[0].length = part2_size;
+        let name2 = client
+            .commit_part(VOL, BKT, "obj", &upload_id, 2, open2.client_id, &blocks2, part2_size, &etag2)
+            .await
+            .unwrap();
+
+        // Independently recompute the AWS multipart ETag: md5 over the raw
+        // per-part digests, in part order, then "-<count>".
+        let mut hasher = Md5::new();
+        hasher.update(raw1);
+        hasher.update(raw2);
+        let expected_etag = format!("{:x}-2", hasher.finalize());
+
+        let (etag, size) = client
+            .complete_multipart(
+                VOL,
+                BKT,
+                "obj",
+                &upload_id,
+                &[(1, name1, etag1), (2, name2, etag2)],
+            )
+            .await
+            .unwrap();
+        assert_eq!(size, part1_size + part2_size);
+        assert_eq!(etag, expected_etag, "multipart ETag must be md5(raw||raw)-N");
+
+        // The completed object is now a normal key: stitched size, both parts'
+        // blocks, and the multipart ETag in metadata.
+        let meta = client.get_key_info(VOL, BKT, "obj").await.unwrap();
+        assert_eq!(meta.size, part1_size + part2_size);
+        assert_eq!(meta.etag.as_deref(), Some(expected_etag.as_str()));
+        assert_eq!(meta.blocks.len(), 2, "one block group per part, in order");
+        assert_eq!(meta.blocks[0].length, part1_size);
+        assert_eq!(meta.blocks[1].length, part2_size);
+    }
+
+    /// Complete-time validation maps each OM status to the right [`OmError`], so
+    /// the gateway can emit the matching S3 code. Uses three independent uploads.
+    #[tokio::test]
+    async fn complete_validation_maps_statuses() {
+        let pipeline = CompliantOmPipeline {
+            datanodes: datanodes(5),
+            ec: ec_3_2(),
+        };
+        let (mut client, _record) = client_for(pipeline).await;
+
+        // Helper to open an upload and commit one part of a given size.
+        async fn part(
+            client: &mut OzoneOmClient,
+            upload_id: &str,
+            pn: u32,
+            size: u64,
+        ) -> (String, String) {
+            let raw = [pn as u8; 16];
+            let etag = hex_encode(&raw);
+            let open = client
+                .create_multipart_part_key(VOL, BKT, "obj", upload_id, pn, None, size)
+                .await
+                .unwrap();
+            let mut blocks = open.blocks.clone();
+            blocks[0].length = size;
+            let name = client
+                .commit_part(VOL, BKT, "obj", upload_id, pn, open.client_id, &blocks, size, &etag)
+                .await
+                .unwrap();
+            (name, etag)
+        }
+
+        // EntityTooSmall: a non-last part below 5 MiB.
+        let u1 = client.initiate_multipart(VOL, BKT, "obj").await.unwrap();
+        let (n1, e1) = part(&mut client, &u1, 1, 1024).await;
+        let (n2, e2) = part(&mut client, &u1, 2, 1024).await;
+        let err = client
+            .complete_multipart(VOL, BKT, "obj", &u1, &[(1, n1, e1), (2, n2, e2)])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OmError::EntityTooSmall), "got {err:?}");
+
+        // InvalidPart: name a part number that was never uploaded.
+        let u2 = client.initiate_multipart(VOL, BKT, "obj").await.unwrap();
+        let (n1, e1) = part(&mut client, &u2, 1, 5 * 1024 * 1024).await;
+        let err = client
+            .complete_multipart(
+                VOL,
+                BKT,
+                "obj",
+                &u2,
+                &[(1, n1, e1), (2, "missing".into(), hex_encode(&[2u8; 16]))],
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OmError::InvalidPart), "got {err:?}");
+
+        // InvalidPartOrder: descending / duplicate part numbers.
+        let u3 = client.initiate_multipart(VOL, BKT, "obj").await.unwrap();
+        let (n1, e1) = part(&mut client, &u3, 1, 5 * 1024 * 1024).await;
+        let (n2, e2) = part(&mut client, &u3, 2, 1234).await;
+        let err = client
+            .complete_multipart(
+                VOL,
+                BKT,
+                "obj",
+                &u3,
+                &[(2, n2, e2), (1, n1, e1)],
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OmError::InvalidPartOrder), "got {err:?}");
+    }
+
+    /// Committing a part to an upload id the OM never minted is `NoSuchUpload`.
+    #[tokio::test]
+    async fn commit_part_unknown_upload_is_no_such_upload() {
+        let pipeline = CompliantOmPipeline {
+            datanodes: datanodes(5),
+            ec: ec_3_2(),
+        };
+        let (mut client, _record) = client_for(pipeline).await;
+        // Open a part key so we have a real block to commit, but commit it under
+        // a bogus upload id.
+        let open = client
+            .create_multipart_part_key(VOL, BKT, "obj", "upload-404", 1, None, 1024)
+            .await
+            .unwrap();
+        let err = client
+            .commit_part(
+                VOL,
+                BKT,
+                "obj",
+                "upload-404",
+                1,
+                open.client_id,
+                &open.blocks,
+                1024,
+                "00112233445566778899aabbccddeeff",
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OmError::NoSuchUpload), "got {err:?}");
+    }
+
+    /// `abort_multipart` removes the upload (and is lenient on a second abort).
+    #[tokio::test]
+    async fn abort_multipart_then_commit_is_no_such_upload() {
+        let pipeline = CompliantOmPipeline {
+            datanodes: datanodes(5),
+            ec: ec_3_2(),
+        };
+        let (mut client, _record) = client_for(pipeline).await;
+        let upload_id = client.initiate_multipart(VOL, BKT, "obj").await.unwrap();
+        client.abort_multipart(VOL, BKT, "obj", &upload_id).await.unwrap();
+        // Aborting again is a lenient no-op success.
+        client.abort_multipart(VOL, BKT, "obj", &upload_id).await.unwrap();
+        // Committing into the aborted upload now fails as NoSuchUpload.
+        let open = client
+            .create_multipart_part_key(VOL, BKT, "obj", &upload_id, 1, None, 1024)
+            .await
+            .unwrap();
+        let err = client
+            .commit_part(VOL, BKT, "obj", &upload_id, 1, open.client_id, &open.blocks, 1024, "ab")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OmError::NoSuchUpload), "got {err:?}");
+    }
+
+    /// `list_parts` returns the committed parts ascending and honors the marker.
+    #[tokio::test]
+    async fn list_parts_ascending_with_marker() {
+        let pipeline = CompliantOmPipeline {
+            datanodes: datanodes(5),
+            ec: ec_3_2(),
+        };
+        let (mut client, _record) = client_for(pipeline).await;
+        let upload_id = client.initiate_multipart(VOL, BKT, "obj").await.unwrap();
+        // Commit parts 1, 2, 3 (out of insertion order to prove sorting).
+        for pn in [2u32, 1, 3] {
+            let raw = [pn as u8; 16];
+            let open = client
+                .create_multipart_part_key(VOL, BKT, "obj", &upload_id, pn, None, 4096)
+                .await
+                .unwrap();
+            client
+                .commit_part(VOL, BKT, "obj", &upload_id, pn, open.client_id, &open.blocks, 4096, &hex_encode(&raw))
+                .await
+                .unwrap();
+        }
+        let all = client.list_parts(VOL, BKT, "obj", &upload_id, 0).await.unwrap();
+        assert_eq!(
+            all.iter().map(|p| p.part_number).collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "parts must be ascending"
+        );
+        assert_eq!(all[0].size, 4096);
+        assert_eq!(all[0].etag.as_deref(), Some(hex_encode(&[1u8; 16]).as_str()));
+        // Marker filters out parts at or below it.
+        let after1 = client.list_parts(VOL, BKT, "obj", &upload_id, 1).await.unwrap();
+        assert_eq!(
+            after1.iter().map(|p| p.part_number).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        // Listing an unknown upload is NoSuchUpload.
+        let err = client.list_parts(VOL, BKT, "obj", "upload-404", 0).await.unwrap_err();
+        assert!(matches!(err, OmError::NoSuchUpload), "got {err:?}");
+    }
+
+    /// `list_multipart_uploads` filters by key prefix and sorts by (key, id).
+    #[tokio::test]
+    async fn list_multipart_uploads_prefix_and_sort() {
+        let pipeline = CompliantOmPipeline {
+            datanodes: datanodes(5),
+            ec: ec_3_2(),
+        };
+        let (mut client, _record) = client_for(pipeline).await;
+        // Three uploads; two under prefix "a/", one under "b/".
+        let a1 = client.initiate_multipart(VOL, BKT, "a/one").await.unwrap();
+        let a2 = client.initiate_multipart(VOL, BKT, "a/two").await.unwrap();
+        let _b = client.initiate_multipart(VOL, BKT, "b/three").await.unwrap();
+
+        let listed = client.list_multipart_uploads(VOL, BKT, "a/").await.unwrap();
+        assert_eq!(
+            listed,
+            vec![
+                UploadListing { key: "a/one".into(), upload_id: a1 },
+                UploadListing { key: "a/two".into(), upload_id: a2 },
+            ],
+            "only the a/ prefix, sorted by key"
+        );
+        // Empty prefix sees all three, sorted by key.
+        let all = client.list_multipart_uploads(VOL, BKT, "").await.unwrap();
+        assert_eq!(
+            all.iter().map(|u| u.key.clone()).collect::<Vec<_>>(),
+            vec!["a/one", "a/two", "b/three"]
+        );
+    }
+
+    /// `list_keys` filters by prefix + start_after and caps at limit.
+    #[tokio::test]
+    async fn list_keys_prefix_start_after_limit() {
+        let pipeline = CompliantOmPipeline {
+            datanodes: datanodes(5),
+            ec: ec_3_2(),
+        };
+        let (mut client, _record) = client_for(pipeline).await;
+
+        // Commit four keys: a/1, a/2, a/3 (under prefix a/) and b/1 (excluded).
+        for key in ["a/1", "a/2", "a/3", "b/1"] {
+            let open = client.create_key(VOL, BKT, key, None, 0).await.unwrap();
+            let mut blocks = open.blocks.clone();
+            blocks[0].length = 10;
+            client
+                .commit_key(VOL, BKT, key, open.client_id, &blocks, 10, Some("etag-x"), &[])
+                .await
+                .unwrap();
+        }
+
+        // Prefix a/, no start, generous limit -> a/1, a/2, a/3 ascending.
+        let listed = client.list_keys(VOL, BKT, "a/", "", 100).await.unwrap();
+        assert_eq!(
+            listed.iter().map(|k| k.key.clone()).collect::<Vec<_>>(),
+            vec!["a/1", "a/2", "a/3"]
+        );
+        assert_eq!(listed[0].size, 10);
+        assert_eq!(listed[0].etag.as_deref(), Some("etag-x"));
+
+        // start_after = "a/1" excludes it.
+        let after = client.list_keys(VOL, BKT, "a/", "a/1", 100).await.unwrap();
+        assert_eq!(
+            after.iter().map(|k| k.key.clone()).collect::<Vec<_>>(),
+            vec!["a/2", "a/3"]
+        );
+
+        // limit caps the page.
+        let capped = client.list_keys(VOL, BKT, "a/", "", 2).await.unwrap();
+        assert_eq!(capped.len(), 2);
+        assert_eq!(capped[0].key, "a/1");
+    }
+
+    /// Object tagging round-trips: put a tag set, get it back (sorted), then an
+    /// empty put clears it.
+    #[tokio::test]
+    async fn object_tagging_round_trips() {
+        let pipeline = CompliantOmPipeline {
+            datanodes: datanodes(5),
+            ec: ec_3_2(),
+        };
+        let (mut client, _record) = client_for(pipeline).await;
+
+        // The key must exist before it can be tagged.
+        let open = client.create_key(VOL, BKT, "obj", None, 0).await.unwrap();
+        let mut blocks = open.blocks.clone();
+        blocks[0].length = 10;
+        client
+            .commit_key(VOL, BKT, "obj", open.client_id, &blocks, 10, Some("e"), &[])
+            .await
+            .unwrap();
+
+        client
+            .put_object_tagging(
+                VOL,
+                BKT,
+                "obj",
+                &[("zeta".into(), "z".into()), ("alpha".into(), "a".into())],
+            )
+            .await
+            .unwrap();
+        let tags = client.get_object_tagging(VOL, BKT, "obj").await.unwrap();
+        assert_eq!(
+            tags,
+            vec![("alpha".to_string(), "a".to_string()), ("zeta".to_string(), "z".to_string())],
+            "tags returned sorted by key"
+        );
+
+        // Tagging round-trips through key metadata under x-amz-tag-, so the ETag
+        // and other metadata survive a tag replace.
+        assert_eq!(client.get_key_info(VOL, BKT, "obj").await.unwrap().etag.as_deref(), Some("e"));
+
+        // An empty put clears all tags (this is how DeleteObjectTagging is served).
+        client.put_object_tagging(VOL, BKT, "obj", &[]).await.unwrap();
+        assert!(client.get_object_tagging(VOL, BKT, "obj").await.unwrap().is_empty());
+
+        // Tagging an absent key is NotFound.
+        let err = client.put_object_tagging(VOL, BKT, "ghost", &[]).await.unwrap_err();
+        assert!(matches!(err, OmError::NotFound), "got {err:?}");
     }
 }

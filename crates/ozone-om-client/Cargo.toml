@@ -18,3 +18,4 @@ tokio = { workspace = true }
 tokio-stream = { workspace = true }
 parking_lot = { workspace = true }
 test-fixtures = { path = "../test-fixtures" }
+md-5 = { workspace = true }
