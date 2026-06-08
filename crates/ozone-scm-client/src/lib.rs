@@ -30,6 +30,8 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod compliant;
+
 use ozone_grpc_types::scm::dn::v1::scm_rust_datanode_service_client::ScmRustDatanodeServiceClient;
 use ozone_grpc_types::scm::dn::v1::{
     ContainerReportAck, ContainerReportRequest, HeartbeatRequest, HeartbeatResponse,

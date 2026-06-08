@@ -15,3 +15,5 @@ ozone-grpc-types = { path = "../ozone-grpc-types" }
 
 [dev-dependencies]
 tokio = { workspace = true }
+tokio-stream = { workspace = true }
+test-fixtures = { path = "../test-fixtures" }
