@@ -533,9 +533,11 @@ impl Gateway {
         Ok(etag)
     }
 
-    /// Server-side copy: clone the source key's metadata under the destination
-    /// (an OBS-style reference copy — the destination shares the source's block
-    /// groups). Returns `(etag, size)`. A missing source maps to `NoSuchKey`.
+    /// Server-side DEEP copy: read the source object and write the destination as
+    /// brand-new, independent EC blocks (it shares NO block ids with the source, so
+    /// deleting the source never affects the copy). Metadata/tagging directives are
+    /// applied at the gateway. Returns `(etag, size)`. A missing source maps to
+    /// `NoSuchKey`.
     pub async fn copy_object(
         &self,
         dest_bucket: &str,

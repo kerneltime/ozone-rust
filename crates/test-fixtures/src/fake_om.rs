@@ -1,7 +1,7 @@
 //! In-memory fake Ozone Manager implementing [`OmRustGatewayService`].
 //!
 //! This fixture lets S3-gateway integration tests exercise the OM control
-//! plane (create/allocate/commit/lookup/list/copy/delete) plus multipart
+//! plane (create/allocate/commit/lookup/list/delete) plus multipart
 //! upload (initiate/complete/abort/list-parts/list-uploads) without a real Java
 //! OM. See the per-RPC docs below for the exact contract.
 //!

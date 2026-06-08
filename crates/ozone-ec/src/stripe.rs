@@ -467,5 +467,70 @@ mod tests {
             let recovered = decode_object(profile, data.len(), &views).unwrap();
             proptest::prop_assert_eq!(recovered, data);
         }
+
+        /// The decoder's O(1) `expected_shard_len` must EXACTLY equal the byte
+        /// length `encode_object` actually produces for every shard. If it ever
+        /// disagreed, the decoder would wrongly drop a VALID shard as
+        /// "inconsistent" and spuriously fail. Pins the closed form across fuzzed
+        /// lengths and profiles.
+        #[test]
+        fn expected_shard_len_matches_encoded_shards(
+            data in proptest::collection::vec(proptest::prelude::any::<u8>(), 0usize..2000),
+            profile_idx in 0usize..3,
+        ) {
+            let profiles = [
+                Profile { data: 3, parity: 2, chunk_size: 16 },
+                Profile { data: 6, parity: 3, chunk_size: 16 },
+                Profile { data: 10, parity: 4, chunk_size: 16 },
+            ];
+            let profile = profiles[profile_idx];
+            let len = data.len();
+            let shards = encode_object(profile, &data).unwrap();
+            for i in 0..profile.data {
+                proptest::prop_assert_eq!(
+                    shards.data[i].len(),
+                    expected_shard_len(profile, len, i),
+                    "data shard {} length mismatch at len {}", i, len
+                );
+            }
+            for j in 0..profile.parity {
+                proptest::prop_assert_eq!(
+                    shards.parity[j].len(),
+                    expected_shard_len(profile, len, profile.data + j),
+                    "parity shard {} length mismatch at len {}", j, len
+                );
+            }
+        }
+
+        /// `decode_object` must NEVER panic, for ANY profile, length, and shard set
+        /// -- including wrong-length shards, all-missing, and an oversized length.
+        /// This is the generalization of the out-of-bounds-slice bug: a malformed
+        /// `block_group_len` must degrade to a graceful error, never an OOB panic.
+        /// When it DOES succeed it must yield exactly `len` bytes (no silent
+        /// truncation).
+        #[test]
+        fn decode_never_panics_on_arbitrary_inputs(
+            profile_idx in 0usize..3,
+            len in 0usize..5000,
+            raw in proptest::collection::vec(
+                proptest::option::of(
+                    proptest::collection::vec(proptest::prelude::any::<u8>(), 0usize..200)
+                ),
+                14,
+            ),
+        ) {
+            let profiles = [
+                Profile { data: 3, parity: 2, chunk_size: 16 },
+                Profile { data: 6, parity: 3, chunk_size: 16 },
+                Profile { data: 10, parity: 4, chunk_size: 16 },
+            ];
+            let profile = profiles[profile_idx];
+            let total = profile.total();
+            let views: Vec<Option<&[u8]>> = (0..total).map(|i| raw[i].as_deref()).collect();
+            // A panic (e.g. an out-of-bounds slice) fails the proptest.
+            if let Ok(obj) = decode_object(profile, len, &views) {
+                proptest::prop_assert_eq!(obj.len(), len, "a successful decode must yield exactly len bytes");
+            }
+        }
     }
 }
