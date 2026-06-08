@@ -26,9 +26,10 @@ use tonic::transport::Server;
 
 use ozone_dn_server::DatanodeService;
 use ozone_fjall_store::FjallMetaStore;
+use ozone_grpc_types::hadoop::hdds;
 use ozone_s3_gw::{serve, Gateway};
 use ozone_storage::FileChunkStore;
-use test_fixtures::fake_om::{datanode_details, FakeOm, PipelineConfig};
+use test_fixtures::compliant_om::{CompliantOm, CompliantOmPipeline};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -66,8 +67,8 @@ async fn spawn_datanode(idx: usize) -> Datanode {
     }
 }
 
-async fn spawn_om(pipeline: PipelineConfig) -> (String, JoinHandle<()>) {
-    let service = FakeOm::new(pipeline).into_server();
+async fn spawn_om(pipeline: CompliantOmPipeline) -> (String, JoinHandle<()>) {
+    let service = CompliantOm::new(pipeline).into_server();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let handle = tokio::spawn(async move {
@@ -78,6 +79,31 @@ async fn spawn_om(pipeline: PipelineConfig) -> (String, JoinHandle<()>) {
             .ok();
     });
     (format!("http://{addr}"), handle)
+}
+
+/// A datanode-details message for the OM pipeline. The datanode's data endpoint
+/// is advertised under the REPLICATION port (the name the Rust datanode
+/// registers to SCM), which the compliant OM carries on each pipeline member so
+/// the gateway can dial it for shard I/O.
+fn dd(uuid: &str, port: u16) -> hdds::DatanodeDetailsProto {
+    hdds::DatanodeDetailsProto {
+        uuid: Some(uuid.to_string()),
+        ip_address: "127.0.0.1".to_string(),
+        host_name: "h".to_string(),
+        ports: vec![hdds::Port { name: "REPLICATION".to_string(), value: port as u32 }],
+        ..Default::default()
+    }
+}
+
+/// The pipeline EC config (RS-3-2, 1 KiB cells) as the real wire `hdds` form the
+/// compliant OM expects.
+fn ec_hdds() -> hdds::EcReplicationConfig {
+    hdds::EcReplicationConfig {
+        data: 3,
+        parity: 2,
+        codec: "rs".to_string(),
+        ec_chunk_size: 1024,
+    }
 }
 
 type HttpClient = Client<hyper_util::client::legacy::connect::HttpConnector, Full<Bytes>>;
@@ -136,17 +162,19 @@ async fn spawn_stack_with_block_size(block_group_size: Option<usize>) -> (String
     for i in 0..5 {
         dns.push(spawn_datanode(i).await);
     }
-    let ec_wire: ozone_grpc_types::dn::v1::EcReplicationConfig =
-        ozone_types::EcReplicationConfig::rs(3, 2, 1024).into();
-    let details: Vec<_> = dns
-        .iter()
-        .map(|d| datanode_details(&d.uuid, "127.0.0.1", d.addr.port() as u32))
-        .collect();
-    let (om_endpoint, _om) = spawn_om(PipelineConfig::new(details, ec_wire)).await;
+    let pipeline = CompliantOmPipeline {
+        datanodes: dns.iter().map(|d| dd(&d.uuid, d.addr.port())).collect(),
+        ec: ec_hdds(),
+    };
+    let (om_endpoint, _om) = spawn_om(pipeline).await;
     let mut gw = Gateway::connect(om_endpoint, "us-east-1").await.unwrap();
     if let Some(n) = block_group_size {
         gw.set_block_group_size(n);
     }
+    // The compliant OM (unlike the old permissive fake) reports a bucket as
+    // existing only after CreateBucket. Tests write to `bucket1` without creating
+    // it AND HEAD it expecting 200, so the harness seeds it up front.
+    gw.create_bucket("bucket1", "setup").await.unwrap();
     let gateway = Arc::new(gw);
     let gw_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", gw_listener.local_addr().unwrap());
@@ -260,13 +288,19 @@ async fn spawn_two_gateways_over_one_om() -> (String, String, Vec<Datanode>) {
     for i in 0..5 {
         dns.push(spawn_datanode(i).await);
     }
-    let ec_wire: ozone_grpc_types::dn::v1::EcReplicationConfig =
-        ozone_types::EcReplicationConfig::rs(3, 2, 1024).into();
-    let details: Vec<_> = dns
-        .iter()
-        .map(|d| datanode_details(&d.uuid, "127.0.0.1", d.addr.port() as u32))
-        .collect();
-    let (om_endpoint, _om) = spawn_om(PipelineConfig::new(details, ec_wire)).await;
+    let pipeline = CompliantOmPipeline {
+        datanodes: dns.iter().map(|d| dd(&d.uuid, d.addr.port())).collect(),
+        ec: ec_hdds(),
+    };
+    let (om_endpoint, _om) = spawn_om(pipeline).await;
+    // Seed `bucket1` once (the compliant OM only reports a bucket as existing
+    // after CreateBucket); both gateway instances share the same OM state.
+    Gateway::connect(om_endpoint.clone(), "us-east-1")
+        .await
+        .unwrap()
+        .create_bucket("bucket1", "setup")
+        .await
+        .unwrap();
     let mut bases = Vec::new();
     for _ in 0..2 {
         let gw = Arc::new(

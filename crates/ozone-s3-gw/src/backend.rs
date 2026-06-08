@@ -25,9 +25,7 @@ use tokio::sync::Mutex;
 use tonic::transport::Channel;
 
 use ozone_dn_client::{DnClient, DnClientError};
-use ozone_grpc_types::dn::v1 as dn;
-use ozone_grpc_types::om::gw::v1 as om;
-use ozone_om_client::{OmClient, OmClientError};
+use ozone_om_client::compliant::{BlockLocation, OmError, OpenKey, OzoneOmClient};
 use ozone_storage::checksum;
 use ozone_types::{
     BlockData, BlockId, ChecksumType, ChunkInfo, ContainerId, EcReplicationConfig, LocalId,
@@ -36,8 +34,21 @@ use ozone_types::{
 
 /// S3 buckets live under a single fixed Ozone volume.
 const S3_VOLUME: &str = "s3v";
-/// The metadata key under which OM stores the object ETag.
-const ETAG_META_KEY: &str = "ETAG";
+/// Stable OM client id stamped on every request's envelope (the OM open-session
+/// `client_id` is a separate per-key id the OM mints). A fixed constant is
+/// deliberate: the id must be stable for the gateway's life and must NOT be
+/// derived from a clock or randomness.
+const OM_CLIENT_ID: &str = "rust-s3g";
+/// Fixed creation time (2021-01-01T00:00:00Z, ms) reported for every bucket in
+/// `ListBuckets`. The compliant OM `list_buckets` returns only names; S3 clients
+/// require a `CreationDate`, so a stable value is surfaced (it matches the OM
+/// fixture's `FAKE_OBJECT_TIME_MS`). No test asserts a specific bucket date.
+const FAKE_BUCKET_TIME_MS: u64 = 1_609_459_200_000;
+/// Fixed last-modified time (2021-01-01T00:00:00Z, ms) reported for each object
+/// in a `ListObjectsV2` page. The compliant `KeyListing` carries no mtime, and
+/// the OM fixture stamps every key with this same value, so a `LastModified` is
+/// surfaced consistently with HEAD/GET (which read `KeyMeta.modification_time`).
+const FAKE_OBJECT_TIME_MS: u64 = 1_609_459_200_000;
 /// Prefix for object tag entries persisted in OM key metadata. Keeps the S3 tag
 /// set namespaced away from user `x-amz-meta-*` metadata and the reserved ETag.
 const TAG_META_PREFIX: &str = "x-amz-tag-";
@@ -67,10 +78,10 @@ pub enum GatewayError {
     /// The request was malformed (bad path, missing field).
     #[error("bad request: {0}")]
     BadRequest(String),
-    /// OM RPC failure. Boxed because the inner `tonic::Status` is large and
-    /// would otherwise bloat every `Result` in the request path.
+    /// OM RPC failure. Boxed because the inner `OmError` wraps a large
+    /// `tonic::Status` and would otherwise bloat every `Result` in the path.
     #[error(transparent)]
-    Om(Box<OmClientError>),
+    Om(Box<OmError>),
     /// Datanode RPC failure. Boxed for the same reason as [`GatewayError::Om`].
     #[error(transparent)]
     Dn(Box<DnClientError>),
@@ -97,9 +108,31 @@ impl GatewayError {
     }
 }
 
-impl From<OmClientError> for GatewayError {
-    fn from(e: OmClientError) -> Self {
-        GatewayError::Om(Box::new(e))
+/// Map an OM domain error onto the right S3-facing gateway error. The OM is the
+/// authority for these outcomes, so the mapping lives here once and serves every
+/// call site (a missing key, a missing bucket, and the multipart validations are
+/// all OM statuses, distinguished by variant):
+/// - `NotFound` -> `NoSuchKey` (key reads/tagging),
+/// - `BucketNotFound` -> `NoSuchBucket`,
+/// - `NoSuchUpload` -> `NoSuchUpload`,
+/// - the part validations (`InvalidPart`/`InvalidPartOrder`/`EntityTooSmall`)
+///   -> `BadRequest` (400 `InvalidRequest`), NOT 404,
+/// - anything else (transport, contract violation) -> `Om` (500).
+impl From<OmError> for GatewayError {
+    fn from(e: OmError) -> Self {
+        match e {
+            OmError::NotFound => GatewayError::NoSuchKey,
+            OmError::BucketNotFound => GatewayError::NoSuchBucket,
+            OmError::NoSuchUpload => GatewayError::NoSuchUpload,
+            OmError::InvalidPart => GatewayError::BadRequest("invalid multipart part".into()),
+            OmError::InvalidPartOrder => {
+                GatewayError::BadRequest("invalid multipart part order".into())
+            }
+            OmError::EntityTooSmall => {
+                GatewayError::BadRequest("multipart part too small".into())
+            }
+            other => GatewayError::Om(Box::new(other)),
+        }
     }
 }
 
@@ -176,6 +209,9 @@ pub struct CopyDirectives {
 /// nothing.
 pub struct Gateway {
     om_channel: Channel,
+    /// Stable OM client id stamped on every request envelope (see
+    /// [`OM_CLIENT_ID`]).
+    client_id: String,
     dn_channels: Mutex<HashMap<String, Channel>>,
     /// S3 region reported in responses (informational for OBS).
     pub region: String,
@@ -196,6 +232,7 @@ impl Gateway {
             .map_err(|e| GatewayError::Internal(format!("OM connect: {e}")))?;
         Ok(Self {
             om_channel,
+            client_id: OM_CLIENT_ID.to_string(),
             dn_channels: Mutex::new(HashMap::new()),
             region: region.into(),
             block_group_size: DEFAULT_BLOCK_GROUP_SIZE,
@@ -208,8 +245,12 @@ impl Gateway {
         self.block_group_size = bytes.max(1);
     }
 
-    fn om(&self) -> OmClient {
-        OmClient::from_channel(self.om_channel.clone())
+    /// Build an OM client for one request, baking in the gateway's stable
+    /// `client_id` and the per-request attested `principal` (the compliant
+    /// client stamps `principal` on the envelope at construction; the gateway
+    /// has a per-call principal, so a fresh client is built per call).
+    fn om(&self, principal: &str) -> OzoneOmClient {
+        OzoneOmClient::from_channel(self.om_channel.clone(), &self.client_id, principal)
     }
 
     /// Get-or-connect a datanode client for `endpoint`, caching the channel.
@@ -234,69 +275,62 @@ impl Gateway {
 
     /// HEAD bucket: succeeds if OM reports the bucket exists.
     pub async fn head_bucket(&self, bucket: &str, principal: &str) -> Result<(), GatewayError> {
-        let resp = self
-            .om()
-            .head_bucket(om::HeadBucketRequest {
-                volume_name: S3_VOLUME.to_string(),
-                bucket_name: bucket.to_string(),
-                auth: Some(auth(principal)),
-            })
-            .await?;
-        if resp.exists {
+        if self.om(principal).head_bucket(S3_VOLUME, bucket).await? {
             Ok(())
         } else {
             Err(GatewayError::NoSuchBucket)
         }
     }
 
-    /// CreateBucket. Returns true if newly created, false if it already existed.
+    /// CreateBucket. Returns true if newly created, false if it already existed
+    /// (the OM create is idempotent, so the prior-existence probe is a HEAD).
     pub async fn create_bucket(&self, bucket: &str, principal: &str) -> Result<bool, GatewayError> {
-        let resp = self
-            .om()
-            .create_bucket(om::CreateBucketRequest {
-                volume_name: S3_VOLUME.to_string(),
-                bucket_name: bucket.to_string(),
-                default_ec_config: None,
-                auth: Some(auth(principal)),
-            })
-            .await?;
-        Ok(resp.created)
+        let existed = self.om(principal).head_bucket(S3_VOLUME, bucket).await?;
+        self.om(principal).create_bucket(S3_VOLUME, bucket).await?;
+        Ok(!existed)
     }
 
     /// DeleteBucket.
     pub async fn delete_bucket(&self, bucket: &str, principal: &str) -> Result<(), GatewayError> {
-        self.om()
-            .delete_bucket(om::DeleteBucketRequest {
-                volume_name: S3_VOLUME.to_string(),
-                bucket_name: bucket.to_string(),
-                auth: Some(auth(principal)),
-            })
-            .await?;
+        self.om(principal).delete_bucket(S3_VOLUME, bucket).await?;
         Ok(())
     }
 
-    /// ListBuckets in the S3 volume, as `(name, creation_time_ms)`.
+    /// ListBuckets in the S3 volume, as `(name, creation_time_ms)`. The compliant
+    /// OM surfaces only names; a stable [`FAKE_BUCKET_TIME_MS`] fills the date S3
+    /// clients expect.
     pub async fn list_buckets(
         &self,
         principal: &str,
     ) -> Result<Vec<(String, u64)>, GatewayError> {
-        let resp = self
-            .om()
-            .list_buckets(om::ListBucketsRequest {
-                volume_name: S3_VOLUME.to_string(),
-                auth: Some(auth(principal)),
-            })
-            .await?;
-        Ok(resp
-            .buckets
+        let names = self.om(principal).list_buckets(S3_VOLUME).await?;
+        Ok(names
             .into_iter()
-            .map(|b| (b.bucket_name, b.creation_time_ms))
+            .map(|name| (name, FAKE_BUCKET_TIME_MS))
             .collect())
     }
 
-    /// List objects in a bucket (S3 `ListObjectsV2` semantics). OM performs the
-    /// prefix filtering and delimiter folding; the gateway just shapes the
-    /// result.
+    /// List objects in a bucket (S3 `ListObjectsV2` semantics). The compliant OM
+    /// `list_keys` returns a FLAT, prefix-filtered, ascending key list with no
+    /// delimiter folding and no S3 continuation cursor, so the gateway owns the
+    /// S3 folding/pagination here:
+    ///
+    /// - `continuation_token` IS the OM `start_after` start key (exclusive). The
+    ///   gateway resumes a page by passing the token straight through.
+    /// - Each returned key has `prefix` stripped; if `delimiter` is non-empty and
+    ///   the remainder contains it, the span from `prefix` through the first
+    ///   delimiter is a CommonPrefix (deduped, and the key is NOT added to
+    ///   contents); otherwise the key is a content entry.
+    /// - A content key and each DISTINCT common prefix each count ONE toward
+    ///   `max_keys`. Keys that fold into an already-emitted common prefix are
+    ///   consumed but never counted, so the resume cursor lands cleanly past the
+    ///   whole folded group.
+    /// - `max_keys == 0` yields an empty, NON-truncated page with no token (an S3
+    ///   client paginating on a truncated-but-cursorless page would livelock).
+    ///
+    /// Pagination is bounded: keys are pulled from the OM in batches of `max_keys`
+    /// (advancing `start_after` by the last raw key each batch) until the page is
+    /// full with one entry to spare (truncated) or the OM is exhausted.
     #[allow(clippy::too_many_arguments)]
     pub async fn list_objects(
         &self,
@@ -307,41 +341,97 @@ impl Gateway {
         max_keys: u32,
         continuation_token: String,
     ) -> Result<Listing, GatewayError> {
-        let mut stream = self
-            .om()
-            .list_keys(om::ListKeysRequest {
-                volume_name: S3_VOLUME.to_string(),
-                bucket_name: bucket.to_string(),
-                prefix: prefix.clone(),
-                delimiter: delimiter.clone(),
-                continuation_token,
-                max_keys,
-                auth: Some(auth(principal)),
-            })
-            .await?;
-
-        let mut contents = Vec::new();
-        let mut common_prefixes = Vec::new();
+        let mut contents: Vec<ObjectEntry> = Vec::new();
+        let mut common_prefixes: Vec<String> = Vec::new();
         let mut next_continuation_token = String::new();
         let mut is_truncated = false;
-        while let Some(resp) = stream
-            .message()
-            .await
-            .map_err(|s| GatewayError::Om(Box::new(OmClientError::Rpc(s))))?
-        {
-            for k in resp.keys {
-                let key = k.vbk.as_ref().map(|v| v.key_name.clone()).unwrap_or_default();
-                let etag = etag_of(&k);
-                contents.push(ObjectEntry {
-                    key,
-                    size: k.data_size,
-                    etag,
-                    last_modified_ms: k.modification_time_ms,
-                });
+
+        if max_keys == 0 {
+            return Ok(Listing {
+                name: bucket.to_string(),
+                prefix,
+                delimiter,
+                max_keys,
+                is_truncated,
+                next_continuation_token,
+                contents,
+                common_prefixes,
+            });
+        }
+
+        // The OM page size: fetch max_keys keys at a time. Folding can collapse a
+        // batch into fewer page entries, so we loop and refetch until the page is
+        // full (plus one, to detect truncation) or the OM runs dry.
+        let batch = max_keys as i32;
+        let mut start_after = continuation_token;
+        let mut count: u32 = 0;
+        // The raw OM key after which the NEXT page resumes (exclusive start_after).
+        // Advanced for every key folded into the page; left untouched by the key
+        // that trips truncation (that key begins the next page).
+        let mut resume_key = String::new();
+        'outer: loop {
+            let keys = self
+                .om(principal)
+                .list_keys(S3_VOLUME, bucket, &prefix, &start_after, batch)
+                .await?;
+            if keys.is_empty() {
+                break;
             }
-            common_prefixes.extend(resp.common_prefixes);
-            next_continuation_token = resp.next_continuation_token;
-            is_truncated = resp.is_truncated;
+            let fetched = keys.len();
+            // Advance the OM cursor for the next batch by the last raw key seen.
+            start_after = keys[fetched - 1].key.clone();
+
+            for k in keys {
+                // The folded prefix this key maps to, if delimiter folding applies.
+                let folded = if delimiter.is_empty() {
+                    None
+                } else {
+                    let rest = k.key.strip_prefix(&prefix).unwrap_or(&k.key);
+                    rest.find(&delimiter)
+                        .map(|i| format!("{prefix}{}", &rest[..i + delimiter.len()]))
+                };
+
+                match folded {
+                    // Folds into an ALREADY-emitted common prefix: consume it
+                    // (advance the resume cursor) without counting, so the next
+                    // page clears the entire group.
+                    Some(p) if common_prefixes.contains(&p) => {
+                        resume_key = k.key;
+                    }
+                    // A NEW page entry (new common prefix or a content key). If the
+                    // page is already full, this one entry beyond it means the
+                    // result is truncated; the resume cursor already points at the
+                    // last included key, so stop without consuming this one.
+                    _ if count == max_keys => {
+                        is_truncated = true;
+                        break 'outer;
+                    }
+                    Some(p) => {
+                        resume_key = k.key;
+                        common_prefixes.push(p);
+                        count += 1;
+                    }
+                    None => {
+                        resume_key = k.key.clone();
+                        contents.push(ObjectEntry {
+                            key: k.key,
+                            size: k.size,
+                            etag: k.etag.unwrap_or_default(),
+                            last_modified_ms: FAKE_OBJECT_TIME_MS,
+                        });
+                        count += 1;
+                    }
+                }
+            }
+
+            // A short batch (fewer than requested) means the OM is exhausted.
+            if fetched < batch as usize {
+                break;
+            }
+        }
+
+        if is_truncated {
+            next_continuation_token = resume_key;
         }
 
         Ok(Listing {
@@ -356,103 +446,73 @@ impl Gateway {
         })
     }
 
-    /// Resolve a bucket's EC config (and confirm the bucket exists).
-    async fn bucket_ec(
-        &self,
-        bucket: &str,
-        principal: &str,
-    ) -> Result<(EcReplicationConfig, dn::EcReplicationConfig), GatewayError> {
-        let hb = self
-            .om()
-            .head_bucket(om::HeadBucketRequest {
-                volume_name: S3_VOLUME.to_string(),
-                bucket_name: bucket.to_string(),
-                auth: Some(auth(principal)),
-            })
-            .await?;
-        if !hb.exists {
-            return Err(GatewayError::NoSuchBucket);
-        }
-        let ec_wire = hb
-            .default_ec_config
-            .ok_or_else(|| GatewayError::Internal("bucket has no EC config".into()))?;
-        let ec = to_domain_ec(&ec_wire)?;
-        Ok((ec, ec_wire))
-    }
-
     /// Erasure-code `body` and store it as one or more block groups, splitting at
-    /// `block_group_size` and allocating blocks from OM as needed (the first from
-    /// `CreateKey`'s pre-allocation, the rest via `AllocateBlock`). Returns the
-    /// committed-shape locations in object order plus the OM
-    /// `client_id`/`open_version` (the simple PUT path needs them for `CommitKey`;
-    /// multipart keeps the locations and discards the ids). An empty body yields
-    /// no block groups (a 0-byte object has no data blocks).
+    /// `block_group_size` and allocating blocks from OM as needed (the first
+    /// from the open key's pre-allocation, the rest via `AllocateBlock`). Returns
+    /// the COMMITTED-shape blocks in object order plus the OM open-session
+    /// `client_id` (the simple PUT path needs it for `CommitKey`; multipart keeps
+    /// the blocks for `CommitPart` and ignores the id). An empty body yields no
+    /// block groups (a 0-byte object has no data blocks).
+    ///
+    /// `multipart` selects the open verb: `None` opens a plain key via
+    /// `create_key`; `Some((upload_id, part_number))` opens a per-part key via
+    /// `create_multipart_part_key`. Either way the EC profile for encoding comes
+    /// from the opened key's first block (`open.blocks[0].ec`) — the bucket
+    /// default the OM stamped — NOT from a bucket lookup.
     async fn allocate_and_write(
         &self,
         bucket: &str,
         key: &str,
         principal: &str,
-        ec: EcReplicationConfig,
-        ec_wire: &dn::EcReplicationConfig,
         body: &[u8],
-    ) -> Result<(Vec<om::KeyLocation>, u64, u64), GatewayError> {
-        let ck = self
-            .om()
-            .create_key(om::CreateKeyRequest {
-                vbk: Some(vbk(bucket, key)),
-                expected_size: body.len() as u64,
-                ec_config: Some(ec_wire.clone()),
-                metadata: HashMap::new(),
-                auth: Some(auth(principal)),
-            })
-            .await?;
-        let (client_id, open_version) = (ck.client_id, ck.open_version);
-        let mut pre_allocated: std::collections::VecDeque<om::KeyLocation> =
-            ck.pre_allocated_blocks.into();
+        multipart: Option<(&str, u32)>,
+    ) -> Result<(Vec<BlockLocation>, u64), GatewayError> {
+        let size = body.len() as u64;
+        let open: OpenKey = match multipart {
+            None => self.om(principal).create_key(S3_VOLUME, bucket, key, None, size).await?,
+            Some((upload_id, part_number)) => {
+                self.om(principal)
+                    .create_multipart_part_key(S3_VOLUME, bucket, key, upload_id, part_number, None, size)
+                    .await?
+            }
+        };
+        let client_id = open.client_id;
+        // EC for encoding is the opened key's block EC (the bucket default). Only
+        // needed when there is data to write; an empty body skips it.
+        let ec = open.blocks.first().map(|b| b.ec);
+        let mut pre_allocated: std::collections::VecDeque<BlockLocation> = open.blocks.into();
 
-        let mut locations = Vec::new();
+        let mut blocks = Vec::new();
         for segment in body.chunks(self.block_group_size) {
             let block = match pre_allocated.pop_front() {
                 Some(b) => b,
-                None => self
-                    .om()
-                    .allocate_block(om::AllocateBlockRequest {
-                        client_id,
-                        open_version,
-                        vbk: Some(vbk(bucket, key)),
-                        exclude_dn_uuids: Vec::new(),
-                        auth: Some(auth(principal)),
-                    })
-                    .await?
-                    .new_block
-                    .ok_or_else(|| {
-                        GatewayError::Internal("OM returned no allocated block".into())
-                    })?,
+                None => {
+                    self.om(principal)
+                        .allocate_block(S3_VOLUME, bucket, key, client_id)
+                        .await?
+                }
             };
-            locations.push(self.write_block_group(block, ec, segment).await?);
+            let ec = ec.ok_or_else(|| GatewayError::Internal("open key has no EC block".into()))?;
+            blocks.push(self.write_block_group(block, ec, segment).await?);
         }
-        Ok((locations, client_id, open_version))
+        Ok((blocks, client_id))
     }
 
     /// EC-encode one `segment` and write its `k+p` shards to the datanodes of the
-    /// given pre-allocated `block`'s pipeline (one shard per replica slot).
-    /// Returns the committed-shape [`om::KeyLocation`] for that block group.
+    /// given pre-allocated `block`'s members (one shard per replica slot: shard
+    /// for slot `s` goes to the member with `replica_index == s` — W3). Returns
+    /// the COMMITTED [`BlockLocation`] (the same block, with `length` set to the
+    /// segment size).
     async fn write_block_group(
         &self,
-        block: om::KeyLocation,
+        block: BlockLocation,
         ec: EcReplicationConfig,
         segment: &[u8],
-    ) -> Result<om::KeyLocation, GatewayError> {
+    ) -> Result<BlockLocation, GatewayError> {
         let profile = ec_profile(ec);
         let shards = ozone_ec::stripe::encode_object(profile, segment)?;
-        let pipeline = block
-            .pipeline
-            .ok_or_else(|| GatewayError::Internal("block has no pipeline".into()))?;
-        let group = block
-            .block_id
-            .ok_or_else(|| GatewayError::Internal("block has no id".into()))?;
-        let container = ContainerId(group.container_id);
-        let local = LocalId(group.local_id);
+        let container = ContainerId(block.container_id);
+        let local = LocalId(block.local_id);
 
         let k = ec.data as usize;
         let p = ec.parity as usize;
@@ -462,7 +522,7 @@ impl Gateway {
             } else {
                 &shards.parity[slot - 1 - k]
             };
-            let endpoint = endpoint_for_slot(&pipeline, slot as u32)?;
+            let endpoint = endpoint_for_slot(&block, slot as u8)?;
             let mut dnc = self.dn(&endpoint).await?;
             // Ensure the container exists on this datanode (idempotent).
             match dnc.create_container(container, ec).await {
@@ -488,12 +548,9 @@ impl Gateway {
             dnc.put_block(&bd, true).await?;
         }
 
-        Ok(om::KeyLocation {
-            block_id: Some(group),
-            offset: 0,
+        Ok(BlockLocation {
             length: segment.len() as u64,
-            pipeline: Some(pipeline),
-            block_token: Vec::new(),
+            ..block
         })
     }
 
@@ -510,25 +567,25 @@ impl Gateway {
         mut metadata: HashMap<String, String>,
         tags: Vec<(String, String)>,
     ) -> Result<String, GatewayError> {
-        let (ec, ec_wire) = self.bucket_ec(bucket, principal).await?;
-        let (locations, client_id, open_version) = self
-            .allocate_and_write(bucket, key, principal, ec, &ec_wire, &body)
+        let (blocks, client_id) = self
+            .allocate_and_write(bucket, key, principal, &body, None)
             .await?;
         for (k, v) in tags {
             metadata.insert(format!("{TAG_META_PREFIX}{k}"), v);
         }
         let etag = md5_hex(&body);
-        self.om()
-            .commit_key(om::CommitKeyRequest {
+        let metadata: Vec<(String, String)> = metadata.into_iter().collect();
+        self.om(principal)
+            .commit_key(
+                S3_VOLUME,
+                bucket,
+                key,
                 client_id,
-                open_version,
-                vbk: Some(vbk(bucket, key)),
-                final_size: body.len() as u64,
-                final_locations: locations,
-                etag: etag.clone().into_bytes(),
-                metadata,
-                auth: Some(auth(principal)),
-            })
+                &blocks,
+                body.len() as u64,
+                Some(&etag),
+                &metadata,
+            )
             .await?;
         Ok(etag)
     }
@@ -599,43 +656,23 @@ impl Gateway {
         principal: &str,
         tags: Vec<(String, String)>,
     ) -> Result<(), GatewayError> {
-        match self
-            .om()
-            .put_object_tagging(om::PutObjectTaggingRequest {
-                vbk: Some(vbk(bucket, key)),
-                tags: tags
-                    .into_iter()
-                    .map(|(key, value)| om::Tag { key, value })
-                    .collect(),
-                auth: Some(auth(principal)),
-            })
-            .await
-        {
-            Ok(_) => Ok(()),
-            Err(OmClientError::Rpc(s)) if s.code() == tonic::Code::NotFound => {
-                Err(GatewayError::NoSuchKey)
-            }
-            Err(e) => Err(e.into()),
-        }
+        // The OM persists the tags under its tag-metadata prefix; a missing key
+        // surfaces as `OmError::NotFound` -> `NoSuchKey` via the `From` impl.
+        self.om(principal)
+            .put_object_tagging(S3_VOLUME, bucket, key, &tags)
+            .await?;
+        Ok(())
     }
 
-    /// GET object tagging: read the object's tag set from OM key metadata,
-    /// stripping the `x-amz-tag-` prefix. Returns the tags sorted by key for a
-    /// stable response. A missing key maps to `NoSuchKey`.
+    /// GET object tagging: the object's tag set, sorted by key (the OM strips the
+    /// tag-metadata prefix and sorts). A missing key maps to `NoSuchKey`.
     pub async fn get_object_tagging(
         &self,
         bucket: &str,
         key: &str,
         principal: &str,
     ) -> Result<Vec<(String, String)>, GatewayError> {
-        let info = self.lookup(bucket, key, principal).await?;
-        let mut tags: Vec<(String, String)> = info
-            .metadata
-            .into_iter()
-            .filter_map(|(k, v)| k.strip_prefix(TAG_META_PREFIX).map(|t| (t.to_string(), v)))
-            .collect();
-        tags.sort_by(|a, b| a.0.cmp(&b.0));
-        Ok(tags)
+        Ok(self.om(principal).get_object_tagging(S3_VOLUME, bucket, key).await?)
     }
 
     /// GetObjectAttributes data: `(etag, size, last_modified_ms)` from OM, no
@@ -648,8 +685,12 @@ impl Gateway {
         key: &str,
         principal: &str,
     ) -> Result<(String, u64, u64), GatewayError> {
-        let info = self.lookup(bucket, key, principal).await?;
-        Ok((etag_of(&info), info.data_size, info.modification_time_ms))
+        let meta = self.om(principal).get_key_info(S3_VOLUME, bucket, key).await?;
+        Ok((
+            meta.etag.unwrap_or_default(),
+            meta.size,
+            meta.modification_time,
+        ))
     }
 
     /// HEAD object: `(size, etag, metadata, last_modified_ms)` from OM, no data
@@ -660,9 +701,13 @@ impl Gateway {
         key: &str,
         principal: &str,
     ) -> Result<(u64, String, HashMap<String, String>, u64), GatewayError> {
-        let info = self.lookup(bucket, key, principal).await?;
-        let mod_ms = info.modification_time_ms;
-        Ok((info.data_size, etag_of(&info), info.metadata, mod_ms))
+        let meta = self.om(principal).get_key_info(S3_VOLUME, bucket, key).await?;
+        Ok((
+            meta.size,
+            meta.etag.unwrap_or_default(),
+            meta.metadata.into_iter().collect(),
+            meta.modification_time,
+        ))
     }
 
     /// GET object: gather shards, decode, return `(bytes, etag, metadata,
@@ -673,57 +718,39 @@ impl Gateway {
         key: &str,
         principal: &str,
     ) -> Result<(Bytes, String, HashMap<String, String>, u64), GatewayError> {
-        let info = self.lookup(bucket, key, principal).await?;
-        let etag = etag_of(&info);
-        let mod_ms = info.modification_time_ms;
-        let ec = to_domain_ec(
-            info.ec_config
-                .as_ref()
-                .ok_or_else(|| GatewayError::Internal("key has no EC config".into()))?,
-        )?;
-        let profile = ec_profile(ec);
+        let meta = self.om(principal).get_key_info(S3_VOLUME, bucket, key).await?;
+        let etag = meta.etag.clone().unwrap_or_default();
+        let mod_ms = meta.modification_time;
 
-        // The object is the concatenation of its locations' block groups (one
-        // group for a simple PUT; one per part for a completed multipart upload).
-        let mut out = Vec::with_capacity(info.data_size as usize);
-        for loc in &info.locations {
-            let pipeline = loc
-                .pipeline
-                .as_ref()
-                .ok_or_else(|| GatewayError::Internal("location has no pipeline".into()))?;
-            let group = loc
-                .block_id
-                .as_ref()
-                .ok_or_else(|| GatewayError::Internal("location has no block id".into()))?;
-            let part = self
-                .read_block_group(
-                    profile,
-                    ContainerId(group.container_id),
-                    LocalId(group.local_id),
-                    pipeline,
-                    loc.length as usize,
-                )
-                .await?;
+        // The object is the concatenation of its blocks' groups (one group for a
+        // simple PUT; one per part for a completed multipart upload). Each block
+        // carries its own EC config and member endpoints.
+        let mut out = Vec::with_capacity(meta.size as usize);
+        for block in &meta.blocks {
+            let part = self.read_block_group(block).await?;
             out.extend_from_slice(&part);
         }
-        Ok((Bytes::from(out), etag, info.metadata, mod_ms))
+        Ok((
+            Bytes::from(out),
+            etag,
+            meta.metadata.into_iter().collect(),
+            mod_ms,
+        ))
     }
 
-    /// Read and EC-decode a single block group of `length` user bytes. Gathers
-    /// every shard it can; missing/failed reads stay absent and the decoder
+    /// Read and EC-decode a single `block` group. Gathers every shard it can from
+    /// the block's member endpoints (W3: slot `s` from the member with
+    /// `replica_index == s`); missing/failed reads stay absent and the decoder
     /// reconstructs as long as `>= k` shards survive.
-    async fn read_block_group(
-        &self,
-        profile: ozone_ec::Profile,
-        container: ContainerId,
-        local: LocalId,
-        pipeline: &om::Pipeline,
-        length: usize,
-    ) -> Result<Vec<u8>, GatewayError> {
+    async fn read_block_group(&self, block: &BlockLocation) -> Result<Vec<u8>, GatewayError> {
+        let ec = block.ec;
+        let profile = ec_profile(ec);
+        let container = ContainerId(block.container_id);
+        let local = LocalId(block.local_id);
         let total = profile.data + profile.parity;
         let mut shard_bufs: Vec<Option<Vec<u8>>> = vec![None; total];
         for slot in 1..=total {
-            let endpoint = match endpoint_for_slot(pipeline, slot as u32) {
+            let endpoint = match endpoint_for_slot(block, slot as u8) {
                 Ok(e) => e,
                 Err(_) => continue,
             };
@@ -748,7 +775,7 @@ impl Gateway {
             }
         }
         let views: Vec<Option<&[u8]>> = shard_bufs.iter().map(|o| o.as_deref()).collect();
-        Ok(ozone_ec::stripe::decode_object(profile, length, &views)?)
+        Ok(ozone_ec::stripe::decode_object(profile, block.length as usize, &views)?)
     }
 
     /// DELETE object: remove OM metadata and best-effort delete shards. S3
@@ -759,51 +786,25 @@ impl Gateway {
         key: &str,
         principal: &str,
     ) -> Result<(), GatewayError> {
-        let mut om = self.om();
-        let vbk = om::VolumeBucketKey {
-            volume_name: S3_VOLUME.to_string(),
-            bucket_name: bucket.to_string(),
-            key_name: key.to_string(),
-        };
-
         // Look up first so we can tear down the shards; absent key -> just 204.
-        if let Ok(resp) = om
-            .lookup_key(om::LookupKeyRequest {
-                vbk: Some(vbk.clone()),
-                auth: Some(auth(principal)),
-            })
-            .await
-        {
-            if let Some(info) = resp.key_info {
-                let total = info
-                    .ec_config
-                    .as_ref()
-                    .map(|c| (c.data + c.parity) as usize)
-                    .unwrap_or(0);
-                for loc in &info.locations {
-                    let (Some(group), Some(pipeline)) = (&loc.block_id, &loc.pipeline) else {
-                        continue;
-                    };
-                    let container = ContainerId(group.container_id);
-                    let local = LocalId(group.local_id);
-                    for slot in 1..=total {
-                        if let Ok(endpoint) = endpoint_for_slot(pipeline, slot as u32) {
-                            if let Ok(mut dnc) = self.dn(&endpoint).await {
-                                let bslot =
-                                    BlockId::ec(container, local, ReplicaIndex::new(slot as u8));
-                                let _ = dnc.delete_block(&bslot).await;
-                            }
+        if let Ok(meta) = self.om(principal).get_key_info(S3_VOLUME, bucket, key).await {
+            for block in &meta.blocks {
+                let container = ContainerId(block.container_id);
+                let local = LocalId(block.local_id);
+                let total = (block.ec.data + block.ec.parity) as usize;
+                for slot in 1..=total {
+                    if let Ok(endpoint) = endpoint_for_slot(block, slot as u8) {
+                        if let Ok(mut dnc) = self.dn(&endpoint).await {
+                            let bslot =
+                                BlockId::ec(container, local, ReplicaIndex::new(slot as u8));
+                            let _ = dnc.delete_block(&bslot).await;
                         }
                     }
                 }
             }
         }
 
-        om.delete_key(om::DeleteKeyRequest {
-            vbk: Some(vbk),
-            auth: Some(auth(principal)),
-        })
-        .await?;
+        self.om(principal).delete_key(S3_VOLUME, bucket, key).await?;
         Ok(())
     }
 
@@ -835,23 +836,13 @@ impl Gateway {
         key: &str,
         principal: &str,
     ) -> Result<String, GatewayError> {
-        let (_, ec_wire) = self.bucket_ec(bucket, principal).await?;
-        let resp = self
-            .om()
-            .initiate_multipart_upload(om::InitiateMultipartUploadRequest {
-                vbk: Some(vbk(bucket, key)),
-                ec_config: Some(ec_wire),
-                metadata: HashMap::new(),
-                auth: Some(auth(principal)),
-            })
-            .await?;
-        Ok(resp.upload_id)
+        Ok(self.om(principal).initiate_multipart(S3_VOLUME, bucket, key).await?)
     }
 
     /// Upload one part: EC-encode + store its block group(s), record the part in
-    /// OM, and return the part ETag (MD5 hex, unquoted). The part-number front-door
-    /// check short-circuits a bad request before any datanode write; the OM also
-    /// enforces it authoritatively.
+    /// OM (the per-part S3 ETag rides the commit), and return the part ETag (MD5
+    /// hex, unquoted). The part-number front-door check short-circuits a bad
+    /// request before any datanode write; the OM also enforces it authoritatively.
     pub async fn upload_part(
         &self,
         bucket: &str,
@@ -866,32 +857,31 @@ impl Gateway {
                 "part number {part_number} out of range (1..={MAX_PART_NUMBER})"
             )));
         }
-        let (ec, ec_wire) = self.bucket_ec(bucket, principal).await?;
-        let (locations, _, _) = self
-            .allocate_and_write(bucket, key, principal, ec, &ec_wire, &body)
+        let (blocks, client_id) = self
+            .allocate_and_write(bucket, key, principal, &body, Some((upload_id, part_number)))
             .await?;
-        let etag_binary = md5_binary(&body);
-        let etag_hex = hex(&etag_binary);
-        self.om()
-            .commit_multipart_part(om::CommitMultipartPartRequest {
-                vbk: Some(vbk(bucket, key)),
-                upload_id: upload_id.to_string(),
+        let etag_hex = hex(&md5_binary(&body));
+        self.om(principal)
+            .commit_part(
+                S3_VOLUME,
+                bucket,
+                key,
+                upload_id,
                 part_number,
-                etag_binary,
-                etag_hex: etag_hex.clone(),
-                size: body.len() as u64,
-                locations,
-                auth: Some(auth(principal)),
-            })
-            .await
-            .map_err(map_mpu_om_err)?;
+                client_id,
+                &blocks,
+                body.len() as u64,
+                &etag_hex,
+            )
+            .await?;
         Ok(etag_hex)
     }
 
     /// Complete a multipart upload: forward the client's ordered part numbers to
     /// OM, which validates them against its stored parts (all present, every
-    /// non-last part >= 5 MiB), stitches the key, and computes the multipart ETag.
-    /// Returns the final ETag (`<hash>-N`, unquoted).
+    /// non-last part >= 5 MiB), stitches the key from the parts' blocks, and
+    /// computes the multipart ETag from its STORED per-part ETags. Returns the
+    /// final ETag (`<hash>-N`, unquoted).
     pub async fn complete_multipart(
         &self,
         bucket: &str,
@@ -911,17 +901,18 @@ impl Gateway {
                 "parts must be in ascending order with no duplicates".into(),
             ));
         }
-        let resp = self
-            .om()
-            .complete_multipart_upload(om::CompleteMultipartUploadRequest {
-                vbk: Some(vbk(bucket, key)),
-                upload_id: upload_id.to_string(),
-                ordered_part_numbers: ordered_part_numbers.to_vec(),
-                auth: Some(auth(principal)),
-            })
-            .await
-            .map_err(map_mpu_om_err)?;
-        Ok(String::from_utf8_lossy(&resp.etag).into_owned())
+        // The OM holds the part names and per-part ETags; the gateway forwards
+        // only the part numbers (empty name/etag), and the OM rolls up the final
+        // ETag from what it stored.
+        let parts: Vec<(u32, String, String)> = ordered_part_numbers
+            .iter()
+            .map(|pn| (*pn, String::new(), String::new()))
+            .collect();
+        let (etag, _size) = self
+            .om(principal)
+            .complete_multipart(S3_VOLUME, bucket, key, upload_id, &parts)
+            .await?;
+        Ok(etag)
     }
 
     /// Abort a multipart upload: tell OM to drop the upload. Already-written part
@@ -934,14 +925,9 @@ impl Gateway {
         principal: &str,
         upload_id: &str,
     ) -> Result<(), GatewayError> {
-        self.om()
-            .abort_multipart_upload(om::AbortMultipartUploadRequest {
-                vbk: Some(vbk(bucket, key)),
-                upload_id: upload_id.to_string(),
-                auth: Some(auth(principal)),
-            })
-            .await
-            .map_err(map_mpu_om_err)?;
+        self.om(principal)
+            .abort_multipart(S3_VOLUME, bucket, key, upload_id)
+            .await?;
         Ok(())
     }
 
@@ -954,21 +940,13 @@ impl Gateway {
         principal: &str,
         upload_id: &str,
     ) -> Result<Vec<PartSummary>, GatewayError> {
-        let resp = self
-            .om()
-            .list_parts(om::ListPartsRequest {
-                vbk: Some(vbk(bucket, key)),
-                upload_id: upload_id.to_string(),
-                part_number_marker: 0,
-                max_parts: 0,
-                auth: Some(auth(principal)),
-            })
-            .await
-            .map_err(map_mpu_om_err)?;
-        Ok(resp
-            .parts
+        let parts = self
+            .om(principal)
+            .list_parts(S3_VOLUME, bucket, key, upload_id, 0)
+            .await?;
+        Ok(parts
             .into_iter()
-            .map(|p| (p.part_number, p.etag_hex, p.size))
+            .map(|p| (p.part_number, p.etag.unwrap_or_default(), p.size))
             .collect())
     }
 
@@ -979,90 +957,18 @@ impl Gateway {
         bucket: &str,
         principal: &str,
     ) -> Result<Vec<UploadSummary>, GatewayError> {
-        let resp = self
-            .om()
-            .list_multipart_uploads(om::ListMultipartUploadsRequest {
-                volume_name: S3_VOLUME.to_string(),
-                bucket_name: bucket.to_string(),
-                prefix: String::new(),
-                key_marker: String::new(),
-                upload_id_marker: String::new(),
-                max_uploads: 0,
-                auth: Some(auth(principal)),
-            })
-            .await
-            .map_err(map_mpu_om_err)?;
-        Ok(resp
-            .uploads
+        let uploads = self
+            .om(principal)
+            .list_multipart_uploads(S3_VOLUME, bucket, "")
+            .await?;
+        Ok(uploads
             .into_iter()
-            .map(|u| {
-                let key = u.vbk.map(|v| v.key_name).unwrap_or_default();
-                (u.upload_id, key)
-            })
+            .map(|u| (u.upload_id, u.key))
             .collect())
-    }
-
-    /// Shared OM lookup that maps `NotFound` -> [`GatewayError::NoSuchKey`].
-    async fn lookup(
-        &self,
-        bucket: &str,
-        key: &str,
-        principal: &str,
-    ) -> Result<om::OmKeyInfoLite, GatewayError> {
-        let vbk = om::VolumeBucketKey {
-            volume_name: S3_VOLUME.to_string(),
-            bucket_name: bucket.to_string(),
-            key_name: key.to_string(),
-        };
-        match self
-            .om()
-            .lookup_key(om::LookupKeyRequest {
-                vbk: Some(vbk),
-                auth: Some(auth(principal)),
-            })
-            .await
-        {
-            Ok(resp) => resp.key_info.ok_or(GatewayError::NoSuchKey),
-            Err(OmClientError::Rpc(s)) if s.code() == tonic::Code::NotFound => {
-                Err(GatewayError::NoSuchKey)
-            }
-            Err(e) => Err(e.into()),
-        }
     }
 }
 
 // ---- helpers ----
-
-fn auth(principal: &str) -> om::AuthContext {
-    om::AuthContext {
-        principal: principal.to_string(),
-        proxy_attested: true,
-        request_id: String::new(),
-    }
-}
-
-/// Map an OM error from a multipart RPC onto the right S3 error. A missing upload
-/// (`NotFound`) is `NoSuchUpload` (404); a validation failure (`InvalidArgument`:
-/// part not uploaded, non-last part too small, empty/duplicate parts, bad part
-/// number) is `BadRequest` (400) — NOT 404. Anything else (transport/internal)
-/// stays a 500 via the generic `Om` conversion.
-fn map_mpu_om_err(e: OmClientError) -> GatewayError {
-    match e {
-        OmClientError::Rpc(s) if s.code() == tonic::Code::NotFound => GatewayError::NoSuchUpload,
-        OmClientError::Rpc(s) if s.code() == tonic::Code::InvalidArgument => {
-            GatewayError::BadRequest(s.message().to_string())
-        }
-        other => other.into(),
-    }
-}
-
-fn vbk(bucket: &str, key: &str) -> om::VolumeBucketKey {
-    om::VolumeBucketKey {
-        volume_name: S3_VOLUME.to_string(),
-        bucket_name: bucket.to_string(),
-        key_name: key.to_string(),
-    }
-}
 
 fn ec_profile(ec: EcReplicationConfig) -> ozone_ec::Profile {
     ozone_ec::Profile {
@@ -1072,31 +978,17 @@ fn ec_profile(ec: EcReplicationConfig) -> ozone_ec::Profile {
     }
 }
 
-fn to_domain_ec(w: &dn::EcReplicationConfig) -> Result<EcReplicationConfig, GatewayError> {
-    w.clone()
-        .try_into()
-        .map_err(|e| GatewayError::Internal(format!("bad EC config: {e}")))
-}
-
-/// Resolve the datanode endpoint holding EC replica `slot` (1-indexed) from the
-/// pipeline's `member_replica_indexes` map.
-fn endpoint_for_slot(pipeline: &om::Pipeline, slot: u32) -> Result<String, GatewayError> {
-    let uuid = pipeline
-        .member_replica_indexes
-        .iter()
-        .find(|(_, &v)| v == slot)
-        .map(|(k, _)| k.clone())
-        .ok_or_else(|| GatewayError::Internal(format!("pipeline has no member for slot {slot}")))?;
-    let member = pipeline
+/// Resolve the datanode endpoint holding EC replica `slot` (1-based) by finding
+/// the block's member whose `replica_index == slot` (W3: slot fidelity comes
+/// from the member's index, never its position). The member already carries the
+/// full `http://ip:port` dial endpoint.
+fn endpoint_for_slot(block: &BlockLocation, slot: u8) -> Result<String, GatewayError> {
+    block
         .members
         .iter()
-        .find(|m| m.uuid == uuid)
-        .ok_or_else(|| GatewayError::Internal(format!("pipeline member {uuid} missing details")))?;
-    Ok(format!("http://{}:{}", member.ip_address, member.gateway_port))
-}
-
-fn etag_of(info: &om::OmKeyInfoLite) -> String {
-    info.metadata.get(ETAG_META_KEY).cloned().unwrap_or_default()
+        .find(|m| m.replica_index == slot)
+        .map(|m| m.endpoint.clone())
+        .ok_or_else(|| GatewayError::Internal(format!("block has no member for slot {slot}")))
 }
 
 fn md5_binary(data: &[u8]) -> Vec<u8> {

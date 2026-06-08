@@ -94,7 +94,7 @@ pub struct OpenKey {
 }
 
 /// Result of [`OzoneOmClient::get_key_info`]: the committed object's size, ETag,
-/// user metadata, and block layout for reads.
+/// user metadata, modification time, and block layout for reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyMeta {
     /// Total object size in bytes.
@@ -103,6 +103,12 @@ pub struct KeyMeta {
     pub etag: Option<String>,
     /// User metadata as `(key, value)` pairs (includes any `ETAG` entry).
     pub metadata: Vec<(String, String)>,
+    /// Last-modified time in epoch milliseconds (`KeyInfo.modification_time`).
+    /// The gateway surfaces this as the S3 `Last-Modified` and uses it for
+    /// date-conditional requests; `KeyListing` has no analog because S3
+    /// `ListObjectsV2` derives each entry's `LastModified` from the same field
+    /// the gateway already folds in.
+    pub modification_time: u64,
     /// The committed block layout (W2: what was actually written).
     pub blocks: Vec<BlockLocation>,
 }
@@ -633,6 +639,7 @@ impl OzoneOmClient {
             size: ki.data_size,
             etag,
             metadata,
+            modification_time: ki.modification_time,
             blocks: blocks_of_key_info(&ki)?,
         })
     }
