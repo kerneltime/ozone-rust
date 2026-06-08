@@ -1363,3 +1363,112 @@ async fn reconstruct_announces_closed_replica_to_scm() {
         tokio::fs::remove_dir_all(&d.dir).await.ok();
     }
 }
+
+/// END-TO-END compliant self-heal: a scrubber finds on-disk rot, the COMPLIANT loop
+/// reports it UNHEALTHY (incremental), the compliant fake SCM (pipeline mode) turns
+/// that report into a real ReconstructEC, and the same loop heals the shard AT REST
+/// -- with NO externally-injected command. The compliant analog of
+/// `scrub_to_self_heal_closes_the_loop`, proving the whole loop closes over the real
+/// Apache Ozone wire protocol.
+#[tokio::test]
+async fn compliant_scrub_to_self_heal_closes_the_loop() {
+    use ozone_dn_server::CompliantScmRegistration;
+    use ozone_grpc_types::hadoop::hdds as oz;
+    use test_fixtures::compliant_scm::{CompliantPipelineFixture, CompliantScm};
+
+    let mut dns = Vec::new();
+    for i in 0..5 {
+        dns.push(spawn_dn(i).await);
+    }
+    let payload: Vec<u8> = (0..PAYLOAD_LEN).map(|i| (i * 3 + 1) as u8).collect();
+    let originals = seed_block_group(&dns, LOCAL, &payload).await;
+    let original_slot1 = originals[0].clone();
+    corrupt_chunk(&dns[0], LOCAL, 1);
+
+    let mut target = DnClient::connect(format!("http://{}", dns[0].addr)).await.unwrap();
+    let (b, c) = verify_read(1);
+    assert!(
+        target.read_chunk(&b, &c, true).await.is_err(),
+        "shard must be corrupt before the self-heal loop runs"
+    );
+
+    // Pipeline: all 5 survivors with their REPLICATION ports + the EC config -- the
+    // cluster knowledge a real SCM would supply when minting the ReconstructEC.
+    let pipeline = CompliantPipelineFixture {
+        sources: (0..5)
+            .map(|i| oz::DatanodeDetailsAndReplicaIndexProto {
+                datanode_details: oz::DatanodeDetailsProto {
+                    uuid: Some(dns[i].uuid.clone()),
+                    ip_address: "127.0.0.1".to_string(),
+                    host_name: "h".to_string(),
+                    ports: vec![oz::Port {
+                        name: "REPLICATION".to_string(),
+                        value: dns[i].addr.port() as u32,
+                    }],
+                    ..Default::default()
+                },
+                replica_index: (i + 1) as i32,
+            })
+            .collect(),
+        ec_config: oz::EcReplicationConfig {
+            data: 3,
+            parity: 2,
+            codec: "rs".to_string(),
+            ec_chunk_size: 8,
+        },
+    };
+    let scm = CompliantScm::with_pipeline(pipeline);
+    let record = scm.record();
+    let scm_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let scm_addr = scm_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(scm.into_server())
+            .serve_with_incoming(TcpListenerStream::new(scm_listener))
+            .await
+            .ok();
+    });
+
+    // The compliant self-heal stack on dns[0]: scrubber -> repair channel -> loop.
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+    let scrubber = Scrubber::new(dns[0].meta.clone(), dns[0].chunks.clone());
+    tokio::spawn(async move {
+        scrubber.run(Duration::from_millis(25), tx).await;
+    });
+    let reg = CompliantScmRegistration {
+        uuid: dns[0].uuid.clone(),
+        ip_address: "127.0.0.1".to_string(),
+        host_name: "h".to_string(),
+        data_port: dns[0].addr.port() as u32,
+        meta: dns[0].meta.clone(),
+        chunks: dns[0].chunks.clone(),
+        heartbeat_interval: Duration::from_millis(50),
+        repairs: Some(rx),
+    };
+    tokio::spawn(async move {
+        reg.run(format!("http://{scm_addr}")).await.ok();
+    });
+
+    // PROOF: slot 1 heals at rest with NO injected command -- the loop closed itself.
+    let healed = poll_verified_read(&mut target, LOCAL, 1, 250)
+        .await
+        .expect("shard must self-heal via the COMPLIANT scrubber -> SCM -> reconstruct loop");
+    assert_eq!(healed, original_slot1, "self-healed bytes are the original");
+
+    // The DN's signal was an INCREMENTAL UNHEALTHY report naming slot 1.
+    let saw_unhealthy = record.lock().heartbeats.iter().any(|hb| {
+        hb.incremental_container_report.iter().any(|icr| {
+            icr.report.iter().any(|r| {
+                r.state == oz::container_replica_proto::State::Unhealthy as i32
+                    && r.replica_index == Some(1)
+                    && r.container_id == CONTAINER as i64
+            })
+        })
+    });
+    assert!(saw_unhealthy, "expected an INCREMENTAL UNHEALTHY report for slot 1");
+
+    for d in &dns {
+        d.handle.abort();
+        tokio::fs::remove_dir_all(&d.dir).await.ok();
+    }
+}

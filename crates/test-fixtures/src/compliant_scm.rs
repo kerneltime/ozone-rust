@@ -10,7 +10,8 @@
 //! - commands ride the heartbeat RESPONSE and are drained remove-on-read, exactly
 //!   once, mirroring SCM's per-DN `CommandQueue`.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -20,6 +21,62 @@ use ozone_grpc_types::hadoop::hdds as oz;
 use oz::storage_container_datanode_protocol_service_server::{
     StorageContainerDatanodeProtocolService, StorageContainerDatanodeProtocolServiceServer,
 };
+
+/// Monotonic command ids for synthesized commands (uniqueness is all that matters).
+static NEXT_CMD_ID: AtomicU64 = AtomicU64::new(1);
+
+/// The survivor pipeline + EC config a ReconstructEC needs — what only SCM knows.
+/// A test configures it once via [`CompliantScm::with_pipeline`]; the fake turns an
+/// inbound UNHEALTHY incremental container report into a real ReconstructEC targeting
+/// the reporting DN — the SCM side of the compliant self-heal loop.
+#[derive(Clone)]
+pub struct CompliantPipelineFixture {
+    /// Survivor datanodes, each carrying its EC slot inline (`replica_index`) and a
+    /// REPLICATION port (so the reconstructing target can dial it).
+    pub sources: Vec<oz::DatanodeDetailsAndReplicaIndexProto>,
+    /// EC config of the container (real wire form).
+    pub ec_config: oz::EcReplicationConfig,
+}
+
+/// Synthesize a ReconstructEC for `(container, slot)` targeting `target_uuid`, built
+/// from the pipeline. `missing_container_indexes` is the byte-per-slot wire form;
+/// `targets[0]` pairs positionally with it. The target carries only its uuid (the
+/// handler matches on uuid and writes locally; it never dials the target).
+fn synth_reconstruct(
+    container_id: i64,
+    slot: i32,
+    target_uuid: &str,
+    pipe: &CompliantPipelineFixture,
+) -> oz::ScmCommandProto {
+    oz::ScmCommandProto {
+        command_type: oz::scm_command_proto::Type::ReconstructEcContainersCommand as i32,
+        reconstruct_ec_containers_command_proto: Some(oz::ReconstructEcContainersCommandProto {
+            container_id,
+            sources: pipe.sources.clone(),
+            targets: vec![oz::DatanodeDetailsProto {
+                uuid: Some(target_uuid.to_string()),
+                ..Default::default()
+            }],
+            missing_container_indexes: vec![slot as u8],
+            ec_replication_config: pipe.ec_config.clone(),
+            cmd_id: NEXT_CMD_ID.fetch_add(1, Ordering::Relaxed) as i64,
+        }),
+        ..Default::default()
+    }
+}
+
+/// Whether `cmd` should be delivered to the DN heartbeating as `uuid`. A ReconstructEC
+/// names explicit targets, so it goes ONLY to a matching DN (otherwise a peer's
+/// heartbeat would consume — and drop — another DN's command). Other commands deliver
+/// to any heartbeat.
+fn command_targets(cmd: &oz::ScmCommandProto, uuid: &str) -> bool {
+    if cmd.command_type == oz::scm_command_proto::Type::ReconstructEcContainersCommand as i32 {
+        if let Some(c) = &cmd.reconstruct_ec_containers_command_proto {
+            return c.targets.iter().any(|t| t.uuid.as_deref() == Some(uuid));
+        }
+    }
+    true
+}
 
 /// Inspectable record of exactly what the datanode sent on the wire.
 #[derive(Default)]
@@ -39,6 +96,12 @@ pub struct CompliantScm {
     /// Commands queued for delivery; drained remove-on-read on each heartbeat,
     /// exactly like the real per-DN command queue.
     pending: Arc<Mutex<VecDeque<oz::ScmCommandProto>>>,
+    /// If set, an inbound UNHEALTHY incremental report synthesizes a ReconstructEC
+    /// (built from this pipeline) targeting the reporting DN, queued for delivery.
+    pipeline: Option<CompliantPipelineFixture>,
+    /// `(container_id, replica_index)` already turned into a command, so a duplicate
+    /// UNHEALTHY report does not issue a second reconstruct.
+    issued: Arc<Mutex<HashSet<(i64, i32)>>>,
 }
 
 impl Default for CompliantScm {
@@ -54,6 +117,8 @@ impl CompliantScm {
             cluster_id: "test-cluster".to_string(),
             record: Arc::new(Mutex::new(ScmRecord::default())),
             pending: Arc::new(Mutex::new(VecDeque::new())),
+            pipeline: None,
+            issued: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -63,6 +128,16 @@ impl CompliantScm {
         let s = Self::new();
         *s.pending.lock() = commands.into();
         s
+    }
+
+    /// A compliant SCM that reacts to an UNHEALTHY incremental report by issuing a
+    /// ReconstructEC for that container+slot (built from `pipeline`), delivered on a
+    /// later heartbeat — the SCM side of the compliant self-heal loop.
+    pub fn with_pipeline(pipeline: CompliantPipelineFixture) -> Self {
+        Self {
+            pipeline: Some(pipeline),
+            ..Self::new()
+        }
     }
 
     /// Handle to inspect what the datanode sent. Clone BEFORE [`Self::into_server`].
@@ -137,9 +212,41 @@ impl StorageContainerDatanodeProtocolService for CompliantScm {
                     .send_heartbeat_request
                     .ok_or_else(|| Status::invalid_argument("missing sendHeartbeatRequest"))?;
                 let uuid = hb.datanode_details.uuid.clone().unwrap_or_default();
+                // Pipeline self-heal: an UNHEALTHY incremental report becomes a
+                // ReconstructEC targeting the reporting DN, deduped by (container, slot).
+                if let Some(pipe) = &self.pipeline {
+                    for icr in &hb.incremental_container_report {
+                        for cr in &icr.report {
+                            if cr.state != oz::container_replica_proto::State::Unhealthy as i32 {
+                                continue;
+                            }
+                            let slot = cr.replica_index.unwrap_or(0);
+                            if !self.issued.lock().insert((cr.container_id, slot)) {
+                                continue;
+                            }
+                            self.pending
+                                .lock()
+                                .push_back(synth_reconstruct(cr.container_id, slot, &uuid, pipe));
+                        }
+                    }
+                }
                 self.record.lock().heartbeats.push(hb);
-                // Remove-on-read: deliver every currently-pending command once.
-                let commands: Vec<_> = self.pending.lock().drain(..).collect();
+                // Remove-on-read: deliver every currently-pending command that TARGETS
+                // this DN, exactly once (a ReconstructEC for another DN stays queued).
+                let commands: Vec<_> = {
+                    let mut q = self.pending.lock();
+                    let mut keep = VecDeque::with_capacity(q.len());
+                    let mut out = Vec::new();
+                    while let Some(c) = q.pop_front() {
+                        if command_targets(&c, &uuid) {
+                            out.push(c);
+                        } else {
+                            keep.push_back(c);
+                        }
+                    }
+                    *q = keep;
+                    out
+                };
                 resp.send_heartbeat_response = Some(oz::ScmHeartbeatResponseProto {
                     datanode_uuid: uuid,
                     commands,
