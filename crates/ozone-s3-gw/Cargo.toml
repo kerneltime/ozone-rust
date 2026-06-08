@@ -36,3 +36,4 @@ ozone-dn-server = { path = "../ozone-dn-server" }
 ozone-fjall-store = { path = "../ozone-fjall-store" }
 tokio-stream = { workspace = true }
 aws-sdk-s3 = { workspace = true }
+proptest = { workspace = true }

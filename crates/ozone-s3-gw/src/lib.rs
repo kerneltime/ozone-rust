@@ -1360,6 +1360,47 @@ fn iso8601_millis(ms: u64) -> String {
 mod tests {
     use super::*;
 
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(400))]
+
+        /// `parse_range` must NEVER yield a Satisfiable range that is out of bounds:
+        /// the GET path slices `data[start..=end]`, so `start > end` or
+        /// `end >= total` would PANIC on a malicious Range header (the same
+        /// untrusted-input-to-slice bug class as the EC decoder, on the HTTP edge).
+        #[test]
+        fn parse_range_never_yields_out_of_bounds(
+            header in ".*",
+            total in 0usize..100_000,
+        ) {
+            match parse_range(&header, total) {
+                RangeSpec::Satisfiable(start, end) => {
+                    proptest::prop_assert!(start <= end, "start {} > end {}", start, end);
+                    proptest::prop_assert!(end < total, "end {} not < total {}", end, total);
+                }
+                RangeSpec::Unsatisfiable | RangeSpec::Whole => {}
+            }
+        }
+
+        /// Every S3 request parser takes raw, untrusted client bytes/strings; none
+        /// may panic on ANY input (a panic here is a per-request DoS).
+        #[test]
+        fn s3_request_parsers_never_panic(
+            s in ".*",
+            bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0usize..600),
+        ) {
+            let _ = pct_decode(&s);
+            let _ = parse_http_date(&s);
+            let _ = parse_tagging_header(&s);
+            let _ = parse_object_attributes_header(&s);
+            let _ = parse_range(&s, 1000);
+            let _ = parse_range(&s, 0);
+            let _ = extract_xml_element(&s, "Tag");
+            let _ = parse_complete_parts(&bytes);
+            let _ = parse_tagging(&bytes);
+            let _ = parse_delete_request(&bytes);
+        }
+    }
+
     #[test]
     fn delete_result_xml_reports_partial_failure() {
         // A batch delete where one key fails must report the OTHERS as deleted and
