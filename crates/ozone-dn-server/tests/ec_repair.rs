@@ -16,17 +16,19 @@ use std::time::Duration;
 use bytes::Bytes;
 use ozone_dn_client::DnClient;
 use ozone_dn_server::scrub::Scrubber;
-use ozone_dn_server::{repair, DatanodeService, ScmRegistration};
+use ozone_dn_server::{repair, CompliantScmRegistration, DatanodeService, ScmRegistration};
 use ozone_ec::stripe::{encode_object, EncodedShards};
 use ozone_ec::Profile;
 use ozone_fjall_store::FjallMetaStore;
 use ozone_grpc_types::dn::v1 as dn;
+use ozone_grpc_types::hadoop::hdds as oz;
 use ozone_grpc_types::scm::dn::v1 as scm;
 use ozone_storage::{checksum, ChunkStore, FileChunkStore, MetaStore, StorageError};
 use ozone_types::{
     BlockData, BlockId, ChecksumType, ChunkInfo, ContainerId, ContainerInfo, ContainerState,
     EcReplicationConfig, LocalId, ReplicaIndex,
 };
+use test_fixtures::compliant_scm::{CompliantPipelineFixture, CompliantScm};
 use test_fixtures::fake_scm::{FakeScm, PipelineFixture};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -439,6 +441,76 @@ async fn poll_verified_read(target: &mut DnClient, local: u64, slot: u8, tries: 
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     None
+}
+
+// ---- compliant self-heal harness (real Apache Ozone wire protocol) ----
+
+/// The compliant survivor pipeline: all 5 datanodes, each carrying its EC slot inline
+/// and a REPLICATION port, plus the EC config -- the cluster knowledge a real SCM
+/// supplies in a ReconstructEC. `handle_reconstruct` excludes the slot(s) being
+/// rebuilt, so this is correct for any target slot.
+fn compliant_pipeline_for(dns: &[Dn]) -> CompliantPipelineFixture {
+    CompliantPipelineFixture {
+        sources: (0..5)
+            .map(|i| oz::DatanodeDetailsAndReplicaIndexProto {
+                datanode_details: oz::DatanodeDetailsProto {
+                    uuid: Some(dns[i].uuid.clone()),
+                    ip_address: "127.0.0.1".to_string(),
+                    host_name: "h".to_string(),
+                    ports: vec![oz::Port {
+                        name: "REPLICATION".to_string(),
+                        value: dns[i].addr.port() as u32,
+                    }],
+                    ..Default::default()
+                },
+                replica_index: (i + 1) as i32,
+            })
+            .collect(),
+        ec_config: oz::EcReplicationConfig {
+            data: 3,
+            parity: 2,
+            codec: "rs".to_string(),
+            ec_chunk_size: 8,
+        },
+    }
+}
+
+/// Serve `scm` (the compliant fake) and return its endpoint.
+async fn serve_compliant_scm(scm: CompliantScm) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(scm.into_server())
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .ok();
+    });
+    format!("http://{addr}")
+}
+
+/// Run a scrubber (short interval) + the COMPLIANT SCM loop on `dn`, wired via the
+/// repair channel, against the SCM at `endpoint`. No command is injected -- repair is
+/// driven entirely by the closed loop.
+fn spawn_compliant_heal_stack(dn: &Dn, endpoint: String) {
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+    let scrubber = Scrubber::new(dn.meta.clone(), dn.chunks.clone());
+    tokio::spawn(async move {
+        scrubber.run(Duration::from_millis(25), tx).await;
+    });
+    let reg = CompliantScmRegistration {
+        uuid: dn.uuid.clone(),
+        ip_address: "127.0.0.1".to_string(),
+        host_name: "h".to_string(),
+        data_port: dn.addr.port() as u32,
+        meta: dn.meta.clone(),
+        chunks: dn.chunks.clone(),
+        heartbeat_interval: Duration::from_millis(50),
+        repairs: Some(rx),
+    };
+    tokio::spawn(async move {
+        reg.run(endpoint).await.ok();
+    });
 }
 
 #[tokio::test]
@@ -917,10 +989,6 @@ async fn reconstruct_uses_min_block_group_len() {
 /// directly elsewhere; this proves the dispatch decodes the wire correctly).
 #[tokio::test]
 async fn compliant_reconstruct_command_rebuilds_target_slot() {
-    use ozone_dn_server::CompliantScmRegistration;
-    use ozone_grpc_types::hadoop::hdds as oz;
-    use test_fixtures::compliant_scm::CompliantScm;
-
     let mut dns = Vec::new();
     for i in 0..6 {
         dns.push(spawn_dn(i).await);
@@ -1261,10 +1329,6 @@ async fn reconstruct_rolls_back_empty_rebuild_no_spurious_replica() {
 /// SCM's prior UNHEALTHY entry. Without it SCM never learns the replica was restored.
 #[tokio::test]
 async fn reconstruct_announces_closed_replica_to_scm() {
-    use ozone_dn_server::CompliantScmRegistration;
-    use ozone_grpc_types::hadoop::hdds as oz;
-    use test_fixtures::compliant_scm::CompliantScm;
-
     let mut dns = Vec::new();
     for i in 0..6 {
         dns.push(spawn_dn(i).await);
@@ -1372,10 +1436,6 @@ async fn reconstruct_announces_closed_replica_to_scm() {
 /// Apache Ozone wire protocol.
 #[tokio::test]
 async fn compliant_scrub_to_self_heal_closes_the_loop() {
-    use ozone_dn_server::CompliantScmRegistration;
-    use ozone_grpc_types::hadoop::hdds as oz;
-    use test_fixtures::compliant_scm::{CompliantPipelineFixture, CompliantScm};
-
     let mut dns = Vec::new();
     for i in 0..5 {
         dns.push(spawn_dn(i).await);
@@ -1392,62 +1452,9 @@ async fn compliant_scrub_to_self_heal_closes_the_loop() {
         "shard must be corrupt before the self-heal loop runs"
     );
 
-    // Pipeline: all 5 survivors with their REPLICATION ports + the EC config -- the
-    // cluster knowledge a real SCM would supply when minting the ReconstructEC.
-    let pipeline = CompliantPipelineFixture {
-        sources: (0..5)
-            .map(|i| oz::DatanodeDetailsAndReplicaIndexProto {
-                datanode_details: oz::DatanodeDetailsProto {
-                    uuid: Some(dns[i].uuid.clone()),
-                    ip_address: "127.0.0.1".to_string(),
-                    host_name: "h".to_string(),
-                    ports: vec![oz::Port {
-                        name: "REPLICATION".to_string(),
-                        value: dns[i].addr.port() as u32,
-                    }],
-                    ..Default::default()
-                },
-                replica_index: (i + 1) as i32,
-            })
-            .collect(),
-        ec_config: oz::EcReplicationConfig {
-            data: 3,
-            parity: 2,
-            codec: "rs".to_string(),
-            ec_chunk_size: 8,
-        },
-    };
-    let scm = CompliantScm::with_pipeline(pipeline);
+    let scm = CompliantScm::with_pipeline(compliant_pipeline_for(&dns));
     let record = scm.record();
-    let scm_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let scm_addr = scm_listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        Server::builder()
-            .add_service(scm.into_server())
-            .serve_with_incoming(TcpListenerStream::new(scm_listener))
-            .await
-            .ok();
-    });
-
-    // The compliant self-heal stack on dns[0]: scrubber -> repair channel -> loop.
-    let (tx, rx) = tokio::sync::mpsc::channel(64);
-    let scrubber = Scrubber::new(dns[0].meta.clone(), dns[0].chunks.clone());
-    tokio::spawn(async move {
-        scrubber.run(Duration::from_millis(25), tx).await;
-    });
-    let reg = CompliantScmRegistration {
-        uuid: dns[0].uuid.clone(),
-        ip_address: "127.0.0.1".to_string(),
-        host_name: "h".to_string(),
-        data_port: dns[0].addr.port() as u32,
-        meta: dns[0].meta.clone(),
-        chunks: dns[0].chunks.clone(),
-        heartbeat_interval: Duration::from_millis(50),
-        repairs: Some(rx),
-    };
-    tokio::spawn(async move {
-        reg.run(format!("http://{scm_addr}")).await.ok();
-    });
+    spawn_compliant_heal_stack(&dns[0], serve_compliant_scm(scm).await);
 
     // PROOF: slot 1 heals at rest with NO injected command -- the loop closed itself.
     let healed = poll_verified_read(&mut target, LOCAL, 1, 250)
@@ -1466,6 +1473,202 @@ async fn compliant_scrub_to_self_heal_closes_the_loop() {
         })
     });
     assert!(saw_unhealthy, "expected an INCREMENTAL UNHEALTHY report for slot 1");
+
+    for d in &dns {
+        d.handle.abort();
+        tokio::fs::remove_dir_all(&d.dir).await.ok();
+    }
+}
+
+#[tokio::test]
+async fn compliant_self_heal_covers_all_block_groups_in_replica() {
+    let mut dns = Vec::new();
+    for i in 0..5 {
+        dns.push(spawn_dn(i).await);
+    }
+    let o1 = seed_block_group(&dns, 1, &(0..PAYLOAD_LEN).map(|i| (i * 3 + 1) as u8).collect::<Vec<_>>()).await;
+    let o2 = seed_block_group(&dns, 2, &(0..PAYLOAD_LEN).map(|i| (i * 5 + 2) as u8).collect::<Vec<_>>()).await;
+    // Corrupt slot 1 in BOTH of this DN's block groups.
+    corrupt_chunk(&dns[0], 1, 1);
+    corrupt_chunk(&dns[0], 2, 1);
+
+    let scm = CompliantScm::with_pipeline(compliant_pipeline_for(&dns));
+    let record = scm.record();
+    spawn_compliant_heal_stack(&dns[0], serve_compliant_scm(scm).await);
+
+    let mut target = DnClient::connect(format!("http://{}", dns[0].addr)).await.unwrap();
+    // ONE UNHEALTHY report (latch) -> one ReconstructEC, whose survivor-enumeration
+    // rebuilds slot 1 across BOTH block groups of the replica.
+    let h1 = poll_verified_read(&mut target, 1, 1, 250).await.expect("block 1 heals");
+    let h2 = poll_verified_read(&mut target, 2, 1, 250).await.expect("block 2 heals");
+    assert_eq!(h1, o1[0]);
+    assert_eq!(h2, o2[0]);
+
+    // The rising-edge latch collapses both findings into a SINGLE UNHEALTHY report.
+    let unhealthy = record
+        .lock()
+        .heartbeats
+        .iter()
+        .flat_map(|hb| hb.incremental_container_report.clone())
+        .flat_map(|icr| icr.report)
+        .filter(|r| {
+            r.state == oz::container_replica_proto::State::Unhealthy as i32
+                && r.replica_index == Some(1)
+        })
+        .count();
+    assert_eq!(
+        unhealthy, 1,
+        "the rising-edge latch must collapse both block-group findings into one report"
+    );
+
+    for d in &dns {
+        d.handle.abort();
+        tokio::fs::remove_dir_all(&d.dir).await.ok();
+    }
+}
+
+#[tokio::test]
+async fn compliant_self_heal_gives_up_cleanly_when_unrecoverable() {
+    let mut dns = Vec::new();
+    for i in 0..5 {
+        dns.push(spawn_dn(i).await);
+    }
+    // Block group 1: corrupt slot 1 (target) AND the two parity peers (slots 4,5),
+    // leaving only slots 2,3 valid = 2 < k=3 -> unrecoverable.
+    let _o1 = seed_block_group(&dns, 1, &(0..PAYLOAD_LEN).map(|i| (i * 3 + 1) as u8).collect::<Vec<_>>()).await;
+    corrupt_chunk(&dns[0], 1, 1);
+    corrupt_chunk(&dns[3], 1, 4);
+    corrupt_chunk(&dns[4], 1, 5);
+    // Block group 2: fully intact -- the liveness control.
+    let o2 = seed_block_group(&dns, 2, &(0..PAYLOAD_LEN).map(|i| (i * 7 + 9) as u8).collect::<Vec<_>>()).await;
+
+    let scm = CompliantScm::with_pipeline(compliant_pipeline_for(&dns));
+    spawn_compliant_heal_stack(&dns[0], serve_compliant_scm(scm).await);
+    let mut target = DnClient::connect(format!("http://{}", dns[0].addr)).await.unwrap();
+
+    // Give the loop ample time to attempt + fail the unrecoverable repair.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    // The unrecoverable shard stays corrupt (no panic, no garbage written).
+    let (b, c) = verify_read_at(1, 1);
+    assert!(
+        target.read_chunk(&b, &c, true).await.is_err(),
+        "an unrecoverable shard must remain corrupt, not be half-written"
+    );
+    // The datanode stays live: the intact block group (slot 1 of group 2) still serves.
+    let live = poll_verified_read(&mut target, 2, 1, 50)
+        .await
+        .expect("intact block group must still be served after a failed repair");
+    assert_eq!(live, o2[0]);
+
+    for d in &dns {
+        d.handle.abort();
+        tokio::fs::remove_dir_all(&d.dir).await.ok();
+    }
+}
+
+#[tokio::test]
+async fn compliant_concurrent_self_heal_of_two_slots() {
+    let mut dns = Vec::new();
+    for i in 0..5 {
+        dns.push(spawn_dn(i).await);
+    }
+    let originals = seed_block_group(&dns, LOCAL, &(0..PAYLOAD_LEN).map(|i| (i * 3 + 1) as u8).collect::<Vec<_>>()).await;
+    // Corrupt two DATA shards at once -- slot 1 (dns[0]) and slot 2 (dns[1]). Both must
+    // self-heal even though each command targets a DIFFERENT DN: the fake SCM routes
+    // each synthesized ReconstructEC only to the DN its targets name (one CompliantScm,
+    // two heartbeating DNs). Survivors among slots 3,4,5 (= k=3) always suffice.
+    corrupt_chunk(&dns[0], LOCAL, 1);
+    corrupt_chunk(&dns[1], LOCAL, 2);
+
+    let endpoint = serve_compliant_scm(CompliantScm::with_pipeline(compliant_pipeline_for(&dns))).await;
+    spawn_compliant_heal_stack(&dns[0], endpoint.clone());
+    spawn_compliant_heal_stack(&dns[1], endpoint);
+
+    let mut t0 = DnClient::connect(format!("http://{}", dns[0].addr)).await.unwrap();
+    let mut t1 = DnClient::connect(format!("http://{}", dns[1].addr)).await.unwrap();
+    let h0 = poll_verified_read(&mut t0, LOCAL, 1, 300).await.expect("slot 1 self-heals");
+    let h1 = poll_verified_read(&mut t1, LOCAL, 2, 300).await.expect("slot 2 self-heals");
+    assert_eq!(h0, originals[0], "slot 1 healed to the original bytes");
+    assert_eq!(h1, originals[1], "slot 2 healed to the original bytes");
+
+    for d in &dns {
+        d.handle.abort();
+        tokio::fs::remove_dir_all(&d.dir).await.ok();
+    }
+}
+
+#[tokio::test]
+async fn compliant_malformed_reconstruct_does_not_stall_the_loop() {
+    let mut dns = Vec::new();
+    for i in 0..5 {
+        dns.push(spawn_dn(i).await);
+    }
+    let payload: Vec<u8> = (0..PAYLOAD_LEN).map(|i| (i * 3 + 1) as u8).collect();
+    seed_block_group(&dns, LOCAL, &payload).await;
+
+    // A ReconstructEC with an UNPARSEABLE codec, FOLLOWED by a CloseContainer in the
+    // same batch. The malformed command must be handled gracefully (logged, skipped)
+    // without stalling the loop, so the close still takes effect.
+    let bad = oz::ScmCommandProto {
+        command_type: oz::scm_command_proto::Type::ReconstructEcContainersCommand as i32,
+        reconstruct_ec_containers_command_proto: Some(oz::ReconstructEcContainersCommandProto {
+            container_id: CONTAINER as i64,
+            sources: Vec::new(),
+            targets: vec![oz::DatanodeDetailsProto {
+                uuid: Some("dn-0".to_string()),
+                ..Default::default()
+            }],
+            missing_container_indexes: vec![1u8],
+            ec_replication_config: oz::EcReplicationConfig {
+                data: 3,
+                parity: 2,
+                codec: "not-a-codec".to_string(),
+                ec_chunk_size: 8,
+            },
+            cmd_id: 1,
+        }),
+        ..Default::default()
+    };
+    let close = oz::ScmCommandProto {
+        command_type: oz::scm_command_proto::Type::CloseContainerCommand as i32,
+        close_container_command_proto: Some(oz::CloseContainerCommandProto {
+            container_id: CONTAINER as i64,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let endpoint = serve_compliant_scm(CompliantScm::with_commands(vec![bad, close])).await;
+    let reg = CompliantScmRegistration {
+        uuid: "dn-0".to_string(),
+        ip_address: "127.0.0.1".to_string(),
+        host_name: "h".to_string(),
+        data_port: dns[0].addr.port() as u32,
+        meta: dns[0].meta.clone(),
+        chunks: dns[0].chunks.clone(),
+        heartbeat_interval: Duration::from_millis(50),
+        repairs: None,
+    };
+    tokio::spawn(async move {
+        reg.run(endpoint).await.ok();
+    });
+
+    // The CloseContainer must take effect -> the loop survived the malformed command.
+    let mut closed = false;
+    for _ in 0..150 {
+        if let Some(ci) = dns[0].meta.get_container(ContainerId(CONTAINER)).await.unwrap() {
+            if ci.state == ContainerState::Closed {
+                closed = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        closed,
+        "the loop must process CloseContainer after a malformed ReconstructEC"
+    );
 
     for d in &dns {
         d.handle.abort();

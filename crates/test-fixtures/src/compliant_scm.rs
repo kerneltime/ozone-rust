@@ -401,4 +401,62 @@ mod tests {
             .unwrap();
         assert!(second.commands.is_empty(), "remove-on-read: not redelivered");
     }
+
+    #[tokio::test]
+    async fn reconstruct_command_routes_only_to_its_target_dn() {
+        // A ReconstructEC naming target "dn-1" must NOT be consumed by "dn-0"'s
+        // heartbeat (else it would be drained and dropped, losing dn-1's repair); it
+        // stays queued until dn-1 heartbeats. This is the routing two DNs sharing one
+        // SCM rely on so they don't eat each other's commands.
+        let cmd = oz::ScmCommandProto {
+            command_type: oz::scm_command_proto::Type::ReconstructEcContainersCommand as i32,
+            reconstruct_ec_containers_command_proto: Some(oz::ReconstructEcContainersCommandProto {
+                container_id: 1,
+                sources: Vec::new(),
+                targets: vec![oz::DatanodeDetailsProto {
+                    uuid: Some("dn-1".to_string()),
+                    ..Default::default()
+                }],
+                missing_container_indexes: vec![1u8],
+                ec_replication_config: oz::EcReplicationConfig {
+                    data: 3,
+                    parity: 2,
+                    codec: "rs".to_string(),
+                    ec_chunk_size: 8,
+                },
+                cmd_id: 1,
+            }),
+            ..Default::default()
+        };
+        let mut client = Client::connect(serve(CompliantScm::with_commands(vec![cmd])).await)
+            .await
+            .unwrap();
+
+        // dn-0 heartbeats: the command targets dn-1, so dn-0 receives nothing.
+        let r0 = client
+            .submit_request(heartbeat_req("dn-0"))
+            .await
+            .unwrap()
+            .into_inner()
+            .send_heartbeat_response
+            .unwrap();
+        assert!(
+            r0.commands.is_empty(),
+            "a ReconstructEC for dn-1 must not be delivered to dn-0"
+        );
+
+        // dn-1 heartbeats: it receives its command (still queued, not lost).
+        let r1 = client
+            .submit_request(heartbeat_req("dn-1"))
+            .await
+            .unwrap()
+            .into_inner()
+            .send_heartbeat_response
+            .unwrap();
+        assert_eq!(
+            r1.commands.len(),
+            1,
+            "the ReconstructEC is delivered to its target dn-1"
+        );
+    }
 }
