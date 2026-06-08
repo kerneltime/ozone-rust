@@ -43,11 +43,23 @@ survivors disagree on length could be rebuilt at the wrong length. Both are fixe
       `decode_object(profile, len, views)` then `encode_object` to recover the exact
       stored shards (data + parity byte-identical — proven by `repair_identity`).
    d. For each `slot` in `missing_slots`: persist the rebuilt shard locally (this DN is
-      the target) — `write_chunk` + recomputed CRC + `put_block` with `block_group_len = len`,
-      into a RECOVERING-then-CLOSED container (B5).
-3. **Group-atomic:** accumulate; on a fatal error mid-group, roll back this DN's
-   created container/blocks. `[I] for a single-target self-rebuild, per-block idempotent
-   writes + a final close is sufficient; full multi-target coordinator push is deferred.]`
+      the target) — `write_chunk` + recomputed CRC + `put_block` with `block_group_len = len`.
+3. **Lifecycle (B5-lite, IMPLEMENTED).** The in-progress state is `Open` (we do not yet
+   have a distinct `RECOVERING` enum — see §6); the terminal state is `Closed`:
+   - target absent → create `Open`, rebuild, then `set_container_state(Closed)` on
+     success — a complete replica and a valid future EC source (real Ozone's
+     RECOVERING→CLOSED). `we_created = true`.
+   - target pre-existing `Open` (the in-place scrubber heal) → rebuild in place, leave
+     `Open`. `we_created = false`. NEVER closed or deleted here.
+   - target `Closed` → already reconstructed; a re-delivered command is a no-op.
+4. **Group-atomic rollback (IMPLEMENTED).** A mid-rebuild error on a container WE
+   created deletes it (metadata + bytes) before surfacing the error, so a half-built
+   replica is never left to be reported healthy (which could make SCM trim a real
+   replica → data loss). A pre-existing container is NEVER deleted on a rebuild error —
+   that is the `we_created` safety boundary, proven load-bearing by mutation
+   (unconditional rollback fails `reconstruct_keeps_preexisting_container_on_failure`).
+   `[I] single-target self-rebuild; the full multi-target coordinator push-to-peer is
+   deferred and does not change per-shard correctness.]`
 
 **Scope decision [I]:** real Ozone designates ONE coordinator that pushes rebuilt
 shards to PEER targets. For the Rust slice we model each TARGET DN rebuilding its OWN
@@ -85,14 +97,32 @@ not change the per-shard correctness (survivor-enum + min-length + decode).
 4. **unrecoverable**: `< k` good survivors ⇒ no write, shard stays absent, no panic.
 5. **idempotent re-delivery**: a second identical command is a no-op (already-clean
    shard skipped).
-6. RECOVERING lifecycle (B5): create RECOVERING with replica_index → write → close; a
-   failure deletes the RECOVERING container (state-guarded), never a CLOSED one.
+6. Lifecycle (B5-lite, DONE): `reconstruct_closes_fresh_target_and_noops_on_redelivery`
+   (create Open → rebuild → CLOSED; re-delivery to CLOSED is a no-op),
+   `reconstruct_rolls_back_created_container_on_failure` (a write fault mid-rebuild
+   deletes the container WE created), `reconstruct_keeps_preexisting_container_on_failure`
+   (a pre-existing container survives a rebuild failure — never deleted). All three were
+   confirmed load-bearing by mutating the close / rollback / `we_created` guard and
+   watching exactly the matching test fail.
 
-## 6. B5 prerequisites (data-plane additions, Rust-native, all-Rust fleet)
+## 6. B5 status (data-plane additions, Rust-native, all-Rust fleet)
 
-- `ContainerState::Recovering` (or reuse Open with a recovering flag) so a fresh target
-  can be provisioned before writes and the G1/G2 refuse-non-Open guard still applies to
-  real CLOSED containers.
-- `CreateContainerRequest.replica_index` so the target stamps its EC slot.
-- A state-guarded delete for rollback.
-- `DnClient::list_blocks` survivor enumeration (confirm it exists / exercise it).
+- **[DONE, reuse-Open]** In-progress state. B5-lite reuses `Open` as the in-progress
+  state and `Closed` as terminal, gated by `we_created`. A distinct
+  `ContainerState::Recovering` enum is DEFERRED; it would let a full container report
+  exclude an in-progress target as a source even across a DN restart. Today the report
+  risk is absent for a different reason: the heartbeat loop is single-threaded and the
+  full container report is built only at registration, so no report observes the Open
+  target mid-rebuild (a crash mid-rebuild leaves an Open, non-CLOSED container that SCM
+  does not treat as an EC source; a `Recovering` enum + restart sweep would make this
+  explicit rather than incidental).
+- **[DONE]** State-guarded delete for rollback — `MetaStore::delete_container` +
+  `ChunkStore::delete_container`, invoked only when `we_created`.
+- **[DONE]** `DnClient::list_blocks` survivor enumeration — exercised by every B4/B5
+  test (the fresh target enumerates slots from the survivor peers).
+- **[DEFERRED]** Reporting the restored replica back to SCM (incremental container
+  report of the CLOSED/healed replica + clearing the scrubber latch) so SCM's replica
+  view converges — the self-heal loop's HA-completion signal. Tracked as the next step
+  after B5-lite; without it SCM keeps its last (UNHEALTHY / under-replicated) view.
+- **[N/A for self-rebuild]** `CreateContainerRequest.replica_index` — the target stamps
+  its slot via the per-block `ReplicaIndex` on `put_block`, not a container field.

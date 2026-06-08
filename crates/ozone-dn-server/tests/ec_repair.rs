@@ -22,7 +22,7 @@ use ozone_ec::Profile;
 use ozone_fjall_store::FjallMetaStore;
 use ozone_grpc_types::dn::v1 as dn;
 use ozone_grpc_types::scm::dn::v1 as scm;
-use ozone_storage::{checksum, ChunkStore, FileChunkStore, MetaStore};
+use ozone_storage::{checksum, ChunkStore, FileChunkStore, MetaStore, StorageError};
 use ozone_types::{
     BlockData, BlockId, ChecksumType, ChunkInfo, ContainerId, ContainerInfo, ContainerState,
     EcReplicationConfig, LocalId, ReplicaIndex,
@@ -1011,4 +1011,203 @@ async fn compliant_reconstruct_command_rebuilds_target_slot() {
         d.handle.abort();
         tokio::fs::remove_dir_all(&d.dir).await.ok();
     }
+}
+
+// ---- B5: RECOVERING-then-CLOSED lifecycle + group-atomic rollback ----
+
+/// A [`ChunkStore`] whose `write_chunk` always fails, to deterministically abort a
+/// rebuild AFTER the target container has been provisioned. Reads/deletes delegate
+/// to a real inner store so survivor enumeration and rollback cleanup still work.
+struct FailWritesChunkStore {
+    inner: FileChunkStore,
+}
+
+#[async_trait::async_trait]
+impl ChunkStore for FailWritesChunkStore {
+    async fn write_chunk(
+        &self,
+        _b: &BlockId,
+        _c: &ChunkInfo,
+        _d: Bytes,
+    ) -> Result<(), StorageError> {
+        Err(StorageError::Meta("injected write failure".to_string()))
+    }
+    async fn read_chunk(&self, b: &BlockId, c: &ChunkInfo) -> Result<Bytes, StorageError> {
+        self.inner.read_chunk(b, c).await
+    }
+    async fn delete_chunk(&self, b: &BlockId, c: &ChunkInfo) -> Result<(), StorageError> {
+        self.inner.delete_chunk(b, c).await
+    }
+    async fn delete_container(&self, container: ContainerId) -> Result<(), StorageError> {
+        self.inner.delete_container(container).await
+    }
+}
+
+#[tokio::test]
+async fn reconstruct_closes_fresh_target_and_noops_on_redelivery() {
+    // dns[0..4] hold slots 1..5; dns[5] is a fresh target rebuilding slot 1.
+    let mut dns = Vec::new();
+    for i in 0..6 {
+        dns.push(spawn_dn(i).await);
+    }
+    let payload: Vec<u8> = (0..PAYLOAD_LEN).map(|i| (i * 3 + 1) as u8).collect();
+    let originals = seed_block_group(&dns, LOCAL, &payload).await;
+
+    let sources: Vec<(u8, String)> = (1..5)
+        .map(|i| ((i + 1) as u8, format!("http://{}", dns[i].addr)))
+        .collect();
+    let mk = || repair::ReconstructInput {
+        container: ContainerId(CONTAINER),
+        ec: ec(),
+        missing_slots: vec![1],
+        sources: sources.clone(),
+    };
+
+    // First delivery: the fresh target rebuilds slot 1, then CLOSES the container
+    // (RECOVERING -> CLOSED) -- a complete replica and a valid future EC source.
+    let r1 = repair::reconstruct_from_survivors(&dns[5].meta, &dns[5].chunks, mk())
+        .await
+        .expect("first reconstruct succeeds");
+    assert_eq!(r1, vec![LOCAL]);
+    let ci = dns[5]
+        .meta
+        .get_container(ContainerId(CONTAINER))
+        .await
+        .unwrap()
+        .expect("target container present after rebuild");
+    assert_eq!(
+        ci.state,
+        ContainerState::Closed,
+        "a rebuilt whole replica is completed by closing it"
+    );
+
+    // The rebuilt slot reads clean even though the container is CLOSED (reads do not
+    // depend on container state).
+    let mut t = DnClient::connect(format!("http://{}", dns[5].addr)).await.unwrap();
+    let (b, c) = verify_read(1);
+    let got = t
+        .read_chunk(&b, &c, true)
+        .await
+        .expect("rebuilt slot reads clean on the closed target");
+    assert_eq!(got.as_ref(), &originals[0][..]);
+
+    // Re-delivery of the SAME command is a clean NO-OP (CLOSED target): never an
+    // error and never a re-write.
+    let r2 = repair::reconstruct_from_survivors(&dns[5].meta, &dns[5].chunks, mk())
+        .await
+        .expect("re-delivery to a CLOSED target is a clean no-op");
+    assert!(r2.is_empty(), "re-delivery to a CLOSED target rebuilds nothing");
+    let ci2 = dns[5]
+        .meta
+        .get_container(ContainerId(CONTAINER))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ci2.state, ContainerState::Closed, "re-delivery leaves it CLOSED");
+
+    for d in &dns {
+        d.handle.abort();
+        tokio::fs::remove_dir_all(&d.dir).await.ok();
+    }
+}
+
+#[tokio::test]
+async fn reconstruct_rolls_back_created_container_on_failure() {
+    // Survivors slots 1..5 on dns[0..4] (real servers).
+    let mut dns = Vec::new();
+    for i in 0..5 {
+        dns.push(spawn_dn(i).await);
+    }
+    let payload: Vec<u8> = (0..PAYLOAD_LEN).map(|i| (i * 3 + 1) as u8).collect();
+    seed_block_group(&dns, LOCAL, &payload).await;
+
+    // Fresh target whose chunk store FAILS every write: the rebuild aborts AFTER the
+    // container is created, exercising the group-atomic rollback.
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let tdir = std::env::temp_dir().join(format!("ozone-ec-rollback-{}-{n}", std::process::id()));
+    let tmeta: Arc<dyn MetaStore> = Arc::new(FjallMetaStore::open(tdir.join("meta")).unwrap());
+    let tchunks: Arc<dyn ChunkStore> = Arc::new(FailWritesChunkStore {
+        inner: FileChunkStore::new(tdir.join("data")),
+    });
+
+    let sources: Vec<(u8, String)> = (1..5)
+        .map(|i| ((i + 1) as u8, format!("http://{}", dns[i].addr)))
+        .collect();
+    let input = repair::ReconstructInput {
+        container: ContainerId(CONTAINER),
+        ec: ec(),
+        missing_slots: vec![1],
+        sources,
+    };
+    let r = repair::reconstruct_from_survivors(&tmeta, &tchunks, input).await;
+    assert!(r.is_err(), "a write failure mid-rebuild must surface as an error, got {r:?}");
+    assert!(
+        tmeta.get_container(ContainerId(CONTAINER)).await.unwrap().is_none(),
+        "a container created for the rebuild must be rolled back (deleted) on failure -- never left half-built"
+    );
+    let bslot = BlockId::ec(ContainerId(CONTAINER), LocalId(LOCAL), ReplicaIndex::new(1));
+    assert!(
+        tmeta.get_block(&bslot).await.unwrap().is_none(),
+        "rollback leaves no orphan block metadata"
+    );
+
+    for d in &dns {
+        d.handle.abort();
+        tokio::fs::remove_dir_all(&d.dir).await.ok();
+    }
+    tokio::fs::remove_dir_all(&tdir).await.ok();
+}
+
+#[tokio::test]
+async fn reconstruct_keeps_preexisting_container_on_failure() {
+    // Survivors slots 1..5 on dns[0..4].
+    let mut dns = Vec::new();
+    for i in 0..5 {
+        dns.push(spawn_dn(i).await);
+    }
+    let payload: Vec<u8> = (0..PAYLOAD_LEN).map(|i| (i * 3 + 1) as u8).collect();
+    seed_block_group(&dns, LOCAL, &payload).await;
+
+    // Target with a PRE-EXISTING Open container (the in-place heal path) and a chunk
+    // store that fails writes. The rebuild fails -- but a container we did NOT create
+    // must SURVIVE: deleting a live replica on a transient error would be data loss.
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let tdir =
+        std::env::temp_dir().join(format!("ozone-ec-keepexisting-{}-{n}", std::process::id()));
+    let tmeta: Arc<dyn MetaStore> = Arc::new(FjallMetaStore::open(tdir.join("meta")).unwrap());
+    let tchunks: Arc<dyn ChunkStore> = Arc::new(FailWritesChunkStore {
+        inner: FileChunkStore::new(tdir.join("data")),
+    });
+    tmeta
+        .create_container(ContainerInfo::new_open(ContainerId(CONTAINER), ec()))
+        .await
+        .unwrap();
+
+    let sources: Vec<(u8, String)> = (1..5)
+        .map(|i| ((i + 1) as u8, format!("http://{}", dns[i].addr)))
+        .collect();
+    let input = repair::ReconstructInput {
+        container: ContainerId(CONTAINER),
+        ec: ec(),
+        missing_slots: vec![1],
+        sources,
+    };
+    let r = repair::reconstruct_from_survivors(&tmeta, &tchunks, input).await;
+    assert!(r.is_err(), "the write failure must surface, got {r:?}");
+    let ci = tmeta
+        .get_container(ContainerId(CONTAINER))
+        .await
+        .unwrap()
+        .expect("a pre-existing container must survive a rebuild failure -- never deleted");
+    assert_eq!(
+        ci.state,
+        ContainerState::Open,
+        "the pre-existing container is left Open (untouched), not closed or deleted"
+    );
+
+    for d in &dns {
+        d.handle.abort();
+        tokio::fs::remove_dir_all(&d.dir).await.ok();
+    }
+    tokio::fs::remove_dir_all(&tdir).await.ok();
 }

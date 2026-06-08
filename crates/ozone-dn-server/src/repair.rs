@@ -188,10 +188,20 @@ pub struct ReconstructInput {
 /// enumerate every block group from the SURVIVORS (each holds one slot), derive
 /// each block group's length as `min(blockGroupLen)` across survivors (the
 /// partial-stripe correctness guarantee), decode the missing cells, and persist
-/// the rebuilt shard(s) locally (this datanode is the target). Provisions the
-/// container locally if absent — the legitimate whole-replica path, where a fresh
-/// target holds no metadata; refuses a present-but-non-Open container (no orphan).
-/// Returns the local ids rebuilt. Idempotent.
+/// the rebuilt shard(s) locally (this datanode is the target).
+///
+/// Container lifecycle (mirrors real Ozone's RECOVERING -> CLOSED, reusing Open as
+/// the in-progress state — see `docs/flows/ec-reconstruction.md`):
+/// - absent -> create Open, rebuild, then CLOSE on success (a complete replica and a
+///   valid future EC source). A mid-rebuild failure ROLLS BACK the created container
+///   (metadata + bytes) — a half-built replica is never left to be reported healthy.
+/// - Open (pre-existing) -> heal in place, leave Open; never closed or deleted here
+///   (only SCM closes a live replica; deleting it on a transient error is data loss).
+/// - Closed -> already reconstructed; a re-delivered command is a no-op.
+/// - other non-writable -> refuse (no orphan write).
+///
+/// Returns the local ids rebuilt. Idempotent (including re-delivery to a CLOSED
+/// target, which rebuilds nothing).
 pub async fn reconstruct_from_survivors(
     meta: &Arc<dyn MetaStore>,
     chunks: &Arc<dyn ChunkStore>,
@@ -203,7 +213,6 @@ pub async fn reconstruct_from_survivors(
         chunk_size: input.ec.ec_chunk_size as usize,
     };
     let total = profile.data + profile.parity;
-    let k = profile.data;
 
     // Enumerate block groups from the survivors. local_id -> (shards[total], min len).
     let mut shards: BTreeMap<u64, Vec<Option<Vec<u8>>>> = BTreeMap::new();
@@ -255,17 +264,74 @@ pub async fn reconstruct_from_survivors(
         return Ok(Vec::new()); // no survivor blocks -> nothing to rebuild
     }
 
-    // Provision the target container: create it if absent (whole-replica rebuild),
-    // proceed if Open, refuse if present-but-non-Open (never orphan into it).
-    match meta.get_container(input.container).await? {
-        Some(ci) if ci.state.is_writable() => {}
+    // Provision the target container and decide its end-of-life handling:
+    //   - absent  -> create it Open (the whole-replica rebuild). WE own it, so a
+    //                failed rebuild rolls it back and a successful one is CLOSED.
+    //   - Closed  -> a prior rebuild already completed and closed it; a re-delivered
+    //                command is a no-op, NOT an error (idempotent re-delivery). Only
+    //                a complete replica is ever CLOSED here (failure rolls back), so a
+    //                CLOSED target is a finished one.
+    //   - Open    -> a live replica healed in place (the scrubber path); we never
+    //                close or delete it. Only SCM closes a live container, and
+    //                deleting it on a transient rebuild error would be data loss.
+    //   - other   -> refuse (never orphan a write into a non-writable container).
+    let we_created = match meta.get_container(input.container).await? {
+        Some(ci) if ci.state == ContainerState::Closed => return Ok(Vec::new()),
+        Some(ci) if ci.state.is_writable() => false,
         Some(ci) => return Err(RepairError::ContainerNotWritable(input.container, ci.state)),
         None => {
             meta.create_container(ContainerInfo::new_open(input.container, input.ec))
                 .await?;
+            true
         }
-    }
+    };
 
+    // Rebuild every enumerated block group. Group-atomic for a container WE created:
+    // a mid-rebuild failure must never leave a half-built replica that a later report
+    // could advertise as healthy (data loss if SCM then trims a real replica), so we
+    // roll it back (delete metadata + bytes) before surfacing the error. A
+    // pre-existing container is left intact -- NEVER deleted on a rebuild error.
+    let rebuilt = match rebuild_groups(meta, chunks, &input, profile, shards, lengths).await {
+        Ok(rebuilt) => rebuilt,
+        Err(e) => {
+            if we_created {
+                if let Err(re) = meta.delete_container(input.container).await {
+                    tracing::error!(container = %input.container.0, "EC rollback (metadata) failed: {re}");
+                }
+                if let Err(re) = chunks.delete_container(input.container).await {
+                    tracing::error!(container = %input.container.0, "EC rollback (chunks) failed: {re}");
+                }
+            }
+            return Err(e);
+        }
+    };
+
+    // Complete a freshly-provisioned whole replica by CLOSING it: it becomes a valid
+    // future EC source and is reported CLOSED, mirroring real Ozone's RECOVERING ->
+    // CLOSED. Close failure is NOT rolled back -- the data is correct on disk; a
+    // re-delivery finds the container still Open and retries the close.
+    if we_created {
+        meta.set_container_state(input.container, ContainerState::Closed)
+            .await?;
+    }
+    Ok(rebuilt)
+}
+
+/// Rebuild every enumerated block group's missing slot(s) and persist them locally
+/// (bytes + recomputed checksum + block metadata). Extracted from
+/// [`reconstruct_from_survivors`] so the caller can wrap it with group-atomic
+/// rollback. Returns the local ids rebuilt; a block group with fewer than `k`
+/// present survivors is skipped (never written as garbage).
+async fn rebuild_groups(
+    meta: &Arc<dyn MetaStore>,
+    chunks: &Arc<dyn ChunkStore>,
+    input: &ReconstructInput,
+    profile: ozone_ec::Profile,
+    shards: BTreeMap<u64, Vec<Option<Vec<u8>>>>,
+    lengths: BTreeMap<u64, u64>,
+) -> Result<Vec<u64>, RepairError> {
+    let total = profile.data + profile.parity;
+    let k = profile.data;
     let mut rebuilt = Vec::new();
     for (local, slot_bufs) in shards {
         let Some(&len_u64) = lengths.get(&local) else {
