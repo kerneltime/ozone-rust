@@ -109,9 +109,12 @@ translator with no conversion.
   DN join a real SCM."
 
 **Recommendation: Strategy A.** It is additive, isolates risk to new code, honors the
-"only adds gRPC" intent, and is the smallest path to the goal. The rest of this spec
-assumes A; the only A-specific artifact is the byte-bridge (§5.2), which is independently
-unit-testable.
+"only adds gRPC" intent, and is the smallest path to the goal. It is also the better fit
+for the locked target of an upstream apache/ozone PR (§8.4): a reviewer accepts an
+additive, off-by-default transport far more readily than a project-wide engine migration.
+The rest of this spec assumes A; the only A-specific artifact is the byte-bridge (§3.A),
+which is independently unit-testable. (Strategy A remains pending the maintainer's review
+of this spec before any code.)
 
 ## 4. Change surface (Strategy A) — what gets added, what is untouched
 
@@ -233,9 +236,12 @@ entire OM/Track-1 path.
    ratis-shading antrun and the 2.5.0 execution are both untouched.
 3. **Default gRPC port number** for `ozone.scm.datanode.grpc.port` — pick one not in SCM's
    existing port map (verify against `ScmConfigKeys` + the running cluster).
-4. **Upstream vs fork** — is the goal a PR to apache/ozone (then Strategy A + off-by-default
-   + a config doc entry matter a lot) or a local patched dist for validation only (then we
-   can be more expedient)? This changes how much polish P1-P3 need.
+4. **Upstream vs fork** — RESOLVED: target an upstream-quality PR to apache/ozone. So the
+   polish bar is REQUIRED, not optional: Strategy A (additive, off-by-default), a
+   config-key documentation entry, unit + integration tests, and clean isolation (no edits
+   to the existing 2.5.0 execution or interface-server's ratis-shading antrun). P1-P3 carry
+   this bar; P1 should also confirm the change builds cleanly within the full Ozone reactor,
+   not just the new module.
 5. **HA** — first pass non-HA only? The lifecycle hook rides the existing server so HA
    "just works" in principle, but proving it is extra scope.
 
