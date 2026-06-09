@@ -50,9 +50,16 @@ Stock Ozone SCM speaks the datanode protocol over Hadoop-RPC (port 9861), NOT gR
 Rust datanode speaks the same `StorageContainerDatanodeProtocol` but over gRPC/tonic. To
 let the Rust datanode register with a real SCM, add a thin gRPC transport adapter to SCM's
 `SCMDatanodeProtocolServer` (the messages are identical; only the transport differs — the
-project's stated "only change being adding gRPC support to SCM"). This was scoped earlier
-in the session (see chat log). It is the prerequisite for item 2(a) and for a true
-whole-Ozone e2e with the Rust datanode in the fleet.
+project's stated "only change being adding gRPC support to SCM"). It is the prerequisite
+for item 2(a) and for a true whole-Ozone e2e with the Rust datanode in the fleet.
+
+**A full design spec now exists**, grounded in a direct read of apache/ozone at tag
+`ozone-2.0.0`: [`../docs/flows/scm-grpc-datanode-adapter.md`](../docs/flows/scm-grpc-datanode-adapter.md).
+It documents the change surface (a Netty gRPC server modelled on OM's `GrpcOzoneManagerServer`,
+delegating to the existing server-side translator), and the one load-bearing decision: the
+datanode protocol runs on the legacy protobuf-2.5.0 Hadoop-RPC engine, so the gRPC stub
+(protobuf-3) cannot share generated classes — pick the additive byte-bridge (zero blast
+radius, recommended) over migrating the whole datanode protocol to ProtobufRpcEngine2.
 
 ## 4. Whole-Ozone e2e + Robot acceptance against a real cluster
 
