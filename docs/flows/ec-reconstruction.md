@@ -1,5 +1,14 @@
 # Flow: EC reconstruction — survivor-enumeration + min-length (Track 2, B4–B5)
 
+> **STATUS: IMPLEMENTED (Track 2 complete, commits `83dbe66..46a678a`).** The
+> survivor-enumeration + `min(blockGroupLen)` reconstruction, the create → rebuild →
+> CLOSED lifecycle, group-atomic rollback, and the convergence ICR described below are
+> implemented and mutation-proven in `ozone-dn-server/src/repair.rs` +
+> `tests/ec_repair.rs`. The "gap vs the current Rust code" in §2 describes the
+> PRE-migration `handle_reconstruct`, now superseded. Only the items still tagged
+> `[DEFERRED]` in §6 (a distinct `Recovering` enum, the periodic full container report,
+> the scrubber latch-clear) remain open.
+
 Design doc for making the datanode's reconstruction compliant with the real Ozone
 `ECReconstructionCoordinator`. `[V-source]` = verified against quoted Ozone source
 (see the real-EC-repair research output); `[I]` = inferred / decision taken.

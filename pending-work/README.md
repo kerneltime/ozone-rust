@@ -8,13 +8,18 @@ one GitHub token that appeared in it has been redacted — see `chat-log/README.
 The two compliance tracks are DONE (see finished-work). What's left is deeper real-cluster
 integration that the 3.8 GB / no-swap dev box could not run, plus hardening.
 
-## 1. Full EC key-metadata lifecycle against the REAL Java OM  (needs ≥5 datanodes)
+## 1. Full EC key-metadata lifecycle against the REAL Java OM — DONE
 
-`crates/ozone-om-client/examples/probe_real_om.rs` already validated bucket ops against a
-real Java OM, and showed EC `create_key` reaching the OM/SCM and failing only on
-`RequiredNodes = 5 AvailableNodes = 1`. With a beefy machine running **5 datanodes** the
-same probe should complete `create_key (EC) → commit_key → get_key_info → delete_key`
-against the real OM, proving the OM key-metadata path, not just bucket ops.
+COMPLETED on a 128 GB host (Docker compose, 5 datanodes). The probe
+(`crates/ozone-om-client/examples/probe_real_om.rs`) now completes
+`create_key(EC) → commit_key → get_key_info → delete_key` against the real Java OM: SCM
+allocates a real `EC{rs-3-2-1024k}` pipeline across all 5 DNs (slots 1..5). This also
+surfaced + fixed a wire gap the fixture masked — a real Java DN's client-facing pipeline
+exposes the container data port `STANDALONE` (9859), not the Rust DN's `REPLICATION`, so
+the OM client now falls back across the data-port names. See `finished-work/`. The Docker
+bring-up (publish OM gRPC 8981, `docker compose up -d --scale datanode=5`) supersedes the
+JVM-process steps in [`resume-real-cluster.md`](resume-real-cluster.md), which remain
+valid for a no-Docker path.
 
 Step-by-step bring-up (config + scripts here): see
 [`resume-real-cluster.md`](resume-real-cluster.md). The blocker was purely RSS: each Ozone

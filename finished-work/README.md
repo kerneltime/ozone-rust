@@ -101,14 +101,26 @@ Java OM over gRPC (`crates/ozone-om-client/examples/probe_real_om.rs`):
   RequiredNodes = 5 AvailableNodes = 1"` — i.e. a placement limit from the single datanode
   (a RAM constraint in the dev box), NOT a protocol mismatch. Commit `4d9095b`.
 
+**Update — full EC key lifecycle now COMPLETES (5 datanodes, Docker compose).** On a
+128 GB host the cluster was re-stood-up via the bundled `compose/ozone` scaled to 5
+datanodes (OM gRPC 8981 published; the tight-RAM SerialGC/timeout workarounds dropped).
+SCM allocates a real `EC{rs-3-2-1024k}` pipeline across all 5 DNs (slots 1..5, 1-based)
+and the probe completes `create_key(EC) -> commit_key -> get_key_info -> delete_key`
+against the real Java OM. This surfaced and fixed one wire gap the in-memory fixture had
+masked: the OM client built each datanode endpoint from a port named `REPLICATION` (the
+Rust DN's name), but a real Java DN's client-facing pipeline carries `STANDALONE` (9859)
+instead. `key_location_to_block` now falls back across
+`REPLICATION -> STANDALONE -> RATIS -> CLIENT_RPC` (regression test
+`ec_mapping_falls_back_to_standalone_for_real_java_dn`).
+
 ## Test counts (whole workspace, all green, clippy clean under -D warnings)
 
-~268 unit/integration tests across the workspace, including `s3_e2e` 36, `ec_repair` 19,
-`compliant_scm_loop` 3, `compliant_om` (in test-fixtures) 19, `ozone-om-client` 15.
+230 unit/integration tests across the workspace, including `s3_e2e` 36, `ec_repair` 19,
+`compliant_scm_loop` 3, `compliant_om` (in test-fixtures) 19, `ozone-om-client` 16.
 
 ## How to verify quickly
 
 ```sh
-cargo test --workspace          # ~268 tests, all pass
+cargo test --workspace          # 229 tests, all pass
 cargo clippy --workspace --tests
 ```

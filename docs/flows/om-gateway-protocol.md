@@ -1,5 +1,14 @@
 # Flow: S3 gateway → real Ozone Manager (Track 1)
 
+> **STATUS: IMPLEMENTED (Track 1 complete, commits `6d18587..15a7384`).** This is the
+> design doc that drove the migration in §5 (B0–B5), retained for rationale. The gateway
+> now speaks the real `OzoneManagerService.submitRequest(OMRequest)` via
+> `ozone-om-client/src/compliant.rs` (`OzoneOmClient`); the bespoke `om::gw::v1` /
+> `om_rust_gateway_v1.proto` / `fake_om` have been DELETED and replaced in tests by the
+> wire-compliant `CompliantOm`. References below to the "current" bespoke `backend.rs` /
+> `OmClient` describe the PRE-migration state. The OM client has since been validated
+> against a REAL Java OM (bucket lifecycle + EC `create_key`) — see `finished-work/`.
+
 Design doc for making the Rust S3 gateway a DROP-IN client of a real Apache Ozone
 Manager, speaking OM's actual gRPC contract `OzoneManagerService.submitRequest(OMRequest)
 → OMResponse`. The only OM-side change is enabling its existing gRPC transport. `[V]` =
@@ -170,6 +179,9 @@ principal` (the trusted-proxy-attested caller). Status handling (one private hel
 
 - Which `Port` name our Rust datanode exposes in the OM pipeline (it registers "REPLICATION"
   to SCM in Track 2). Resolve at B4 by reading what the pipeline actually carries.
+  **RESOLVED (real-OM probe, 5-DN cluster):** the Rust DN advertises `REPLICATION`, but a
+  REAL Java DN's client-facing EC pipeline carries `STANDALONE` (9859), not `REPLICATION`.
+  `key_location_to_block` now falls back `REPLICATION → STANDALONE → RATIS → CLIENT_RPC`.
 - Whether to reuse `ozone_types::EcReplicationConfig` directly in `BlockLocation` (yes — it
   already models k/p/chunk/codec and the EC crate consumes it).
 - Multipart part block layout under the compliant OM (CreateKey with isMultipartKey +

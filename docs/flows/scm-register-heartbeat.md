@@ -1,5 +1,16 @@
 # Flow: SCM ↔ Datanode register / heartbeat / version handshake (Track 2, B1–B2)
 
+> **STATUS: IMPLEMENTED (Track 2 complete, commits `83dbe66..46a678a`).** This is the
+> design doc that drove the work, retained for rationale. The Rust datanode now speaks
+> the real `StorageContainerDatanodeProtocol` over gRPC via
+> `ozone-dn-server/src/scm_compliant.rs` + `ozone-scm-client/src/compliant.rs`
+> (`OzoneScmClient`); the bespoke `scm.rs` loop and `scm_rust_datanode_v1` proto have
+> been DELETED. Every reference below to the "current" bespoke code (the bidi-streaming
+> heartbeat, the `scm.rs:80-84` `assigned_uuid` rewrite, the `replicaIndex=0` /
+> zero-capacity reports) describes the PRE-migration state — those are the bugs this
+> design FIXED, not open issues. The `[I]` questions in §6 were resolved during
+> implementation. See `finished-work/` for the proven end state.
+
 Design doc for making the Rust datanode's control-plane loop a drop-in, compliant
 peer of the real Apache Ozone SCM. Grounded in the vendored real proto
 (`proto/ozone/ScmServerDatanodeHeartbeatProtocol.proto`, read directly) and the

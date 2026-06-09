@@ -84,7 +84,7 @@ shard I/O to the datanodes is the separate data-plane gap; see `README.md` item 
 ## Also worth running on the beefy machine
 
 ```sh
-cargo test --workspace                       # ~268 tests
+cargo test --workspace                       # 230 tests
 cargo run --example rust_stack &             # Rust gateway+datanodes+CompliantOm on :9878
 robot acceptance/rust_s3_smoke.robot         # 14 S3 acceptance tests (needs robotframework+awscli)
 ```

@@ -5,6 +5,13 @@ Produced from a five-reviewer adversarial audit (2026-06-06) plus direct code
 reads. It exists so a reader does not mistake "the test suite is green" for "the
 system is complete and correct." Read it before claiming any behavior is done.
 
+Since that 06-06 audit, the two compliance tracks landed (Track 1 `6d18587..15a7384`,
+Track 2 `83dbe66..46a678a`): the bespoke `FakeOm`/`FakeScm` were replaced by the
+wire-compliant `CompliantOm`/`CompliantScm` (real OM/SCM proto shapes), every Tier-A
+defect below was fixed, and the gateway's OM client was validated against a REAL Java
+OM (bucket lifecycle + EC `create_key`). The whole workspace is **230 tests green, 0
+ignored**, clippy clean under `-D warnings`. The Tier-C data-plane gaps remain open.
+
 ## How to read this
 
 - **Severity**: HIGH = silent data corruption / integrity hole reachable in
@@ -23,19 +30,26 @@ Greenfield Rust reimplementation. ONLY erasure-coded data + OBS buckets. A secur
 upstream proxy owns all S3 authentication — the gateway trusts a proxy-attested
 principal and does **not** verify SigV4 (this is by design, never a finding).
 Out of scope by design: ACLs, bucket policies, versioning, lifecycle, SSE,
-server-side request signing. The e2e tests use an in-memory `FakeOm` and a
-`FakeScm`; there is no real Ozone Manager or SCM in any test.
+server-side request signing. The e2e tests use the wire-compliant in-memory
+`CompliantOm` / `CompliantScm` (real OM/SCM proto shapes; the retired `FakeOm`/
+`FakeScm` are gone). A real Java OM HAS since been validated for the gateway's OM
+client (bucket lifecycle + EC `create_key`) via `probe_real_om`; there is still no
+real SCM in any test (the datanode<->SCM gRPC adapter is pending) and no single test
+wires a real OM + SCM + the Rust components together.
 
-## The meta-caveat: FakeOm masks the gaps it shares
+## The meta-caveat (HISTORICAL): how FakeOm masked gaps, and how it was closed
 
-The single most important thing a fresh reviewer learns: **`FakeOm` is forgiving
-in exactly the dimensions where the gateway is loose.** It re-sorts multipart
-parts (`fake_om.rs:610`), ignores `max_keys`/`continuation_token` and never
-truncates listings, performs the prefix/delimiter folding itself, and holds no
-multipart part state. So the green suite gives *false confidence* on multipart
-ordering, list pagination, and per-key error mapping — the very areas with open
-defects below. Fixing a Tier-A item therefore usually means **also tightening
-FakeOm** so the regression test can actually fail before the fix.
+At the 06-06 audit the most important thing a reviewer learned was that **`FakeOm`
+was forgiving in exactly the dimensions where the gateway was loose** — it re-sorted
+multipart parts (`fake_om.rs:610`), ignored `max_keys`/`continuation_token` and never
+truncated, folded prefix/delimiter itself, and held no multipart part state — giving
+false confidence on multipart ordering, list pagination, and per-key error mapping.
+That masking is now CLOSED: each Tier-A fix tightened the fixture first (so the
+regression could fail), then Track 1 replaced it with the wire-compliant `CompliantOm`,
+which sorts buckets/keys/uploads but does NOT reorder multipart parts, enforces
+`max_keys` truncation + continuation, and stores real multipart part state.
+**Residual caveat:** `CompliantOm`/`CompliantScm` are still in-memory, so OM-metadata
+durability, HA failover, and full-topology behavior remain unproven (see Tier C).
 
 ---
 
@@ -64,7 +78,7 @@ These are genuinely proven and should not be re-litigated:
   zero-intervention self-heal loop, multi-block replica heal, and clean failure
   when >p shards are lost — all fail-without-fix) + `ozone-ec/tests/repair_identity.rs`
   (decode→re-encode reproduces every shard, so no new EC code). The remaining
-  real-cluster piece is only a production SCM replication manager (FakeScm stands
+  real-cluster piece is only a production SCM replication manager (CompliantScm stands
   in); the datanode side of the loop is complete.
 - **ETag algorithm** — single PUT = `md5_hex(body)`; multipart =
   `hex(md5(concat(binary part md5s)))-N`, computed AWS-identically
@@ -100,7 +114,7 @@ Each is cheap, within the stated scope, and (critically) needs a test that can
 - **Test**: flip a byte in one on-disk shard file, GET still returns exact bytes
   (reconstructed), and a corrupted-beyond-recovery case errors instead of lying.
 
-### A2 [MAJOR] Multipart Complete does not validate part order / duplicates — DONE (this branch)
+### A2 [MAJOR] Multipart Complete does not validate part order / duplicates — DONE (landed)
 - **Where**: `backend.rs` `complete_multipart` + `lib.rs` `parse_complete_parts`
   (preserves client document order). Masked by `fake_om.rs:610` `sort_by_key`.
 - **Now**: out-of-order parts are silently sorted into order by the OM instead of
@@ -113,7 +127,7 @@ Each is cheap, within the stated scope, and (critically) needs a test that can
   fail.
 - **Test**: complete with `[2,1]` → 400 InvalidPartOrder; `[1,1]` → 400.
 
-### A3 [MAJOR] Unsatisfiable Range returns 200 + full body instead of 416 — DONE (this branch)
+### A3 [MAJOR] Unsatisfiable Range returns 200 + full body instead of 416 — DONE (landed)
 - **Where**: `lib.rs` `parse_range` returns `None` for BOTH "no bytes= prefix" and
   "valid syntax but unsatisfiable"; the GET handler serves the full object on
   `None`.
@@ -122,7 +136,7 @@ Each is cheap, within the stated scope, and (critically) needs a test that can
   `Content-Range: bytes */{total}`). Likely a 3-state return from `parse_range`.
 - **Test**: `bytes=200-300` on a 100-byte object → 416 with `Content-Range`.
 
-### A4 [MAJOR] `max-keys` unenforced; listing stream over-drained — DONE (this branch)
+### A4 [MAJOR] `max-keys` unenforced; listing stream over-drained — DONE (landed)
 - **Where**: `backend.rs` `list_objects` drains the entire `list_keys` stream into
   one page (overwriting `is_truncated`/`next_continuation_token` with the last
   message's values); `lib.rs` parses `max-keys` and forwards it without capping.
@@ -136,7 +150,7 @@ Each is cheap, within the stated scope, and (critically) needs a test that can
 - **Test**: put 5 keys, `max-keys=2` → 2 keys + `IsTruncated=true` + token; follow
   the token → remaining keys, no overlap.
 
-### A5 [MAJOR] CopyObject ignores metadata/tagging directives; no self-copy guard — DONE (this branch)
+### A5 [MAJOR] CopyObject ignores metadata/tagging directives; no self-copy guard — DONE (landed)
 - **Where**: `backend.rs` `copy_object` always does a reference copy that clones
   source metadata+tags; `lib.rs` copy branch reads neither directive.
 - **Now**: `x-amz-metadata-directive=REPLACE` / `x-amz-tagging-directive=REPLACE`
@@ -149,7 +163,7 @@ Each is cheap, within the stated scope, and (critically) needs a test that can
 - **Test**: self-copy with REPLACE changes Content-Type; self-copy pure COPY →
   400 InvalidRequest.
 
-### A6 [MAJOR] DeleteObjects: wrong per-key codes, no quiet mode, no 1000 cap — DONE (this branch)
+### A6 [MAJOR] DeleteObjects: wrong per-key codes, no quiet mode, no 1000 cap — DONE (landed)
 - **Where**: `lib.rs` `delete_result_xml` hardcodes `<Code>InternalError</Code>`;
   `parse_delete_request` ignores `<Quiet>`; no batch-size check.
 - **Now**: a real per-key failure (e.g. NoSuchBucket mid-batch) reports as
@@ -160,7 +174,7 @@ Each is cheap, within the stated scope, and (critically) needs a test that can
   `MalformedXML`.
 - **Test**: quiet batch of existing keys → empty `<DeleteResult>`; 1001 keys → 400.
 
-### A7 [MAJOR] `If-Modified-Since` / `If-Unmodified-Since` ignored — DONE (this branch)
+### A7 [MAJOR] `If-Modified-Since` / `If-Unmodified-Since` ignored — DONE (landed)
 - **Where**: neither header is read anywhere in `src/` (grep-confirmed). Only
   If-Match/If-None-Match are evaluated.
 - **Now**: date-conditional GET/HEAD always returns 200 — broken cache
@@ -171,7 +185,7 @@ Each is cheap, within the stated scope, and (critically) needs a test that can
 - **Test**: `If-Modified-Since` in the future → 304; `If-Unmodified-Since` in the
   past → 412.
 
-### A8 [MINOR] Multipart: no min part size, no part-number range — DONE (this branch)
+### A8 [MINOR] Multipart: no min part size, no part-number range — DONE (landed)
 - **Where**: `upload_part` takes any `u32` part number and any size; `lib.rs` only
   checks the number parses.
 - **Now**: `partNumber=0` or `4_000_000_000` is accepted; a <5 MiB non-final part
@@ -203,7 +217,7 @@ Each is cheap, within the stated scope, and (critically) needs a test that can
 These are real code with real gaps that would let a reader believe a behavior is
 backed when it is not. Each must be either wired or clearly annotated.
 
-### B1 [MAJOR-misleading] `block_token` is fully inert — DONE (this branch: documented; full wiring deferred to security milestone)
+### B1 [MAJOR-misleading] `block_token` is fully inert — DONE (landed: documented; full wiring deferred to security milestone)
 - **Verified**: grep finds no non-empty write and no read outside tests — it is
   only ever `Vec::new()` (`backend.rs`, `fake_om.rs`).
 - **Now**: the proto comment says "Opaque token issued by SCM; gateway forwards
@@ -214,7 +228,7 @@ backed when it is not. Each must be either wired or clearly annotated.
   this slice. **Action (security milestone)**: wire SCM-issued token →
   gateway → DN + DN validation.
 
-### B2 [MAJOR] Multi-block write path wired but never called; no size guard — DONE (this branch)
+### B2 [MAJOR] Multi-block write path wired but never called; no size guard — DONE (landed)
 - **Verified**: gateway never calls `allocate_block` (grep). `allocate_and_write`
   writes exactly one block group; `get_object` reads `info.locations` which a
   simple PUT only populates with one entry.
@@ -225,7 +239,7 @@ backed when it is not. Each must be either wired or clearly annotated.
   multi-block is implemented. **Action (later)**: implement the `allocate_block`
   loop + multi-block read assembly.
 
-### B3 [MAJOR] SCM integration is partial — DONE (this branch, partial; remainder documented)
+### B3 [MAJOR] SCM integration is partial — DONE (landed, partial; remainder documented)
 - **Fixed**: the SCM-driven `DeleteContainer` now reclaims chunk bytes too (no
   more leak), and the datanode sends a FULL `ContainerReport` after registration
   so SCM learns its containers. Both covered by `scm_loop.rs` tests.
@@ -235,7 +249,7 @@ backed when it is not. Each must be either wired or clearly annotated.
   this codebase); `bcsi_id`/`replica_index` in the report are 0. These are
   forward-looking — nothing in this repo consumes them yet.
 
-### B4 [MINOR] Inert plumbing kept "consistent for the future" — DONE (this branch: annotated reserved)
+### B4 [MINOR] Inert plumbing kept "consistent for the future" — DONE (landed: annotated reserved)
 - `stripe_checksum`, `eof`, and `blockGroupLen` are written/stored but never read
   on any live path (the read path uses `loc.length` from OM). `CreateKey.metadata`
   is always sent empty (user metadata rides on `CommitKey` instead).
@@ -252,27 +266,32 @@ to acknowledge them. Accurate one-line status: *"S3 SDK surface + erasure-coded
 data path validated against a fake in-memory OM, single gateway instance,
 single-failure degraded read."*
 
-- **C1** No real OM and no real SCM in any test; the two control planes are tested
-  against *disjoint* fakes and never wired together. No full-topology test.
-- **C2** DONE (this branch): multipart part records now live in the OM (new
+- **C1** PARTIAL: the gateway's OM client has been validated against a REAL Java OM
+  (bucket lifecycle + the full EC key lifecycle create_key → commit_key → get_key_info →
+  delete_key, against a 5-datanode cluster) via `probe_real_om`. Still
+  open: no real SCM in any test (the datanode<->SCM gRPC adapter is pending), and the
+  two control planes — now exercised against the wire-compliant
+  `CompliantOm`/`CompliantScm`, not disjoint fakes — are still never wired together
+  with the Rust datanode in one full-topology test.
+- **C2** DONE (landed): multipart part records now live in the OM (new
   CommitMultipartPart RPC; Complete/list/abort read OM state). The gateway is
   stateless for multipart — any replica can complete an upload another initiated,
   proven by the two-gateway e2e test. (Cross-OM-process durability is still
-  bounded by FakeOm being in-memory; a real persistent OM closes that via the
+  bounded by CompliantOm being in-memory; a real persistent OM closes that via the
   same RPCs.)
 - **C3** DATANODE durability PROVEN (`ozone-dn-server/tests/durability.rs`): EC
   shards + block + container metadata survive a drop+reopen of the real
   `FjallMetaStore`+`FileChunkStore` and verify clean — across the core case, at
   scale with pagination, under concurrent writes, and overwrite-keeps-latest.
-  Still open: the OM/SCM side is in-memory (FakeOm/FakeScm), so OM-metadata
+  Still open: the OM/SCM side is in-memory (CompliantOm/CompliantScm), so OM-metadata
   durability and a fsync-on-the-hot-path policy are not validated; chunk writes
   are crash-safe by atomic create-then-rename but an explicit fsync-before-rename
   policy is not asserted.
 - **C4** Degraded read proven end-to-end for only a single failure; max-`p` and
   parity-only-survivor recovery proven only at the pure-EC layer, not through the
   gateway+DN wire path.
-- **EC self-healing loop** — DONE (this branch): the scrubber→SCM→ReconstructEC→
-  heal loop is closed and proven end-to-end (FakeScm shim stands in for SCM's
+- **EC self-healing loop** — DONE (landed): the scrubber→SCM→ReconstructEC→
+  heal loop is closed and proven end-to-end (CompliantScm shim stands in for SCM's
   report→command reaction). The only remaining piece is a real production SCM
   replication manager; the datanode side is complete and tested.
 - **C5** No GC/reclaimer: orphaned blocks accumulate forever (referenced in
