@@ -1,0 +1,58 @@
+<?xml version="1.0"?>
+<configuration>
+  <!-- single-host, non-HA, security-off Ozone for testing the Rust OM client -->
+  <property><name>ozone.om.address</name><value>localhost</value></property>
+  <property><name>ozone.scm.names</name><value>localhost</value></property>
+  <property><name>ozone.scm.client.address</name><value>localhost</value></property>
+  <property><name>ozone.scm.block.client.address</name><value>localhost</value></property>
+
+  <property><name>ozone.metadata.dirs</name><value>/tmp/ozone-data/metadata</value></property>
+  <property><name>ozone.scm.datanode.id.dir</name><value>/tmp/ozone-data/metadata</value></property>
+  <property><name>hdds.datanode.dir</name><value>/tmp/ozone-data/hdds</value></property>
+  <property><name>ozone.http.basedir</name><value>/tmp/ozone-data/http</value></property>
+
+  <property><name>ozone.security.enabled</name><value>false</value></property>
+  <property><name>ozone.acl.enabled</name><value>false</value></property>
+
+  <property><name>ozone.scm.container.size</name><value>256MB</value></property>
+  <property><name>ozone.scm.block.size</name><value>4MB</value></property>
+  <property><name>hdds.heartbeat.interval</name><value>3s</value></property>
+  <property><name>ozone.scm.stale.node.interval</name><value>90s</value></property>
+  <property><name>ozone.scm.dead.node.interval</name><value>180s</value></property>
+
+  <!-- a single datanode forms a factor-1 RATIS pipeline and SCM exits safemode -->
+  <property><name>hdds.scm.safemode.min.datanode</name><value>1</value></property>
+  <property><name>ozone.scm.pipeline.creation.auto.factor.one</name><value>true</value></property>
+  <property><name>ozone.datanode.pipeline.limit</name><value>1</value></property>
+  <property><name>ozone.scm.pipeline.creation.interval</name><value>15s</value></property>
+
+  <!-- buckets/keys default to RATIS/ONE so a single datanode can hold a block -->
+  <property><name>ozone.server.default.replication.type</name><value>RATIS</value></property>
+  <property><name>ozone.server.default.replication</name><value>ONE</value></property>
+
+  <!-- survive GC pauses on tiny heaps: the datanode's registration/heartbeat RPC to
+       SCM gets a generous timeout + many retries so a slow-to-respond SCM (constrained
+       heap) does not fail registration -->
+  <property><name>ozone.scm.heartbeat.rpc-timeout</name><value>60s</value></property>
+  <property><name>ozone.scm.heartbeat.rpc-retry-count</name><value>30</value></property>
+  <property><name>hdds.scm.wait.time.after.safemode.exit</name><value>15s</value></property>
+
+  <!-- give OM its own Ratis storage dir so it does not collide with SCM's group dir
+       (both default to ${metadata.dirs}/ratis on a single host) -->
+  <property><name>ozone.om.ratis.storage.dir</name><value>/tmp/ozone-data/om-ratis</value></property>
+  <property><name>ozone.scm.ha.ratis.storage.dir</name><value>/tmp/ozone-data/scm-ratis</value></property>
+
+  <!-- shrink the NATIVE footprint (RSS is native-dominated, not heap): small RocksDB
+       caches/buffers, small container cache, few handler threads -->
+  <property><name>hdds.datanode.metadata.rocksdb.cache.size</name><value>16MB</value></property>
+  <property><name>ozone.container.cache.size</name><value>64</value></property>
+  <property><name>ozone.container.cache.lock.stripes</name><value>64</value></property>
+  <property><name>ozone.metastore.rocksdb.cf.write.buffer.size</name><value>16MB</value></property>
+  <property><name>ozone.scm.handler.count.key</name><value>3</value></property>
+  <property><name>ozone.scm.block.handler.count.key</name><value>3</value></property>
+  <property><name>ozone.scm.datanode.handler.count.key</name><value>3</value></property>
+  <property><name>ozone.om.handler.count.key</name><value>5</value></property>
+  <property><name>hdds.datanode.handler.count</name><value>3</value></property>
+  <property><name>hdds.container.ratis.segment.preallocated.size</name><value>1MB</value></property>
+  <property><name>ozone.scm.container.lock.stripes</name><value>64</value></property>
+</configuration>
