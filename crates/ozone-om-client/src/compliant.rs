@@ -47,9 +47,18 @@ use ozone_types::{EcCodec, EcReplicationConfig};
 use tonic::transport::Channel;
 
 /// The port name the Rust datanode advertises for shard I/O (it registers a
-/// `REPLICATION` port to SCM in Track 2). [`key_location_to_block`] reads this
-/// port off each pipeline member to build the dial endpoint.
+/// `REPLICATION` port to SCM in Track 2).
 const REPLICATION_PORT_NAME: &str = "REPLICATION";
+
+/// Datanode port names a client may dial for shard data, in preference order.
+/// The Rust datanode (Track 2) advertises `REPLICATION`; a REAL Java datanode's
+/// client-facing pipeline does NOT surface `REPLICATION` and instead carries the
+/// container data ports `STANDALONE`/`RATIS`, so [`key_location_to_block`] falls
+/// back across these. NOTE: against a real Java datanode the chosen endpoint
+/// identifies the container port, but the Rust gateway cannot yet speak Ozone's
+/// container protocol to use it for I/O (the data-plane gap) — for the real-OM
+/// probe the endpoint only needs to PARSE so the key-metadata lifecycle proceeds.
+const DATA_PORT_NAMES: &[&str] = &[REPLICATION_PORT_NAME, "STANDALONE", "RATIS", "CLIENT_RPC"];
 
 /// One EC slot mapped to the datanode that holds it.
 ///
@@ -237,11 +246,12 @@ fn ec_config_from_proto(ec: &hdds::EcReplicationConfig) -> Result<EcReplicationC
 /// config from the pipeline, and zips `pipeline.members` with
 /// `pipeline.member_replica_indexes` so each [`DatanodeSlot::replica_index`]
 /// comes from the parallel index array, NOT the member's position. The endpoint
-/// is `http://<ip>:<REPLICATION port>`.
+/// is `http://<ip>:<data port>`, the data port chosen per [`DATA_PORT_NAMES`]
+/// (the Rust DN's `REPLICATION`, else a real Java DN's `STANDALONE`/`RATIS`).
 ///
 /// Errors with [`OmError::Missing`] if the location lacks a pipeline, the
-/// members/indexes arrays disagree in length, a member lacks a `REPLICATION`
-/// port, or the EC config is absent/invalid.
+/// members/indexes arrays disagree in length, a member exposes none of the
+/// known data ports, or the EC config is absent/invalid.
 fn key_location_to_block(loc: &oz::KeyLocation) -> Result<BlockLocation, OmError> {
     let cbid = &loc.block_id.container_block_id;
     let container_id = u64::try_from(cbid.container_id).map_err(|_| OmError::Missing("container_id"))?;
@@ -268,11 +278,10 @@ fn key_location_to_block(loc: &oz::KeyLocation) -> Result<BlockLocation, OmError
         .zip(pipeline.member_replica_indexes.iter())
     {
         let replica_index = u8::try_from(*idx).map_err(|_| OmError::Missing("replica_index"))?;
-        let port = dd
-            .ports
+        let port = DATA_PORT_NAMES
             .iter()
-            .find(|p| p.name == REPLICATION_PORT_NAME)
-            .ok_or(OmError::Missing("REPLICATION port"))?;
+            .find_map(|name| dd.ports.iter().find(|p| p.name == *name))
+            .ok_or(OmError::Missing("datanode data port"))?;
         members.push(DatanodeSlot {
             replica_index,
             endpoint: format!("http://{}:{}", dd.ip_address, port.value),
@@ -1284,18 +1293,36 @@ mod tests {
         assert_eq!(block.members[1].replica_index, 1);
     }
 
-    /// A `KeyLocation` missing the REPLICATION port cannot form a dial endpoint;
-    /// the mapping must surface that as a contract violation, not silently drop
-    /// the member or use a wrong port.
+    /// A member that advertises no client data port (only e.g. HTTP) cannot form
+    /// a dial endpoint; the mapping must surface that as a contract violation, not
+    /// silently drop the member or use a non-data port.
     #[test]
-    fn ec_mapping_requires_replication_port() {
+    fn ec_mapping_requires_a_data_port() {
         let mut members = datanodes(2);
-        members[0].ports.clear();
+        members[0].ports = vec![hdds::Port { name: "HTTP".to_string(), value: 9882 }];
         let loc = key_location_with_indexes(members, vec![1, 2]);
         assert!(matches!(
             key_location_to_block(&loc),
-            Err(OmError::Missing("REPLICATION port"))
+            Err(OmError::Missing("datanode data port"))
         ));
+    }
+
+    /// A real Java datanode's pipeline does NOT surface a REPLICATION port to
+    /// clients; it carries the container data port STANDALONE (or RATIS). The
+    /// mapping must fall back to those so a REAL-OM EC pipeline parses, not only
+    /// the Rust datanode's REPLICATION port. Discovered against a real Java OM:
+    /// the in-memory fixture had masked this by always advertising REPLICATION.
+    #[test]
+    fn ec_mapping_falls_back_to_standalone_for_real_java_dn() {
+        let mut members = datanodes(2);
+        for (i, m) in members.iter_mut().enumerate() {
+            m.ports = vec![hdds::Port { name: "STANDALONE".to_string(), value: 9859 + i as u32 }];
+        }
+        let loc = key_location_with_indexes(members, vec![1, 2]);
+        let block = key_location_to_block(&loc).unwrap();
+        let by_slot = |s: u8| block.members.iter().find(|m| m.replica_index == s).unwrap();
+        assert_eq!(by_slot(1).endpoint, "http://10.0.0.1:9859");
+        assert_eq!(by_slot(2).endpoint, "http://10.0.0.2:9860");
     }
 
     /// Lowercase-hex encode, mirroring the `{:x}` MD5 formatting the OM/gateway
